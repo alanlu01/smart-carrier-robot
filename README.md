@@ -17,7 +17,7 @@ Place this Repository in a ROS2 workspace `src/` directory, then:
 sudo apt install python3-smbus2
 colcon build --packages-select smart_carrier_robot
 source install/setup.bash
-export SMART_CARRIER_API_URL=https://your-api.zeabur.app
+export SMART_CARRIER_API_URL=https://api.your-domain.example
 export SMART_CARRIER_ROBOT_ID=R1
 export SMART_CARRIER_ROBOT_TOKEN=replace_me
 ros2 launch smart_carrier_robot smart_carrier.launch.py
