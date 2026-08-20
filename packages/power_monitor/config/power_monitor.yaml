@@ -4,8 +4,4 @@ ina3221_node:
     i2c_address: 64
     current_lsb: 0.0004
     window_size: 6
-
-dispatch_bridge_node:
-  ros__parameters:
-    poll_interval: 2.0
-    heartbeat_interval: 5.0
+    sample_period: 0.5

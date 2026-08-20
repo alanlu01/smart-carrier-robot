@@ -3,13 +3,15 @@
 <package format="3">
   <name>power_monitor</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>INA3221 monitoring and canonical power-bank slot status.</description>
   <maintainer email="kj0921@todo.todo">kj0921</maintainer>
   <license>TODO: License declaration</license>
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>sensor_msgs</depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>python3-smbus2</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

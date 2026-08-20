@@ -1,7 +1,14 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
+    power_config = os.path.join(
+        get_package_share_directory('power_monitor'), 'config', 'power_monitor.yaml'
+    )
     return LaunchDescription([
         # 1. 啟動相機節點 (這裡沒有 &，由 Launch 系統統一接管)
         Node(
@@ -34,6 +41,7 @@ def generate_launch_description():
         Node(
             package='power_monitor',
             executable='ina3221_node',
-            name='ina3221_node'
+            name='ina3221_node',
+            parameters=[power_config]
         )
     ])

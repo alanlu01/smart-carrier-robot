@@ -1,0 +1,5 @@
+smart_carrier_api_bridge:
+  ros__parameters:
+    poll_interval: 2.0
+    heartbeat_interval: 5.0
+    request_timeout: 5.0

@@ -2,7 +2,7 @@ from glob import glob
 
 from setuptools import find_packages, setup
 
-package_name = "smart_carrier_robot"
+package_name = "smart_carrier_api"
 
 setup(
     name=package_name,
@@ -18,13 +18,11 @@ setup(
     zip_safe=True,
     maintainer="alanlu01",
     maintainer_email="alanlu01@users.noreply.github.com",
-    description="ROS2 integration for the Smart Carrier robot",
+    description="Cloud API to ROS 2 bridge for the Smart Carrier robot",
     license="MIT",
     entry_points={
         "console_scripts": [
-            "ina3221_node = smart_carrier_robot.ina3221_node:main",
-            "dispatch_bridge_node = smart_carrier_robot.dispatch_bridge_node:main",
-            "navigator_node = smart_carrier_robot.navigator_node:main",
+            "api_bridge = smart_carrier_api.bridge_node:main",
         ],
     },
 )

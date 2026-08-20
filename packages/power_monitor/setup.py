@@ -1,3 +1,6 @@
+from glob import glob
+from os.path import join
+
 from setuptools import find_packages, setup
 
 package_name = 'power_monitor'
@@ -10,12 +13,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='kj0921',
     maintainer_email='kj0921@todo.todo',
-    description='TODO: Package description',
+    description='INA3221 monitoring and canonical power-bank slot status',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -24,7 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'ina3221_node = power_monitor.ina3221_node:main'
+            'ina3221_node = power_monitor.ina3221_node:main',
         ],
     },
 )

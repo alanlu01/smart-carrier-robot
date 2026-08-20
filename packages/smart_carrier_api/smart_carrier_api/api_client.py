@@ -16,7 +16,11 @@ class SmartCarrierApi:
         self.timeout = timeout
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None):
-        body = json.dumps(payload).encode() if payload is not None else None
+        body = (
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if payload is not None
+            else None
+        )
         request = Request(
             f"{self.base_url}{path}",
             data=body,

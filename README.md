@@ -1,19 +1,28 @@
 # Smart Carrier Robot
 
-ROS 2 monorepo for the Raspberry Pi side of the Smart Carrier project. This branch starts from a byte-for-byte verified snapshot of `~/dev_ws/src` taken on 2026-08-20 and preserves the current robot behavior before the cloud bridge is consolidated into the existing packages.
+ROS 2 monorepo for the Raspberry Pi side of the Smart Carrier project. It starts from a byte-for-byte verified snapshot of `~/dev_ws/src` taken on 2026-08-20 and integrates the cloud bridge without duplicating the existing power or navigation nodes.
 
 ## Repository layout
 
 - `packages/smart_delivery_core` — current delivery state machine, navigation, voice, buttons, and screen integration.
-- `packages/power_monitor` — current INA3221 power monitoring and power-bank state topics.
+- `packages/power_monitor` — INA3221 readings and the canonical power-bank slot states.
 - `packages/hailo_vision` — Hailo-based vision package and model.
 - `packages/vm_robot_model` — URDF, meshes, and robot description launch files.
-- `packages/smart_carrier_robot` — initial cloud API bridge prototype retained for the migration.
+- `packages/smart_carrier_api` — cloud HTTP to ROS 2 bridge only.
 - `vendor/rplidar_ros-dev-ros2` — exact customized RPLIDAR package from the Raspberry Pi.
 - `dependencies.repos` — exact upstream revisions for `camera_ros` and `rf2o_laser_odometry`.
 - `docs/raspberry-pi-baseline.md` — provenance, external dependencies, backup, and known limitations.
 
-The prototype `smart_carrier_robot` package currently contains its own INA3221 and navigator nodes. Do not launch those nodes together with the corresponding nodes in `power_monitor` and `smart_delivery_core`; they are retained only as migration input. The planned end state is one API bridge package using the existing power and navigation implementations.
+The runtime responsibility is deliberately split as follows:
+
+```text
+power_monitor ── power_status ──► smart_delivery_core
+       └──────── power_status ──► smart_carrier_api ── heartbeat ──► cloud
+cloud ── claimed task ──► smart_carrier_api ── order ──► smart_delivery_core
+cloud ◄── task result ─── smart_carrier_api ◄── /smart_carrier/task_result
+```
+
+`smart_carrier_api` does not access I²C and does not start a Nav2 navigator. The old standalone `smart_carrier_ws` is retained on the Raspberry Pi only as a temporary rollback copy and must not be launched together with this workspace.
 
 ## Restore the source workspace
 
@@ -36,6 +45,17 @@ source install/setup.bash
 ```
 
 The current package manifests do not yet declare every system and Python dependency. Reproduce the existing Raspberry Pi runtime described in the baseline document before expecting a clean machine build.
+
+## Cloud bridge
+
+Load the protected environment file, then launch the API-only bridge:
+
+```bash
+source ~/.config/smart-carrier/robot.env
+ros2 launch smart_carrier_api api_bridge.launch.py
+```
+
+The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `current`, `charge`, and `sensor_ok`. Canonical statuses are `empty`, `low`, `ready`, `full`, and `unknown`; `unknown` is used for an unavailable INA3221 reading instead of incorrectly reporting an empty slot.
 
 ## Secrets
 

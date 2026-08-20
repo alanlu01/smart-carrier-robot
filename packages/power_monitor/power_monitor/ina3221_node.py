@@ -1,9 +1,12 @@
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
-import smbus2
 import collections
 import json
+
+import rclpy
+import smbus2
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from power_monitor.power_status import build_slot
 
 
 def decode_shunt_current(raw_val, current_lsb=0.0004):
@@ -18,68 +21,70 @@ def decode_shunt_current(raw_val, current_lsb=0.0004):
 
 class INA3221Node(Node):
     def __init__(self):
-        super().__init__('ina3221_node')
-        
-        # 建立 Publisher
-        self.publisher_ = self.create_publisher(String, 'power_status', 10)
-        
-        # 設定 Timer，每 0.5 秒執行一次
-        timer_period = 0.5
-        self.timer = self.create_timer(timer_period, self.timer_callback)
-        
-        # INA3221 硬體設定
-        self.I2C_BUS = 1
-        self.I2C_ADDR = 0x40
-        self.CURRENT_LSB = 0.0004
-        self.bus = smbus2.SMBus(self.I2C_BUS)
-        
-        # 移動平均濾波器設定 (取最近 6 筆資料，約 3 秒的平均)
-        window_size = 6
-        self.ch1_history = collections.deque(maxlen=window_size)
-        self.ch2_history = collections.deque(maxlen=window_size)
-        self.ch3_history = collections.deque(maxlen=window_size)
-        
-        self.get_logger().info("INA3221 電源監控節點已啟動 (5V/1A 專用版)！")
+        super().__init__("ina3221_node")
 
-    def read_raw_current(self, reg_addr):
+        self.declare_parameter("i2c_bus", 1)
+        self.declare_parameter("i2c_address", 0x40)
+        self.declare_parameter("current_lsb", 0.0004)
+        self.declare_parameter("window_size", 6)
+        self.declare_parameter("sample_period", 0.5)
+
+        self.i2c_bus = int(self.get_parameter("i2c_bus").value)
+        self.i2c_address = int(self.get_parameter("i2c_address").value)
+        self.current_lsb = float(self.get_parameter("current_lsb").value)
+        window_size = int(self.get_parameter("window_size").value)
+        sample_period = float(self.get_parameter("sample_period").value)
+
+        if window_size < 1:
+            raise ValueError("window_size 必須大於 0")
+        if sample_period <= 0:
+            raise ValueError("sample_period 必須大於 0")
+
+        self.publisher = self.create_publisher(String, "power_status", 10)
+        self.histories = [collections.deque(maxlen=window_size) for _ in range(3)]
+        self.bus = smbus2.SMBus(self.i2c_bus)
+        self.timer = self.create_timer(sample_period, self.timer_callback)
+        self.get_logger().info("INA3221 電源監控與行充狀態節點已啟動")
+
+    def read_raw_current(self, register):
         try:
-            data = self.bus.read_i2c_block_data(self.I2C_ADDR, reg_addr, 2)
-            raw_val = (data[0] << 8) | data[1]
-            return decode_shunt_current(raw_val, self.CURRENT_LSB)
-        except Exception as e:
-            self.get_logger().error(f"I2C 讀取錯誤: {e}")
-            return 0.0
+            data = self.bus.read_i2c_block_data(self.i2c_address, register, 2)
+            raw_value = (data[0] << 8) | data[1]
+            return decode_shunt_current(raw_value, self.current_lsb)
+        except OSError as exc:
+            self.get_logger().error(f"INA3221 I2C 讀取錯誤: {exc}")
+            return None
 
     def timer_callback(self):
-        # 1. 讀取原始數據並加入移動平均佇列
-        self.ch1_history.append(self.read_raw_current(0x01))
-        self.ch2_history.append(self.read_raw_current(0x03))
-        self.ch3_history.append(self.read_raw_current(0x05))
-        
-        # 2. 計算平均值
-        avg_ch1 = sum(self.ch1_history) / len(self.ch1_history) if self.ch1_history else 0.0
-        avg_ch2 = sum(self.ch2_history) / len(self.ch2_history) if self.ch2_history else 0.0
-        avg_ch3 = sum(self.ch3_history) / len(self.ch3_history) if self.ch3_history else 0.0
+        channels = {}
+        for index, register in enumerate((0x01, 0x03, 0x05)):
+            history = self.histories[index]
+            sample = self.read_raw_current(register)
+            sensor_ok = sample is not None
+            if sensor_ok:
+                history.append(sample)
 
-        # 3. INA 節點只發布原始電流，分類與排程由 smart_delivery.py 負責。
-        self.get_logger().info(
-            f"\n"
-            f"=== INA3221 三路電流即時監控 ===\n"
-            f"[通道 1] 電流: {avg_ch1:5.3f} A\n"
-            f"[通道 2] 電流: {avg_ch2:5.3f} A\n"
-            f"[通道 3] 電流: {avg_ch3:5.3f} A\n"
-            f"=============================="
+            average = sum(history) / len(history) if history else None
+            channels[f"ch{index + 1}"] = build_slot(
+                index + 1,
+                average,
+                sensor_ok=sensor_ok,
+            )
+
+        summary = " | ".join(
+            f"CH{number}: {channel['current']} A, {channel['status']}"
+            for number, channel in enumerate(channels.values(), start=1)
         )
+        self.get_logger().info(summary)
 
-        # 4. 只打包三路原始電流，避免感測節點與業務分類重複。
-        power_data = {
-            "ch1": {"current": round(avg_ch1, 3)},
-            "ch2": {"current": round(avg_ch2, 3)},
-            "ch3": {"current": round(avg_ch3, 3)}
-        }
-        msg = String()
-        msg.data = json.dumps(power_data)
-        self.publisher_.publish(msg)
+        message = String()
+        message.data = json.dumps(channels, ensure_ascii=False)
+        self.publisher.publish(message)
+
+    def destroy_node(self):
+        self.bus.close()
+        return super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -90,7 +95,9 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

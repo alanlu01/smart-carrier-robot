@@ -1,6 +1,12 @@
 [tool.pytest.ini_options]
-testpaths = ["packages/smart_carrier_robot/tests"]
-pythonpath = ["packages/smart_carrier_robot"]
+testpaths = [
+  "packages/power_monitor/test/test_power_status.py",
+  "packages/smart_carrier_api/tests",
+]
+pythonpath = [
+  "packages/power_monitor",
+  "packages/smart_carrier_api",
+]
 
 [tool.ruff]
 line-length = 100
