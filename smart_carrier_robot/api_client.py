@@ -43,6 +43,9 @@ class SmartCarrierApi:
     def heartbeat(self, payload: dict[str, Any]):
         return self._request("POST", f"/api/v1/robots/{self.robot_id}/heartbeat", payload)
 
+    def list_locations(self):
+        return self._request("GET", "/api/v1/locations")
+
     def claim_task(self):
         return self._request("POST", f"/api/v1/robots/{self.robot_id}/tasks/claim")
 

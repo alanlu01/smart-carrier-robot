@@ -13,6 +13,7 @@ setup(
         (f"share/{package_name}", ["package.xml"]),
         (f"share/{package_name}/launch", glob("launch/*.launch.py")),
         (f"share/{package_name}/config", glob("config/*.yaml")),
+        (f"share/{package_name}/maps", glob("maps/*")),
     ],
     install_requires=["setuptools", "smbus2"],
     zip_safe=True,
@@ -25,6 +26,8 @@ setup(
             "ina3221_node = smart_carrier_robot.ina3221_node:main",
             "dispatch_bridge_node = smart_carrier_robot.dispatch_bridge_node:main",
             "navigator_node = smart_carrier_robot.navigator_node:main",
+            "location_validator_node = smart_carrier_robot.location_validator_node:main",
+            "location_calibrator_node = smart_carrier_robot.location_calibrator_node:main",
         ],
     },
 )

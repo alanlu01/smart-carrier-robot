@@ -31,6 +31,43 @@ Map coordinates are loaded from the backend `locations` table. A task with missi
 - `/smart_carrier/task` — claimed cloud task
 - `/smart_carrier/task_result` — Nav2 result sent back to the cloud
 
+## Validate cloud locations against the active map
+
+The packaged `maps/room.yaml` map is 145×144 pixels at 0.05 m/pixel with origin
+`(-4.879, -0.969)`. Its world bounds are X `[-4.879, 2.371)` and Y
+`[-0.969, 6.231)`.
+
+After the map server is active, validate every cloud location against `/map`:
+
+```bash
+ros2 run smart_carrier_robot location_validator_node
+```
+
+The validator rejects coordinates outside the map, unknown/occupied cells, and targets
+without 0.35 m clearance. To include Nav2 inflation costs, validate the published global
+costmap instead:
+
+```bash
+ros2 run smart_carrier_robot location_validator_node --ros-args \
+  -p map_topic:=/global_costmap/costmap -p clearance_m:=0.0 -p max_cost:=0
+```
+
+The original cloud seed coordinates place E1, F1, and S1 outside this map. Do not claim
+real navigation tasks until all service points are measured in RViz and this validator
+reports `PASS` for every location.
+
+To record a safe service point, start the calibrator and then use RViz `2D Goal Pose` to
+click the target position and drag its desired arrival heading:
+
+```bash
+ros2 run smart_carrier_robot location_calibrator_node --ros-args \
+  -p location_code:=A1
+```
+
+The node rejects unsafe clicks and prints one machine-readable `CALIBRATION` JSON line for
+an accepted pose. Repeat for E1, F1, and S1. These values can then be applied from the API
+VM with the dry-run location calibration command documented in the API Repository.
+
 ## Remaining hardware validation
 
 - Calibrate current thresholds against the actual power banks.
