@@ -1,0 +1,124 @@
+<?xml version="1.0"?>
+<robot name="smart_carrier">
+
+  <!-- 🎨 材質與顏色定義 -->
+  <material name="chassis_color">
+    <color rgba="0.1 0.6 0.8 0.6"/> <!-- 半透明科技藍底盤 -->
+  </material>
+  <material name="lidar_color">
+    <color rgba="0.8 0.8 0.0 1.0"/> <!-- 亮黃色雷達 -->
+  </material>
+  <material name="wheel_color">
+    <color rgba="0.1 0.1 0.1 1.0"/> <!-- 深黑色輪子 -->
+  </material>
+
+  <!-- 📍 1. 機器人投影到地面的投影原點 (base_footprint) -->
+  <link name="base_footprint"/>
+
+  <!-- 📍 2. 車體運動與旋轉中心 (base_link) -->
+  <!-- 設於動力輪軸心高度：距離地面 8 cm (輪胎半徑) -->
+  <link name="base_link"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.080" rpy="0 0 0"/> <!-- 輪胎半徑 8cm -->
+  </joint>
+
+  <!-- 🚗 3. 實體底盤主體 (chassis) -->
+  <!-- 🌟 更新：長 38 cm (0.38m), 寬 25 cm (0.25m), 高度提升為 35 cm (0.35m) 涵蓋三層結構 -->
+  <link name="chassis">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.38 0.25 0.35"/>
+      </geometry>
+      <material name="chassis_color"/>
+    </visual>
+  </link>
+
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis"/>
+    <!-- 🌟 更新：將底盤主體往上移 (0.35 / 2 = 0.175m)，使其與三層結構高度對齊 -->
+    <origin xyz="0 0 0.175" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 📡 4. RPLidar 雷達主體 (laser) -->
+  <!-- 🌟 更新：前偏移 15cm (0.150), 偏右 2.5cm (-0.025), 高度 34.5cm (0.345) -->
+  <link name="laser">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.035" length="0.04"/> <!-- 標準雷達尺寸 -->
+      </geometry>
+      <material name="lidar_color"/>
+    </visual>
+  </link>
+
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="0.150 -0.025 0.345" rpy="0 0 3.14159"/>
+  </joint>
+
+  <!-- 🛞 5. 虛擬四輪展示 (不參與物理運動計算，純 RViz2 視覺觀看) -->
+  <!-- 輪胎半徑 8 cm (0.08m), 寬度 4.2 cm (0.042m) -->
+  <link name="wheel_front_left">
+    <visual>
+      <geometry>
+        <cylinder radius="0.080" length="0.042"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+  </link>
+  <joint name="wheel_fl_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="wheel_front_left"/>
+    <!-- 前後軸距/2 = 10.6cm, 左右輪距/2 = 10.1cm -->
+    <origin xyz="0.106 0.101 0" rpy="-1.5708 0 0"/>
+  </joint>
+
+  <link name="wheel_front_right">
+    <visual>
+      <geometry>
+        <cylinder radius="0.080" length="0.042"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+  </link>
+  <joint name="wheel_fr_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="wheel_front_right"/>
+    <origin xyz="0.106 -0.101 0" rpy="1.5708 0 0"/>
+  </joint>
+
+  <link name="wheel_rear_left">
+    <visual>
+      <geometry>
+        <cylinder radius="0.080" length="0.042"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+  </link>
+  <joint name="wheel_rl_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="wheel_rear_left"/>
+    <origin xyz="-0.106 0.101 0" rpy="-1.5708 0 0"/>
+  </joint>
+
+  <link name="wheel_rear_right">
+    <visual>
+      <geometry>
+        <cylinder radius="0.080" length="0.042"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+  </link>
+  <joint name="wheel_rr_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="wheel_rear_right"/>
+    <origin xyz="-0.106 -0.101 0" rpy="1.5708 0 0"/>
+  </joint>
+
+</robot>

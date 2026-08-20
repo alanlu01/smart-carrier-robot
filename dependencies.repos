@@ -1,0 +1,9 @@
+repositories:
+  camera_ros:
+    type: git
+    url: https://github.com/christianrauch/camera_ros.git
+    version: ac71910ca47bd2110a26892a5bc1b2be664abe29
+  rf2o_laser_odometry:
+    type: git
+    url: https://github.com/Adlink-ROS/rf2o_laser_odometry.git
+    version: 313bb4c4123bcc0cc2e042f278312b19a3c46f31

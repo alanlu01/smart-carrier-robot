@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <!-- 🌟 修正點 1：對齊我們新建的資料夾與 CMakeLists.txt 的專案名稱 -->
+  <name>vm_robot_model</name>
+  <version>0.0.0</version>
+  <description>3D model description and TF static transforms for the Smart Carrier robot</description>
+  <maintainer email="pi@todo.todo">pi</maintainer>
+  
+  <!-- 📌 關鍵：將原本的 TODO 改為標準開源協定 Apache-2.0，消除 Unknown License 警告 -->
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 運作時需要的依賴：發布 TF 座標必須要有 robot_state_publisher -->
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>urdf</exec_depend>
+  
+  <!-- 🌟 修正點 2：補齊 display.launch.py 會用到的兩個執行時期依賴 -->
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

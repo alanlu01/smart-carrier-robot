@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+testpaths = ["packages/smart_carrier_robot/tests"]
+pythonpath = ["packages/smart_carrier_robot"]
 
 [tool.ruff]
 line-length = 100

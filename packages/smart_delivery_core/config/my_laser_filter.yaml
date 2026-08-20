@@ -1,0 +1,16 @@
+scan_to_scan_filter_chain:
+  ros__parameters:
+    filter_threads: 1       # 🌟 確保過濾器使用獨立執行緒，避免卡頓
+    filters: ["filter1"]    # 🌟 致命關鍵！告訴系統：「請幫我載入並執行 filter1」
+    filter1:
+      name: self_mask_box
+      type: laser_filters/LaserScanBoxFilter
+      params:
+        box_frame: "laser"  
+        invert: false
+        min_x: -0.35
+        max_x: 0.20
+        min_y: -0.10
+        max_y: 0.15
+        min_z: -0.50
+        max_z: 0.50

@@ -1,9 +1,30 @@
+# ROS / colcon outputs
 build/
 install/
 log/
+*.log
+
+# Secrets and local runtime configuration
 .env
+.env.*
+!.env.example
+robot.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.ssh/
+
+# Python caches and tooling
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
