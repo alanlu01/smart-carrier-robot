@@ -5,7 +5,8 @@ Deployment completed on 2026-08-20 (Asia/Taipei) for `kj0921@172.20.10.5`.
 ## Deployed source
 
 - Repository: `alanlu01/smart-carrier-robot`
-- Branch: `codex/integrate-api-bridge`
+- Branch: `main` (promoted from `codex/integrate-api-bridge` on 2026-08-21)
+- Current vehicle commit at promotion: `07e3b2a2debac1189bd38580cf47cca782fe5b8c`
 - Functional integration commit: `4324b0f811c9442a1d9ec3751305e331314942d6`
 - Raspberry Pi checkout: `/home/kj0921/dev_ws/src/smart-carrier-robot`
 - Repository-specific SSH key configuration is stored in the checkout's local Git config.
@@ -28,6 +29,9 @@ Colcon recursively discovers the five project packages and customized RPLIDAR pa
 - Pre-migration shell configuration: `/home/kj0921/.bashrc.pre_api_20260820_222122`
 
 No original project package or standalone workspace was permanently deleted. Restore operations should only be performed after stopping robot processes and confirming the exact target paths.
+
+The former Robot `main` tip (`0804942a1aa3d0b7bd9227bf5ee6c3d70ec0876b`) is preserved on GitHub as
+`codex/archive-main-before-dev-ws-20260821`.
 
 ## Shell path update
 
