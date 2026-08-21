@@ -39,7 +39,10 @@ Use a new name first; do not overwrite the current navigation map:
 
 ```bash
 ros2 run nav2_map_server map_saver_cli \
-  -f ~/dev_ws/src/smart-carrier-robot/packages/smart_delivery_core/maps/room_candidate
+  -f ~/dev_ws/src/smart-carrier-robot/packages/smart_delivery_core/maps/room_candidate \
+  --ros-args \
+  -p save_map_timeout:=10.0 \
+  -p map_subscribe_transient_local:=true
 
 ros2 service call /slam_toolbox/serialize_map \
   slam_toolbox/srv/SerializePoseGraph \
