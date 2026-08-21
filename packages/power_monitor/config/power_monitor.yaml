@@ -3,5 +3,12 @@ ina3221_node:
     i2c_bus: 1
     i2c_address: 64
     current_lsb: 0.0004
+    bus_voltage_lsb: 0.008
     window_size: 6
     sample_period: 0.5
+    # 無 bus voltage 才是空槽；有額定電壓但接近 0 A 視為充滿。
+    empty_voltage_max_v: 1.0
+    # 舊版或測試資料沒有 voltage 時的備援門檻；涵蓋實測空槽約 0.002 A。
+    empty_current_max_a: 0.005
+    ready_current_min_a: 0.05
+    low_current_min_a: 0.4

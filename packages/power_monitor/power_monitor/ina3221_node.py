@@ -19,6 +19,15 @@ def decode_shunt_current(raw_val, current_lsb=0.0004):
     return shunt_steps * current_lsb
 
 
+def decode_bus_voltage(raw_val, voltage_lsb=0.008):
+    """Decode an INA3221 bus-voltage register."""
+    if not 0 <= raw_val <= 0xFFFF:
+        raise ValueError("raw_val 必須是 16-bit 無號整數")
+
+    bus_steps = (raw_val & 0x7FFF) >> 3
+    return bus_steps * voltage_lsb
+
+
 class INA3221Node(Node):
     def __init__(self):
         super().__init__("ina3221_node")
@@ -26,22 +35,49 @@ class INA3221Node(Node):
         self.declare_parameter("i2c_bus", 1)
         self.declare_parameter("i2c_address", 0x40)
         self.declare_parameter("current_lsb", 0.0004)
+        self.declare_parameter("bus_voltage_lsb", 0.008)
         self.declare_parameter("window_size", 6)
         self.declare_parameter("sample_period", 0.5)
+        self.declare_parameter("empty_current_max_a", 0.005)
+        self.declare_parameter("empty_voltage_max_v", 1.0)
+        self.declare_parameter("ready_current_min_a", 0.05)
+        self.declare_parameter("low_current_min_a", 0.4)
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)
         self.i2c_address = int(self.get_parameter("i2c_address").value)
         self.current_lsb = float(self.get_parameter("current_lsb").value)
+        self.bus_voltage_lsb = float(self.get_parameter("bus_voltage_lsb").value)
         window_size = int(self.get_parameter("window_size").value)
         sample_period = float(self.get_parameter("sample_period").value)
+        self.empty_current_max_a = float(
+            self.get_parameter("empty_current_max_a").value
+        )
+        self.empty_voltage_max_v = float(
+            self.get_parameter("empty_voltage_max_v").value
+        )
+        self.ready_current_min_a = float(
+            self.get_parameter("ready_current_min_a").value
+        )
+        self.low_current_min_a = float(
+            self.get_parameter("low_current_min_a").value
+        )
 
         if window_size < 1:
             raise ValueError("window_size 必須大於 0")
         if sample_period <= 0:
             raise ValueError("sample_period 必須大於 0")
+        if self.empty_current_max_a < 0 or self.empty_voltage_max_v < 0:
+            raise ValueError("空槽門檻不得小於 0")
+        if not 0 < self.ready_current_min_a < self.low_current_min_a:
+            raise ValueError("電流門檻必須符合 0 < ready < low")
 
         self.publisher = self.create_publisher(String, "power_status", 10)
-        self.histories = [collections.deque(maxlen=window_size) for _ in range(3)]
+        self.current_histories = [
+            collections.deque(maxlen=window_size) for _ in range(3)
+        ]
+        self.voltage_histories = [
+            collections.deque(maxlen=window_size) for _ in range(3)
+        ]
         self.bus = smbus2.SMBus(self.i2c_bus)
         self.timer = self.create_timer(sample_period, self.timer_callback)
         self.get_logger().info("INA3221 電源監控與行充狀態節點已啟動")
@@ -55,24 +91,50 @@ class INA3221Node(Node):
             self.get_logger().error(f"INA3221 I2C 讀取錯誤: {exc}")
             return None
 
+    def read_bus_voltage(self, register):
+        try:
+            data = self.bus.read_i2c_block_data(self.i2c_address, register, 2)
+            raw_value = (data[0] << 8) | data[1]
+            return decode_bus_voltage(raw_value, self.bus_voltage_lsb)
+        except OSError as exc:
+            self.get_logger().error(f"INA3221 I2C 讀取錯誤: {exc}")
+            return None
+
     def timer_callback(self):
         channels = {}
-        for index, register in enumerate((0x01, 0x03, 0x05)):
-            history = self.histories[index]
-            sample = self.read_raw_current(register)
-            sensor_ok = sample is not None
+        registers = ((0x01, 0x02), (0x03, 0x04), (0x05, 0x06))
+        for index, (shunt_register, bus_register) in enumerate(registers):
+            current_history = self.current_histories[index]
+            voltage_history = self.voltage_histories[index]
+            current_sample = self.read_raw_current(shunt_register)
+            voltage_sample = self.read_bus_voltage(bus_register)
+            sensor_ok = current_sample is not None and voltage_sample is not None
             if sensor_ok:
-                history.append(sample)
+                current_history.append(current_sample)
+                voltage_history.append(voltage_sample)
 
-            average = sum(history) / len(history) if history else None
+            current_average = (
+                sum(current_history) / len(current_history)
+                if current_history
+                else None
+            )
+            voltage_average = (
+                sum(voltage_history) / len(voltage_history) if voltage_history else None
+            )
             channels[f"ch{index + 1}"] = build_slot(
                 index + 1,
-                average,
+                current_average if sensor_ok else None,
+                voltage_v=voltage_average if sensor_ok else None,
                 sensor_ok=sensor_ok,
+                empty_current_max_a=self.empty_current_max_a,
+                empty_voltage_max_v=self.empty_voltage_max_v,
+                ready_current_min_a=self.ready_current_min_a,
+                low_current_min_a=self.low_current_min_a,
             )
 
         summary = " | ".join(
-            f"CH{number}: {channel['current']} A, {channel['status']}"
+            f"CH{number}: {channel['voltage']} V, "
+            f"{channel['current']} A, {channel['status']}"
             for number, channel in enumerate(channels.values(), start=1)
         )
         self.get_logger().info(summary)

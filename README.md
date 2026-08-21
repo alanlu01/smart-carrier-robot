@@ -55,7 +55,7 @@ source ~/.config/smart-carrier/robot.env
 ros2 launch smart_carrier_api api_bridge.launch.py
 ```
 
-The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `current`, `charge`, and `sensor_ok`. Canonical statuses are `empty`, `low`, `ready`, `full`, and `unknown`; `unknown` is used for an unavailable INA3221 reading instead of incorrectly reporting an empty slot.
+The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, and `sensor_ok`. Bus voltage distinguishes an unpowered empty slot from a fully charged bank drawing almost no current. Canonical statuses are `empty`, `low`, `ready`, `full`, and `unknown`; `unknown` is used for an unavailable INA3221 reading instead of incorrectly reporting an empty slot.
 
 ## Secrets
 

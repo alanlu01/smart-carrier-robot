@@ -1,7 +1,8 @@
 import json
 from typing import Any
 
-EMPTY_CURRENT_MAX_A = 0.0005
+EMPTY_CURRENT_MAX_A = 0.005
+EMPTY_VOLTAGE_MAX_V = 1.0
 READY_CURRENT_MIN_A = 0.05
 LOW_CURRENT_MIN_A = 0.4
 
@@ -45,6 +46,40 @@ def classify_current_status(
     return "full"
 
 
+def classify_power_status(
+    current_a: float,
+    voltage_v: float | None,
+    *,
+    empty_current_max_a: float = EMPTY_CURRENT_MAX_A,
+    empty_voltage_max_v: float = EMPTY_VOLTAGE_MAX_V,
+    ready_current_min_a: float = READY_CURRENT_MIN_A,
+    low_current_min_a: float = LOW_CURRENT_MIN_A,
+) -> str:
+    """Classify a slot using bus voltage for presence and current for charge state.
+
+    A powered slot with almost no current is a fully charged power bank, while an
+    unpowered slot is empty. Older payloads without voltage retain the
+    current-only fallback.
+    """
+    if voltage_v is None:
+        return classify_current_status(
+            current_a,
+            empty_current_max_a=empty_current_max_a,
+            ready_current_min_a=ready_current_min_a,
+            low_current_min_a=low_current_min_a,
+        )
+
+    if abs(float(voltage_v)) <= empty_voltage_max_v:
+        return "empty"
+
+    current = abs(float(current_a))
+    if current >= low_current_min_a:
+        return "low"
+    if current >= ready_current_min_a:
+        return "ready"
+    return "full"
+
+
 def normalize_power_bank_status(status: Any, status_aliases: dict[Any, str] | None = None) -> str:
     if status_aliases and status in status_aliases:
         status = status_aliases[status]
@@ -81,25 +116,44 @@ def build_slot(
     channel_number: int,
     current_a: float | None,
     *,
+    voltage_v: float | None = None,
     sensor_ok: bool = True,
     status: str | None = None,
+    empty_current_max_a: float = EMPTY_CURRENT_MAX_A,
+    empty_voltage_max_v: float = EMPTY_VOLTAGE_MAX_V,
+    ready_current_min_a: float = READY_CURRENT_MIN_A,
+    low_current_min_a: float = LOW_CURRENT_MIN_A,
 ) -> dict[str, Any]:
     if channel_number not in (1, 2, 3):
         raise ValueError("channel_number 必須介於 1 到 3")
 
-    if current_a is None:
+    valid_current = current_a if sensor_ok else None
+    valid_voltage = voltage_v if sensor_ok else None
+    if not sensor_ok or current_a is None:
         canonical_status = "unknown"
     elif status is None:
-        canonical_status = classify_current_status(current_a)
+        canonical_status = classify_power_status(
+            current_a,
+            voltage_v,
+            empty_current_max_a=empty_current_max_a,
+            empty_voltage_max_v=empty_voltage_max_v,
+            ready_current_min_a=ready_current_min_a,
+            low_current_min_a=low_current_min_a,
+        )
     else:
         canonical_status = normalize_power_bank_status(status)
 
     return {
         "slot": channel_number,
-        "bank_id": None if canonical_status in {"empty", "unknown"} else f"PB-{channel_number:02d}",
+        "bank_id": (
+            None
+            if canonical_status in {"empty", "unknown"}
+            else f"PB-{channel_number:02d}"
+        ),
         "status": canonical_status,
-        "current": None if current_a is None else round(float(current_a), 3),
-        "charge": estimate_charge(current_a, canonical_status),
+        "current": None if valid_current is None else round(float(valid_current), 3),
+        "voltage": None if valid_voltage is None else round(float(valid_voltage), 3),
+        "charge": estimate_charge(valid_current, canonical_status),
         "sensor_ok": bool(sensor_ok),
     }
 
@@ -118,9 +172,12 @@ def payload_to_slots(
             sensor_ok = bool(channel.get("sensor_ok", True))
             current_value = channel.get("current")
             current = None if current_value is None else float(current_value)
+            voltage_value = channel.get("voltage")
+            voltage = None if voltage_value is None else float(voltage_value)
             slot = build_slot(
                 number,
                 current,
+                voltage_v=voltage,
                 sensor_ok=sensor_ok,
                 status=channel.get("status"),
             )
