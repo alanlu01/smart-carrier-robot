@@ -19,7 +19,8 @@ def test_current_classification():
 
 def test_voltage_distinguishes_empty_from_full_at_zero_current():
     assert classify_power_status(0.0, 0.0) == "empty"
-    assert classify_power_status(0.002, 5.0) == "full"
+    assert classify_power_status(0.001, 5.0) == "empty"
+    assert classify_power_status(0.063, 5.0) == "full"
     assert classify_power_status(0.1, 5.0) == "ready"
     assert classify_power_status(0.5, 5.0) == "low"
 

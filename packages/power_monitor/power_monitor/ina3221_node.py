@@ -40,7 +40,7 @@ class INA3221Node(Node):
         self.declare_parameter("sample_period", 0.5)
         self.declare_parameter("empty_current_max_a", 0.005)
         self.declare_parameter("empty_voltage_max_v", 1.0)
-        self.declare_parameter("ready_current_min_a", 0.05)
+        self.declare_parameter("ready_current_min_a", 0.1)
         self.declare_parameter("low_current_min_a", 0.4)
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)

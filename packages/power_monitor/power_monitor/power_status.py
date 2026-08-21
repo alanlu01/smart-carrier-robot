@@ -3,7 +3,7 @@ from typing import Any
 
 EMPTY_CURRENT_MAX_A = 0.005
 EMPTY_VOLTAGE_MAX_V = 1.0
-READY_CURRENT_MIN_A = 0.05
+READY_CURRENT_MIN_A = 0.1
 LOW_CURRENT_MIN_A = 0.4
 
 CANONICAL_STATUSES = {"empty", "low", "ready", "full", "unknown"}
@@ -73,6 +73,8 @@ def classify_power_status(
         return "empty"
 
     current = abs(float(current_a))
+    if current <= empty_current_max_a:
+        return "empty"
     if current >= low_current_min_a:
         return "low"
     if current >= ready_current_min_a:

@@ -31,14 +31,16 @@ The payload is a JSON object with `ch1`, `ch2`, and `ch3`. Each channel contains
 Canonical states are:
 
 - `empty`: no detected slot voltage (`<= 1.0 V`).
-- `full`: slot voltage is present and bank current is below `0.05 A`.
-- `ready`: borrowable bank approaching full charge (`>= 0.05 A` and `< 0.4 A`).
+- `full`: slot voltage is present and bank current is above the empty-slot
+  baseline but below `0.10 A`.
+- `ready`: borrowable bank approaching full charge (`>= 0.10 A` and `< 0.4 A`).
 - `low`: bank charging at high current (`>= 0.4 A`).
 - `unknown`: no valid INA3221 sample is available.
 
 The voltage and current thresholds are ROS parameters in `power_monitor.yaml`.
-For legacy payloads without `voltage`, `<= 0.005 A` is treated as empty; this
-fallback includes the approximately `0.002 A` idle reading observed on the robot.
+For both live and legacy samples, `<= 0.005 A` is treated as an empty powered
+slot; this includes the approximately `0.001` to `0.002 A` idle readings
+observed on the robot. A channel below `1.0 V` is also empty/unconnected.
 
 An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the last healthy inventory and pauses new dispatches after ten seconds without a healthy update; it does not interpret an I²C failure as an empty slot.
 

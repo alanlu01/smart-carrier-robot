@@ -10,5 +10,6 @@ ina3221_node:
     empty_voltage_max_v: 1.0
     # 舊版或測試資料沒有 voltage 時的備援門檻；涵蓋實測空槽約 0.002 A。
     empty_current_max_a: 0.005
-    ready_current_min_a: 0.05
+    # 實測滿電約 0.063 A；0.10 A 以下保留為 full 區間。
+    ready_current_min_a: 0.10
     low_current_min_a: 0.4
