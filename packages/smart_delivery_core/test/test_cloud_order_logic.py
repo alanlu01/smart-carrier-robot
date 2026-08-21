@@ -20,6 +20,7 @@ def test_cloud_borrow_task_uses_backend_coordinates_and_ready_slot():
         {
             "id": "task-1",
             "task_type": "borrow",
+            "power_bank_id": "PB-02",
             "required_charge": 80,
             "quantity": 1,
             "location_code": "A1",
@@ -32,7 +33,8 @@ def test_cloud_borrow_task_uses_backend_coordinates_and_ready_slot():
     assert not deferred
     assert route[0]["task_id"] == "task-1"
     assert route[0]["x"] == 1.0
-    assert route[0]["selected_power_bank"]["bank_id"] == "PB-01"
+    assert route[0]["power_bank_id"] == "PB-02"
+    assert route[0]["selected_power_bank"]["bank_id"] == "PB-02"
 
 
 def test_navigation_task_does_not_require_a_power_bank():
@@ -76,6 +78,38 @@ def test_borrow_becomes_releasable_if_inventory_changes_after_claim():
     assert not route
     assert deferred[0]["task_id"] == "task-race"
     assert "required charge" in infeasible_order_note(deferred[0])
+
+
+def test_borrow_does_not_substitute_a_different_power_bank():
+    order = order_payload_to_order(
+        {
+            "id": "task-selected-bank",
+            "task_type": "borrow",
+            "power_bank_id": "PB-02",
+            "required_charge": 80,
+            "quantity": 1,
+            "location": {"name": "test", "x": 1.0, "y": 2.0, "yaw": 0.0},
+        }
+    )
+    slots = [
+        {
+            "slot": 1,
+            "bank_id": "PB-01",
+            "status": "full",
+            "charge": 100,
+            "sensor_ok": True,
+        },
+        {"slot": 2, "bank_id": None, "status": "empty", "charge": 0, "sensor_ok": True},
+        {"slot": 3, "bank_id": None, "status": "empty", "charge": 0, "sensor_ok": True},
+    ]
+
+    route, deferred, _ = schedule_orders(
+        [order], {"x": 0.0, "y": 0.0}, slots
+    )
+
+    assert not route
+    assert deferred[0]["power_bank_id"] == "PB-02"
+    assert "PB-02" in infeasible_order_note(deferred[0])
 
 
 def test_invalid_cloud_order_is_rejected_before_navigation():
