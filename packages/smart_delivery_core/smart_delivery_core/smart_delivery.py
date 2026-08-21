@@ -173,6 +173,14 @@ def publish_task_result(publisher, task_id, status, note):
     )
     publisher.publish(message)
 
+
+def infeasible_order_note(order):
+    if order.get("type") == "borrow":
+        return "No ready power bank meets the required charge"
+    if order.get("type") == "return":
+        return "No empty power slot is available"
+    return "Task is not executable with the current robot state"
+
 def yaw_to_quaternion(yaw):
     q = Quaternion()
     q.z = math.sin(yaw / 2.0)
@@ -291,14 +299,18 @@ def main():
             )
 
             if not optimized_route:
-                if not is_standby:
-                    print("\n⚠️ 訂單因槽位或庫存不足暫緩。前往待機點充電等待...")
-                    current_pos = go_to_standby(navigator, current_pos)
-                    is_standby = True
-                
-                # 已經在待機點了，就休眠一下等待電量更新，避免狂刷螢幕
-                time.sleep(1.0)
-                continue 
+                blocked_order = pending_orders.pop(0)
+                note = infeasible_order_note(blocked_order)
+                navigator.get_logger().warning(
+                    f"任務 {blocked_order.get('task_id')} 執行條件已改變，釋放回雲端：{note}"
+                )
+                publish_task_result(
+                    task_result_publisher,
+                    blocked_order.get("task_id"),
+                    "released",
+                    note,
+                )
+                continue
 
             # 如果有可執行的訂單，解除待機狀態並準備出發
             is_standby = False

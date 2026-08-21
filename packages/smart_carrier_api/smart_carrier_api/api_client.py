@@ -47,8 +47,19 @@ class SmartCarrierApi:
     def heartbeat(self, payload: dict[str, Any]):
         return self._request("POST", f"/api/v1/robots/{self.robot_id}/heartbeat", payload)
 
-    def claim_task(self):
-        return self._request("POST", f"/api/v1/robots/{self.robot_id}/tasks/claim")
+    def claim_task(self, slots: list[dict[str, Any]]):
+        return self._request(
+            "POST",
+            f"/api/v1/robots/{self.robot_id}/tasks/claim",
+            {"slots": slots},
+        )
+
+    def release_task(self, task_id: str, note: str | None = None):
+        return self._request(
+            "POST",
+            f"/api/v1/robots/{self.robot_id}/tasks/{task_id}/release",
+            {"note": note},
+        )
 
     def report_result(self, task_id: str, status: str, note: str | None = None):
         return self._request(

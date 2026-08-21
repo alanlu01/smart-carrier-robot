@@ -1,7 +1,10 @@
 import pytest
-
 from power_monitor.power_status import build_slot, payload_to_slots
-from smart_delivery_core.smart_delivery import order_payload_to_order, schedule_orders
+from smart_delivery_core.smart_delivery import (
+    infeasible_order_note,
+    order_payload_to_order,
+    schedule_orders,
+)
 
 
 def test_cloud_borrow_task_uses_backend_coordinates_and_ready_slot():
@@ -48,6 +51,31 @@ def test_navigation_task_does_not_require_a_power_bank():
 
     assert not deferred
     assert route[0]["type"] == "navigation"
+
+
+def test_borrow_becomes_releasable_if_inventory_changes_after_claim():
+    order = order_payload_to_order(
+        {
+            "id": "task-race",
+            "task_type": "borrow",
+            "required_charge": 80,
+            "quantity": 1,
+            "location": {"name": "test", "x": 1.0, "y": 2.0, "yaw": 0.0},
+        }
+    )
+    slots = [
+        {"slot": 1, "status": "low", "charge": 45, "sensor_ok": True},
+        {"slot": 2, "status": "low", "charge": 30, "sensor_ok": True},
+        {"slot": 3, "status": "empty", "charge": 0, "sensor_ok": True},
+    ]
+
+    route, deferred, _ = schedule_orders(
+        [order], {"x": 0.0, "y": 0.0}, slots
+    )
+
+    assert not route
+    assert deferred[0]["task_id"] == "task-race"
+    assert "required charge" in infeasible_order_note(deferred[0])
 
 
 def test_invalid_cloud_order_is_rejected_before_navigation():

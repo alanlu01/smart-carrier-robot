@@ -46,7 +46,7 @@ An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the 
 
 `smart_carrier_api` publishes the complete claimed-task JSON returned by the backend. `smart_delivery_core` accepts backend `location.x/y/yaw` coordinates and retains its original name-based lookup only for legacy local messages.
 
-The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. This prevents a task from being claimed before the delivery process is ready to receive it.
+The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It sends the normalized three-slot snapshot with every claim request. The backend scans pending tasks in creation order and returns the first task compatible with the current inventory, so an unavailable borrow or return does not block a later navigation task.
 
 ### `/smart_carrier/task_result` (`std_msgs/String`)
 
@@ -56,7 +56,7 @@ The bridge will not claim a task until it has healthy `power_status` data and an
 {"task_id": "...", "status": "done", "note": "Nav2 goal reached"}
 ```
 
-The API bridge reports that result to the backend and only then releases its active task.
+The status is `done` or `failed` after navigation. If inventory changes between claim and execution, `smart_delivery_core` publishes `released`; the bridge then returns the still-owned task to `pending`. The API bridge clears its active task only after the backend accepts the update.
 
 ## Supported tasks
 

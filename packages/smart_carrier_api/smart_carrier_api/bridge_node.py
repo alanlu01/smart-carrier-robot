@@ -72,7 +72,7 @@ class ApiBridgeNode(Node):
         if self.order_publisher.get_subscription_count() == 0:
             return
         try:
-            task = self.api.claim_task()
+            task = self.api.claim_task(self.slots)
             if not task:
                 return
             task_id = task.get("id")
@@ -115,11 +115,14 @@ class ApiBridgeNode(Node):
                 )
                 return
             status = str(result["status"])
-            if status not in {"done", "failed"}:
+            if status not in {"done", "failed", "released"}:
                 raise ValueError(f"不支援的任務結果狀態：{status}")
-            self.api.report_result(task_id, status, result.get("note"))
+            if status == "released":
+                self.api.release_task(task_id, result.get("note"))
+            else:
+                self.api.report_result(task_id, status, result.get("note"))
             self.active_task_id = None
-            self.get_logger().info(f"已回報雲端任務 {task_id}: {status}")
+            self.get_logger().info(f"已更新雲端任務 {task_id}: {status}")
         except (ApiError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.log_api_error(exc)
 
