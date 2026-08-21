@@ -33,11 +33,19 @@ BORROWABLE_STATUS_PRIORITY = {
 
 NAVIGATION_ONLY_TASK_TYPES = {"delivery", "navigation", "callbot"}
 
-def select_power_bank(power_bank_slots, required_charge=0, status_aliases=None):
+def select_power_bank(
+    power_bank_slots,
+    required_charge=0,
+    status_aliases=None,
+    power_bank_id=None,
+):
     if not 0 <= required_charge <= 100: raise ValueError("required_charge 必須介於 0 到 100")
     candidates = []
     for slot_index, power_bank in enumerate(power_bank_slots):
         if power_bank is None: continue
+        bank_id = power_bank.get("bank_id") or power_bank.get("id")
+        if power_bank_id is not None and bank_id != power_bank_id:
+            continue
         status = normalize_power_bank_status(power_bank.get("status"), status_aliases)
         if status not in BORROWABLE_STATUS_PRIORITY: continue
         charge = power_bank.get("charge")
@@ -82,7 +90,12 @@ def schedule_orders(pending_orders, current_pos, power_banks, slot_capacity=3, s
             distance = math.hypot(float(order["x"]) - position["x"], float(order["y"]) - position["y"])
 
             if order_type == "borrow":
-                selection = select_power_bank(slots, float(order.get("required_charge", 0)), status_aliases)
+                selection = select_power_bank(
+                    slots,
+                    float(order.get("required_charge", 0)),
+                    status_aliases,
+                    order.get("power_bank_id"),
+                )
                 if selection is not None:
                     feasible_orders.append((distance * borrow_distance_weight, distance, order_index, "borrow", selection))
             elif order_type == "return":
@@ -153,6 +166,7 @@ def order_payload_to_order(payload):
         "location_code": location_code,
         "name": location_name,
         "type": task_type,
+        "power_bank_id": data.get("power_bank_id"),
         "required_charge": required_charge,
         "quantity": quantity,
         **coordinates,
@@ -176,6 +190,8 @@ def publish_task_result(publisher, task_id, status, note):
 
 def infeasible_order_note(order):
     if order.get("type") == "borrow":
+        if order.get("power_bank_id"):
+            return f"Selected power bank {order['power_bank_id']} is no longer available"
         return "No ready power bank meets the required charge"
     if order.get("type") == "return":
         return "No empty power slot is available"

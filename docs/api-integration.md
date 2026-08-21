@@ -48,7 +48,7 @@ An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the 
 
 `smart_carrier_api` publishes the complete claimed-task JSON returned by the backend. `smart_delivery_core` accepts backend `location.x/y/yaw` coordinates and retains its original name-based lookup only for legacy local messages.
 
-The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It sends the normalized three-slot snapshot with every claim request. The backend scans pending tasks in creation order and returns the first task compatible with the current inventory, so an unavailable borrow or return does not block a later navigation task.
+The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It sends the normalized three-slot snapshot with every claim request. The backend scans pending tasks in creation order and returns the first task compatible with the current inventory, so an unavailable borrow or return does not block a later navigation task. When a borrow task contains `power_bank_id`, both the backend and delivery scheduler require that exact bank; another available bank is not silently substituted.
 
 ### `/smart_carrier/task_result` (`std_msgs/String`)
 
@@ -62,7 +62,7 @@ The status is `done` or `failed` after navigation. If inventory changes between 
 
 ## Supported tasks
 
-- `borrow`: requires a `ready` or `full` slot meeting `required_charge`.
+- `borrow`: requires the requested `power_bank_id` (when provided) in a `ready` or `full` slot meeting `required_charge`.
 - `return`: requires an empty slot.
 - `delivery`, `navigation`, and `callbot`: navigate without consuming a power-bank slot.
 - `quantity` must currently be `1`; larger quantities are rejected and reported as failed instead of being partially fulfilled.
