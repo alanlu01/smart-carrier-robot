@@ -33,6 +33,7 @@ setup(
             'mecanum_odom_real = smart_delivery_core.mecanum_odom_real:main',
             'serial_bridge = smart_delivery_core.serial_bridge:main',
             'smart_delivery = smart_delivery_core.smart_delivery:main',
+            'smart_delivery_backup = smart_delivery_core.smart_delivery_backup:main',
         ],
     },
 )
