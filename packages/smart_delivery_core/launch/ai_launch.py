@@ -27,7 +27,10 @@ def generate_launch_description():
         Node(
             package='hailo_vision',
             executable='semantic_node',
-            name='semantic_node'
+            name='semantic_node',
+            remappings=[
+                ('/camera/image_raw', '/camera_node/image_raw'),
+            ]
         ),
 
         # 3. 啟動 Hailo 感測融合節點
