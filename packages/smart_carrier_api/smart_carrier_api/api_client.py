@@ -54,6 +54,12 @@ class SmartCarrierApi:
             {"slots": slots},
         )
 
+    def get_task(self, task_id: str):
+        return self._request(
+            "GET",
+            f"/api/v1/robots/{self.robot_id}/tasks/{task_id}",
+        )
+
     def release_task(self, task_id: str, note: str | None = None):
         return self._request(
             "POST",

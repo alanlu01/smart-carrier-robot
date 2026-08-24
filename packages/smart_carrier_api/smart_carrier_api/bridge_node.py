@@ -32,6 +32,7 @@ class ApiBridgeNode(Node):
         self.configured = bool(api_url and robot_id and token)
 
         self.order_publisher = self.create_publisher(String, "order", 10)
+        self.cancel_publisher = self.create_publisher(String, "/smart_carrier/task_cancel", 10)
         self.create_subscription(String, "power_status", self.on_power_status, 10)
         self.create_subscription(String, "/smart_carrier/task_result", self.on_task_result, 10)
         self.create_timer(float(self.get_parameter("poll_interval").value), self.poll)
@@ -44,6 +45,7 @@ class ApiBridgeNode(Node):
         self.power_received = False
         self.heartbeat_confirmed = False
         self.active_task_id = None
+        self.cancel_notified_task_id = None
         self.last_error_at = 0.0
         if not self.configured:
             self.get_logger().error(
@@ -67,7 +69,12 @@ class ApiBridgeNode(Node):
             self.get_logger().error(str(exc))
 
     def poll(self):
-        if not self.configured or self.active_task_id or not self.power_healthy:
+        if not self.configured:
+            return
+        if self.active_task_id:
+            self.poll_active_task()
+            return
+        if not self.power_healthy:
             return
         if self.order_publisher.get_subscription_count() == 0:
             return
@@ -84,6 +91,28 @@ class ApiBridgeNode(Node):
             self.order_publisher.publish(message)
             self.get_logger().info(f"已領取雲端任務 {self.active_task_id}")
         except (ApiError, TypeError) as exc:
+            self.log_api_error(exc)
+
+    def poll_active_task(self):
+        try:
+            task = self.api.get_task(self.active_task_id)
+            cancellation_requested = bool(task.get("cancel_requested_at"))
+            if task.get("status") == "cancelled":
+                cancellation_requested = True
+            if not cancellation_requested or self.cancel_notified_task_id == self.active_task_id:
+                return
+            message = String()
+            message.data = json.dumps(
+                {
+                    "task_id": self.active_task_id,
+                    "reason": task.get("cancel_reason") or "Cancelled by administrator",
+                },
+                ensure_ascii=False,
+            )
+            self.cancel_publisher.publish(message)
+            self.cancel_notified_task_id = self.active_task_id
+            self.get_logger().warning(f"收到雲端取消要求：{self.active_task_id}")
+        except (ApiError, AttributeError, TypeError) as exc:
             self.log_api_error(exc)
 
     def send_heartbeat(self):
@@ -115,13 +144,14 @@ class ApiBridgeNode(Node):
                 )
                 return
             status = str(result["status"])
-            if status not in {"done", "failed", "released"}:
+            if status not in {"done", "failed", "cancelled", "released"}:
                 raise ValueError(f"不支援的任務結果狀態：{status}")
             if status == "released":
                 self.api.release_task(task_id, result.get("note"))
             else:
                 self.api.report_result(task_id, status, result.get("note"))
             self.active_task_id = None
+            self.cancel_notified_task_id = None
             self.get_logger().info(f"已更新雲端任務 {task_id}: {status}")
         except (ApiError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.log_api_error(exc)

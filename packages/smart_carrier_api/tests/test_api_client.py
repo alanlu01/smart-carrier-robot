@@ -61,3 +61,38 @@ def test_release_task_sends_note_to_owned_task_endpoint():
     request = mocked.call_args.args[0]
     assert request.full_url.endswith("/api/v1/robots/R1/tasks/task-1/release")
     assert json.loads(request.data) == {"note": "inventory changed"}
+
+
+def test_get_task_reads_cancellation_state_from_owned_task_endpoint():
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = (
+        b'{"id":"task-1","cancel_requested_at":"2026-08-25T01:00:00Z"}'
+    )
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    client = SmartCarrierApi("https://api.example.test", "R1", "secret-token")
+    with patch("smart_carrier_api.api_client.urlopen", return_value=response) as mocked:
+        result = client.get_task("task-1")
+
+    request = mocked.call_args.args[0]
+    assert request.full_url.endswith("/api/v1/robots/R1/tasks/task-1")
+    assert request.method == "GET"
+    assert result["cancel_requested_at"] == "2026-08-25T01:00:00Z"
+
+
+def test_report_cancelled_result_posts_cancelled_status():
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = b'{"ok":true}'
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    client = SmartCarrierApi("https://api.example.test", "R1", "secret-token")
+    with patch("smart_carrier_api.api_client.urlopen", return_value=response) as mocked:
+        client.report_result("task-1", "cancelled", "Nav2 stopped")
+
+    request = mocked.call_args.args[0]
+    assert request.full_url.endswith("/api/v1/robots/R1/tasks/task-1/result")
+    assert json.loads(request.data) == {"status": "cancelled", "note": "Nav2 stopped"}

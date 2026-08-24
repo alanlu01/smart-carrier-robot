@@ -267,6 +267,8 @@ def main():
 
     # --- 3. 動態訂單佇列與雲端訂單監聽 ---
     pending_orders = []
+    active_task_id = None
+    cancellation_requested_task_ids = set()
 
     def order_callback(msg):
         nonlocal pending_orders
@@ -274,6 +276,14 @@ def main():
         try:
             new_order = json.loads(msg.data)
             task_id = new_order.get("id")
+            if task_id and str(task_id) in cancellation_requested_task_ids:
+                publish_task_result(
+                    task_result_publisher,
+                    task_id,
+                    "cancelled",
+                    "Cancelled by administrator before navigation started",
+                )
+                return
             order_data = order_payload_to_order(new_order)
             if task_id and any(order.get("task_id") == str(task_id) for order in pending_orders):
                 navigator.get_logger().warning(f"忽略重複任務：{task_id}")
@@ -287,8 +297,30 @@ def main():
             print(f"\n❌ 訂單解析失敗: {exc}")
             publish_task_result(task_result_publisher, task_id, "failed", str(exc))
 
+    def task_cancel_callback(msg):
+        nonlocal pending_orders, active_task_id
+        try:
+            cancellation = json.loads(msg.data)
+            task_id = str(cancellation["task_id"])
+            reason = str(cancellation.get("reason") or "Cancelled by administrator")
+            cancellation_requested_task_ids.add(task_id)
+            if active_task_id == task_id:
+                navigator.get_logger().warning(f"正在停止管理員取消的任務：{task_id}")
+                return
+            for index, order in enumerate(pending_orders):
+                if order.get("task_id") == task_id:
+                    pending_orders.pop(index)
+                    publish_task_result(task_result_publisher, task_id, "cancelled", reason)
+                    navigator.get_logger().warning(f"已取消尚未開始導航的任務：{task_id}")
+                    return
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            navigator.get_logger().error(f"無效的取消任務訊息：{exc}")
+
     # 訂閱 cloud_bridge 發出的訂單話題
     navigator.create_subscription(String, "order", order_callback, 10)
+    navigator.create_subscription(
+        String, "/smart_carrier/task_cancel", task_cancel_callback, 10
+    )
 
     current_pos = {"x": 0.0, "y": 0.0}
     is_standby = False  # 用來記錄目前是否已經在待機點
@@ -354,14 +386,23 @@ def main():
             goal_pose.pose.orientation = yaw_to_quaternion(target['yaw'])
 
             navigator.goToPose(goal_pose)
+            active_task_id = target.get("task_id")
+            cancel_sent = False
 
             # 在導航過程中依然要更新話題，確保能邊走邊接單
             while not navigator.isTaskComplete():
                 time.sleep(0.1)
                 rclpy.spin_once(navigator, timeout_sec=0.05)
+                if active_task_id in cancellation_requested_task_ids and not cancel_sent:
+                    navigator.cancelTask()
+                    cancel_sent = True
 
             result = navigator.getResult()
-            if result == TaskResult.SUCCEEDED:
+            if active_task_id in cancellation_requested_task_ids:
+                print("⚠️ 任務已由管理員取消。")
+                result_status = "cancelled"
+                result_note = "Cancelled by administrator; navigation stopped"
+            elif result == TaskResult.SUCCEEDED:
                 if target["type"] == "borrow":
                     msg_txt = "您的行動電源已送達！"
                 elif target["type"] == "return":
@@ -375,7 +416,7 @@ def main():
             elif result == TaskResult.CANCELED:
                 print("⚠️ 任務取消！")
                 result_status = "failed"
-                result_note = "Nav2 goal cancelled"
+                result_note = "Nav2 goal cancelled unexpectedly"
             else:
                 print("❌ 導航失敗！")
                 result_status = "failed"
@@ -387,6 +428,9 @@ def main():
                 result_status,
                 result_note,
             )
+            if active_task_id:
+                cancellation_requested_task_ids.discard(active_task_id)
+            active_task_id = None
 
             # 任務執行完畢，將這筆訂單移除
             target_key = target.get("task_id") or (target["name"], target["type"])
