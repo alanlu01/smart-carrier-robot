@@ -6,7 +6,7 @@ import smbus2
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from power_monitor.power_status import build_slot
+from power_monitor.power_status import SlotStateTracker, build_slot
 
 
 def decode_shunt_current(raw_val, current_lsb=0.0004):
@@ -38,10 +38,12 @@ class INA3221Node(Node):
         self.declare_parameter("bus_voltage_lsb", 0.008)
         self.declare_parameter("window_size", 6)
         self.declare_parameter("sample_period", 0.5)
-        self.declare_parameter("empty_current_max_a", 0.005)
+        self.declare_parameter("empty_current_max_a", 0.008)
         self.declare_parameter("empty_voltage_max_v", 1.0)
-        self.declare_parameter("ready_current_min_a", 0.1)
-        self.declare_parameter("low_current_min_a", 0.4)
+        self.declare_parameter("present_current_min_a", 0.020)
+        self.declare_parameter("full_current_max_a", 0.080)
+        self.declare_parameter("state_confirm_samples", 6)
+        self.declare_parameter("slot_enabled", [True, True, False])
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)
         self.i2c_address = int(self.get_parameter("i2c_address").value)
@@ -55,12 +57,18 @@ class INA3221Node(Node):
         self.empty_voltage_max_v = float(
             self.get_parameter("empty_voltage_max_v").value
         )
-        self.ready_current_min_a = float(
-            self.get_parameter("ready_current_min_a").value
+        self.present_current_min_a = float(
+            self.get_parameter("present_current_min_a").value
         )
-        self.low_current_min_a = float(
-            self.get_parameter("low_current_min_a").value
+        self.full_current_max_a = float(
+            self.get_parameter("full_current_max_a").value
         )
+        state_confirm_samples = int(
+            self.get_parameter("state_confirm_samples").value
+        )
+        self.slot_enabled = [
+            bool(value) for value in self.get_parameter("slot_enabled").value
+        ]
 
         if window_size < 1:
             raise ValueError("window_size 必須大於 0")
@@ -68,8 +76,14 @@ class INA3221Node(Node):
             raise ValueError("sample_period 必須大於 0")
         if self.empty_current_max_a < 0 or self.empty_voltage_max_v < 0:
             raise ValueError("空槽門檻不得小於 0")
-        if not 0 < self.ready_current_min_a < self.low_current_min_a:
-            raise ValueError("電流門檻必須符合 0 < ready < low")
+        if not self.empty_current_max_a < self.present_current_min_a:
+            raise ValueError("空槽門檻必須小於行充存在門檻")
+        if not self.present_current_min_a < self.full_current_max_a:
+            raise ValueError("行充存在門檻必須小於滿電門檻")
+        if state_confirm_samples < 1:
+            raise ValueError("狀態確認樣本數必須大於 0")
+        if len(self.slot_enabled) != 3:
+            raise ValueError("slot_enabled 必須包含三個布林值")
 
         self.publisher = self.create_publisher(String, "power_status", 10)
         self.current_histories = [
@@ -77,6 +91,15 @@ class INA3221Node(Node):
         ]
         self.voltage_histories = [
             collections.deque(maxlen=window_size) for _ in range(3)
+        ]
+        self.state_trackers = [
+            SlotStateTracker(
+                empty_current_max_a=self.empty_current_max_a,
+                present_current_min_a=self.present_current_min_a,
+                full_current_max_a=self.full_current_max_a,
+                confirm_samples=state_confirm_samples,
+            )
+            for _ in range(3)
         ]
         self.bus = smbus2.SMBus(self.i2c_bus)
         self.timer = self.create_timer(sample_period, self.timer_callback)
@@ -121,15 +144,26 @@ class INA3221Node(Node):
             voltage_average = (
                 sum(voltage_history) / len(voltage_history) if voltage_history else None
             )
+            enabled = self.slot_enabled[index]
+            status = (
+                self.state_trackers[index].update(
+                    current_average if sensor_ok else None,
+                    sensor_ok=sensor_ok,
+                )
+                if enabled
+                else "disabled"
+            )
             channels[f"ch{index + 1}"] = build_slot(
                 index + 1,
                 current_average if sensor_ok else None,
                 voltage_v=voltage_average if sensor_ok else None,
                 sensor_ok=sensor_ok,
+                status=status,
+                enabled=enabled,
                 empty_current_max_a=self.empty_current_max_a,
                 empty_voltage_max_v=self.empty_voltage_max_v,
-                ready_current_min_a=self.ready_current_min_a,
-                low_current_min_a=self.low_current_min_a,
+                present_current_min_a=self.present_current_min_a,
+                full_current_max_a=self.full_current_max_a,
             )
 
         summary = " | ".join(

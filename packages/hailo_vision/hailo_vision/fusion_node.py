@@ -8,13 +8,51 @@ import math
 import numpy as np
 from collections import deque
 import struct 
+import time
+
+from hailo_vision.semantic_protocol import (
+    parse_semantic_payload,
+    semantic_data_age,
+    semantic_safety_multiplier,
+    stamps_are_synchronized,
+)
 
 class SensorFusionNode(Node):
     def __init__(self):
         super().__init__('sensor_fusion_node')
         
         self.latest_semantic_data = []
+        self.latest_semantic_stamp_ns = None
+        self.latest_semantic_received_at = None
+        self.last_semantic_source_stamp_ns = None
+        self.semantic_started_at = time.monotonic()
+        self.semantic_health_state = 'starting'
+        self.last_semantic_error_at = 0.0
+        self.last_sync_warning_at = 0.0
         self.history = {} 
+
+        self.declare_parameter('semantic_timeout_sec', 0.50)
+        self.declare_parameter('semantic_max_sync_skew_sec', 0.20)
+        self.declare_parameter('semantic_stale_speed_multiplier', 0.50)
+        self.declare_parameter('semantic_hard_stop_timeout_sec', 2.00)
+        self.semantic_timeout_sec = float(
+            self.get_parameter('semantic_timeout_sec').value
+        )
+        self.semantic_max_sync_skew_sec = float(
+            self.get_parameter('semantic_max_sync_skew_sec').value
+        )
+        self.semantic_stale_speed_multiplier = float(
+            self.get_parameter('semantic_stale_speed_multiplier').value
+        )
+        self.semantic_hard_stop_timeout_sec = float(
+            self.get_parameter('semantic_hard_stop_timeout_sec').value
+        )
+        if not 0 < self.semantic_timeout_sec < self.semantic_hard_stop_timeout_sec:
+            raise ValueError('語意 soft timeout 必須大於 0 且小於 hard-stop timeout')
+        if self.semantic_max_sync_skew_sec < 0:
+            raise ValueError('語意與雷達最大時間差不得小於 0')
+        if not 0 <= self.semantic_stale_speed_multiplier <= 1:
+            raise ValueError('語意逾時速度乘數必須介於 0 到 1')
         
         # 🌟 速度控制乘數
         self.speed_multiplier = 1.0
@@ -34,23 +72,114 @@ class SensorFusionNode(Node):
 
         # 3. 發布虛擬玻璃點雲給 Nav2 代價地圖
         self.pub_virtual_glass = self.create_publisher(PointCloud2, '/visual_glass', 10)
+        self.semantic_watchdog_timer = self.create_timer(
+            0.1, self.semantic_watchdog_callback
+        )
 
         self.get_logger().info('🧠 融合節點啟動：極速煞車攔截器與虛擬牆壁建造者已上線！')
 
     def vision_callback(self, msg):
         try:
-            self.latest_semantic_data = json.loads(msg.data)
-        except Exception:
-            pass
+            packet = parse_semantic_payload(msg.data)
+            if (
+                packet.stamp_ns is not None
+                and self.last_semantic_source_stamp_ns is not None
+                and packet.stamp_ns <= self.last_semantic_source_stamp_ns
+            ):
+                return
+            self.latest_semantic_data = packet.detections
+            self.latest_semantic_stamp_ns = packet.stamp_ns
+            self.latest_semantic_received_at = time.monotonic()
+            if packet.stamp_ns is not None:
+                self.last_semantic_source_stamp_ns = packet.stamp_ns
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            now = time.monotonic()
+            if now - self.last_semantic_error_at >= 10.0:
+                self.get_logger().warning(f'無效的語意資料，已忽略: {exc}')
+                self.last_semantic_error_at = now
+
+    def semantic_age(self, now=None):
+        now = time.monotonic() if now is None else now
+        reference = self.latest_semantic_received_at
+        if reference is None:
+            reference = self.semantic_started_at
+        receipt_age = max(0.0, now - reference)
+        return semantic_data_age(
+            receipt_age,
+            source_stamp_ns=self.latest_semantic_stamp_ns,
+            now_ns=self.get_clock().now().nanoseconds,
+        )
+
+    def semantic_speed_limit(self, now=None):
+        return semantic_safety_multiplier(
+            self.semantic_age(now),
+            self.semantic_timeout_sec,
+            self.semantic_stale_speed_multiplier,
+            self.semantic_hard_stop_timeout_sec,
+        )
+
+    def semantic_watchdog_callback(self):
+        speed_limit = self.semantic_speed_limit()
+        if self.latest_semantic_received_at is None and speed_limit == 1.0:
+            next_state = 'starting'
+        elif speed_limit == 1.0:
+            next_state = 'healthy'
+        elif speed_limit > 0.0:
+            next_state = 'stale'
+        else:
+            next_state = 'stopped'
+
+        if next_state == self.semantic_health_state:
+            return
+        if next_state == 'healthy':
+            self.get_logger().info('語意資料已恢復為即時狀態')
+        elif next_state == 'stale':
+            speed_percent = round(self.semantic_stale_speed_multiplier * 100)
+            self.get_logger().warning(
+                f'語意資料已逾時，停止使用舊偵測並限制車速為 {speed_percent}%'
+            )
+        else:
+            self.get_logger().error('語意資料持續逾時，已輸出零速命令')
+            self.pub_safe_cmd.publish(Twist())
+        self.semantic_health_state = next_state
 
     def cmd_vel_callback(self, msg):
+        effective_multiplier = min(
+            self.speed_multiplier,
+            self.semantic_speed_limit(),
+        )
         real_cmd = Twist()
-        real_cmd.linear.x = msg.linear.x * self.speed_multiplier
-        real_cmd.linear.y = msg.linear.y * self.speed_multiplier
-        real_cmd.angular.z = msg.angular.z * self.speed_multiplier
+        real_cmd.linear.x = msg.linear.x * effective_multiplier
+        real_cmd.linear.y = msg.linear.y * effective_multiplier
+        real_cmd.angular.z = msg.angular.z * effective_multiplier
         self.pub_safe_cmd.publish(real_cmd)
 
     def scan_callback(self, scan_msg):
+        if self.semantic_age() > self.semantic_timeout_sec:
+            self.latest_semantic_data = []
+            self.speed_multiplier = 1.0
+            self._update_glass_tracker([], scan_msg.header)
+            return
+
+        scan_stamp_ns = (
+            scan_msg.header.stamp.sec * 1_000_000_000
+            + scan_msg.header.stamp.nanosec
+        )
+        if not stamps_are_synchronized(
+            self.latest_semantic_stamp_ns,
+            scan_stamp_ns,
+            self.semantic_max_sync_skew_sec,
+        ):
+            now = time.monotonic()
+            if now - self.last_sync_warning_at >= 10.0:
+                self.get_logger().warning(
+                    '語意影像與雷達時間差過大，本次不進行融合'
+                )
+                self.last_sync_warning_at = now
+            self.speed_multiplier = 1.0
+            self._update_glass_tracker([], scan_msg.header)
+            return
+
         if not self.latest_semantic_data:
             self.speed_multiplier = 1.0 
             self._update_glass_tracker([]) # 沒看到東西，衰減玻璃計數
@@ -204,7 +333,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

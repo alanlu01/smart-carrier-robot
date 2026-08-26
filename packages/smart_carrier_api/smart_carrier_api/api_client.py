@@ -17,9 +17,7 @@ class SmartCarrierApi:
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None):
         body = (
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            if payload is not None
-            else None
+            json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         )
         request = Request(
             f"{self.base_url}{path}",
@@ -60,16 +58,29 @@ class SmartCarrierApi:
             f"/api/v1/robots/{self.robot_id}/tasks/{task_id}",
         )
 
-    def release_task(self, task_id: str, note: str | None = None):
+    def release_task(self, task_id: str, event_id: str, note: str | None = None):
         return self._request(
             "POST",
             f"/api/v1/robots/{self.robot_id}/tasks/{task_id}/release",
-            {"note": note},
+            {"event_id": event_id, "note": note},
         )
 
-    def report_result(self, task_id: str, status: str, note: str | None = None):
+    def report_result(
+        self,
+        task_id: str,
+        event_id: str,
+        status: str,
+        note: str | None = None,
+    ):
         return self._request(
             "POST",
             f"/api/v1/robots/{self.robot_id}/tasks/{task_id}/result",
-            {"status": status, "note": note},
+            {"event_id": event_id, "status": status, "note": note},
+        )
+
+    def report_progress(self, task_id: str, progress: dict[str, Any]):
+        return self._request(
+            "POST",
+            f"/api/v1/robots/{self.robot_id}/tasks/{task_id}/progress",
+            progress,
         )

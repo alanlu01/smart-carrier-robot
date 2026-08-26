@@ -20,27 +20,32 @@ The payload is a JSON object with `ch1`, `ch2`, and `ch3`. Each channel contains
 {
   "slot": 1,
   "bank_id": "PB-01",
-  "status": "ready",
-  "voltage": 5.0,
-  "current": 0.1,
-  "charge": 96,
-  "sensor_ok": true
+  "status": "low",
+  "voltage": 10.2,
+  "current": 1.0,
+  "charge": null,
+  "sensor_ok": true,
+  "enabled": true
 }
 ```
 
 Canonical states are:
 
-- `empty`: no detected slot voltage (`<= 1.0 V`).
-- `full`: slot voltage is present and bank current is above the empty-slot
-  baseline but below `0.10 A`.
-- `ready`: borrowable bank approaching full charge (`>= 0.10 A` and `< 0.4 A`).
-- `low`: bank charging at high current (`>= 0.4 A`).
+- `empty`: current is `<= 0.008 A`.
+- `full`: a present bank has settled current from `0.020 A` through `0.080 A`.
+- `low`: the bank is charging above `0.080 A`; its true percentage is unknown.
+- `ready`: retained for compatibility with externally supplied status, but is not generated from INA3221 current.
 - `unknown`: no valid INA3221 sample is available.
+- `disabled`: intentionally unavailable for maintenance; it is not borrowable
+  or returnable and does not make the remaining monitor unhealthy.
 
-The voltage and current thresholds are ROS parameters in `power_monitor.yaml`.
-For both live and legacy samples, `<= 0.005 A` is treated as an empty powered
-slot; this includes the approximately `0.001` to `0.002 A` idle readings
-observed on the robot. A channel below `1.0 V` is also empty/unconnected.
+The quick-charge modules share the vehicle's 3S supply, so the approximately
+`10–12.6 V` bus measurement cannot indicate whether a power bank is inserted.
+The `0.008–0.020 A` gap is a hysteresis band that retains the last trusted
+state. A transition needs six consecutive 0.5-second samples. Startup remains
+`unknown` until one state has been confirmed. `charge` is `0` for `empty`, `100`
+for `full`, and JSON `null` for `low` or `unknown`; current is not used to invent
+a percentage. Thresholds are ROS parameters in `power_monitor.yaml`.
 
 An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the last healthy inventory and pauses new dispatches after ten seconds without a healthy update; it does not interpret an I²C failure as an empty slot.
 
@@ -67,7 +72,13 @@ The status is `done` or `failed` after navigation. If inventory changes between 
 - `delivery`, `navigation`, and `callbot`: navigate without consuming a power-bank slot.
 - `quantity` must currently be `1`; larger quantities are rejected and reported as failed instead of being partially fulfilled.
 
-Physical insertion/removal confirmation remains future work. A successful result currently means that Nav2 reached the destination.
+After Nav2 reaches a borrow or return destination, arrival alone does not mark
+the task done. The delivery node waits for six fresh healthy snapshots showing
+the assigned borrow slot became `empty`, or the assigned return slot became
+occupied, while all other enabled slots remain unchanged. A wrong-slot operation
+must be restored before verification can continue. The user is warned at 30
+seconds and the task fails at 60 seconds; mistakes do not reset the timer.
+Navigation-only tasks still complete immediately on arrival.
 
 ## Runtime
 

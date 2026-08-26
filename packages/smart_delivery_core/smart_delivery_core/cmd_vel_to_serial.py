@@ -50,6 +50,11 @@ class CmdVelToSerialNode(Node):
 
     def destroy_node(self):
         if hasattr(self, 'serial_port') and self.serial_port.is_open:
+            try:
+                self.serial_port.write(b"$CMD,0.00,0.00,0.00#\n")
+                self.serial_port.flush()
+            except Exception as e:
+                self.get_logger().warning(f"關閉前送出零速指令失敗: {e}")
             self.serial_port.close()
             self.get_logger().info("🔒 序列埠已安全關閉。")
         super().destroy_node()

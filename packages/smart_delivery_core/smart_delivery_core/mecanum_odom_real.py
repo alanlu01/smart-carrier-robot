@@ -7,6 +7,8 @@ import tf2_ros
 import math
 import time
 
+from smart_delivery_core.wheel_feedback import WheelSampleAssembler
+
 class MecanumOdomReal(Node):
     def __init__(self):
         super().__init__('mecanum_odom_real')
@@ -36,6 +38,26 @@ class MecanumOdomReal(Node):
         }
         
         self.current_speeds = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0}
+
+        self.declare_parameter('wheel_batch_window_sec', 0.25)
+        self.declare_parameter('wheel_state_timeout_sec', 0.80)
+        self.declare_parameter('max_integration_dt_sec', 0.20)
+        self.wheel_state_timeout_sec = float(
+            self.get_parameter('wheel_state_timeout_sec').value
+        )
+        self.max_integration_dt_sec = float(
+            self.get_parameter('max_integration_dt_sec').value
+        )
+        batch_window_sec = float(
+            self.get_parameter('wheel_batch_window_sec').value
+        )
+        if self.wheel_state_timeout_sec <= 0 or self.max_integration_dt_sec <= 0:
+            raise ValueError('里程計 timeout 與最大積分週期必須大於 0')
+        self.feedback_assembler = WheelSampleAssembler(
+            batch_window_sec=batch_window_sec,
+            started_at=time.monotonic(),
+        )
+        self.feedback_state = 'waiting'
         
         # 🌟 5. 修正後的精準車體幾何參數
         self.wheel_radius = 0.08  # 真實輪子半徑 8cm
@@ -61,7 +83,7 @@ class MecanumOdomReal(Node):
         # 🌟 9. 因為是反向偏移 (里程計少算)，所以數值要大於 1.0
         self.angular_scale = 1.10  # 建議先從 1.05 到 1.15 之間開始測
 
-        self.last_time = time.time()
+        self.last_time = time.monotonic()
         self.timer = self.create_timer(0.05, self.update_odometry)
         
         self.get_logger().info('真實硬體里程計解析節點已成功啟動！監聽中...')
@@ -69,22 +91,25 @@ class MecanumOdomReal(Node):
     def stm32_data_callback(self, msg):
         raw_str = msg.data
         try:
-            for letter in ['A', 'B', 'C', 'D']:
-                rt_label = f'{letter}_RT:'
-                if rt_label in raw_str:
-                    parts = raw_str.split(rt_label)
-                    val_str = parts[1].split(',')[0].strip() if ',' in parts[1] else parts[1].strip()
-                    raw_val = float(val_str)
-                    
-                    wheel_position = self.motor_mapping[letter]
+            snapshot = self.feedback_assembler.add_line(raw_str, time.monotonic())
+            if snapshot is None:
+                return
 
-                    # 🌟 乘上標準轉換係數，並且套用「反向補償」抹平偏右誤差
-                    real_rad_s = raw_val * self.rt_to_rad_s * self.compensation[wheel_position]
-
-                    if letter in ['B', 'D']:
-                        self.current_speeds[wheel_position] = -real_rad_s
-                    else:
-                        self.current_speeds[wheel_position] = real_rad_s
+            next_speeds = {}
+            for letter, raw_val in snapshot.items():
+                wheel_position = self.motor_mapping[letter]
+                real_rad_s = (
+                    raw_val
+                    * self.rt_to_rad_s
+                    * self.compensation[wheel_position]
+                )
+                next_speeds[wheel_position] = (
+                    -real_rad_s if letter in ['B', 'D'] else real_rad_s
+                )
+            self.current_speeds = next_speeds
+            if self.feedback_state != 'healthy':
+                self.get_logger().info('STM32 四輪回授已完整，里程計 watchdog 正常')
+            self.feedback_state = 'healthy'
         except Exception as e:
             self.get_logger().error(f'字串解析出錯: {e}，原始字串為: {raw_str}')
 
@@ -96,9 +121,28 @@ class MecanumOdomReal(Node):
         return q
 
     def update_odometry(self):
-        current_time = time.time()
-        dt = current_time - self.last_time
+        current_time = time.monotonic()
+        dt = min(
+            max(0.0, current_time - self.last_time),
+            self.max_integration_dt_sec,
+        )
         self.last_time = current_time
+
+        if self.feedback_assembler.is_stale(
+            current_time, self.wheel_state_timeout_sec
+        ):
+            self.current_speeds = {
+                'FL': 0.0,
+                'FR': 0.0,
+                'RL': 0.0,
+                'RR': 0.0,
+            }
+            if self.feedback_state != 'stale':
+                age = self.feedback_assembler.sample_age(current_time)
+                self.get_logger().warning(
+                    f'STM32 四輪回授已逾時 {age:.2f}s，凍結里程計並輸出零速度'
+                )
+            self.feedback_state = 'stale'
         
         # 1. 抓取當前四個輪子的最新轉速快照
         w_fl = self.current_speeds['FL']

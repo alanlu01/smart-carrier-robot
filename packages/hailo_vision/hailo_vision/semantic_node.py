@@ -11,6 +11,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from hailo_platform import HEF, VDevice, InferVStreams, InputVStreamParams, OutputVStreamParams, FormatType
 
+from hailo_vision.semantic_protocol import build_semantic_payload
+
 # 分類字典
 CLASS_NAMES = {
     0: 'Person', 1: 'Cart', 2: 'Stroller', 3: 'Wheelchair', 4: 'Wheelchair_Person',
@@ -105,6 +107,7 @@ class SemanticVisionNode(Node):
         
         self.get_logger().info('🚀 Hailo 語意導航大腦啟動！開始鎖定目標方位...')
         self.frame_count = 0
+        self.sequence = 0
         self.start_time = time.time()
         self.fps = 0.0
         
@@ -157,8 +160,16 @@ class SemanticVisionNode(Node):
                 cv2.circle(frame, (int(x_center), y + h), 5, (0, 255, 255), -1)
 
         # 🌟 JSON 情報是關鍵神經，每一幀都必須全速發布！
+        self.sequence += 1
+        semantic_payload = build_semantic_payload(
+            semantic_data_list,
+            stamp_sec=msg.header.stamp.sec,
+            stamp_nanosec=msg.header.stamp.nanosec,
+            frame_id=msg.header.frame_id,
+            sequence=self.sequence,
+        )
         msg_str = String()
-        msg_str.data = json.dumps(semantic_data_list)
+        msg_str.data = json.dumps(semantic_payload)
         self.info_pub.publish(msg_str)
         
         # 計算 FPS
@@ -172,6 +183,7 @@ class SemanticVisionNode(Node):
         if should_publish_image:
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             result_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
+            result_msg.header = msg.header
             self.image_pub.publish(result_msg)
 
 def main(args=None):
@@ -195,7 +207,8 @@ def main(args=None):
                     pass
                 node.destroy_node()
                 
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

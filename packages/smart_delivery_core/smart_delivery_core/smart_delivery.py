@@ -1,15 +1,34 @@
 import json
 import math
 import time
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
+
+from smart_delivery_core.delivery_state import (
+    DeliveryJournal,
+    DeliveryStateMachine,
+    SlotActionVerifier,
+)
 
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
+SLOT_CONFIRMATION_WARNING_SECONDS = 30.0
+SLOT_CONFIRMATION_TIMEOUT_SECONDS = 60.0
+SLOT_CONFIRMATION_SAMPLES = 6
+OCCUPIED_SLOT_STATUSES = {"low", "ready", "full"}
+STATE_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 # --- 1. 預先定義的靠牆待機點 ---
 STANDBY_POINTS = [
@@ -33,32 +52,87 @@ BORROWABLE_STATUS_PRIORITY = {
 
 NAVIGATION_ONLY_TASK_TYPES = {"delivery", "navigation", "callbot"}
 
+
+@dataclass
+class SlotConfirmationTracker:
+    """Confirm a physical borrow/return action using fresh slot snapshots."""
+
+    task_type: str
+    slot_number: int
+    confirm_samples: int = SLOT_CONFIRMATION_SAMPLES
+    matching_samples: int = 0
+    last_status: str = "unknown"
+
+    def __post_init__(self):
+        if self.task_type not in {"borrow", "return"}:
+            raise ValueError("槽位確認只支援 borrow 或 return")
+        if self.slot_number not in (1, 2, 3):
+            raise ValueError("slot_number 必須介於 1 到 3")
+        if self.confirm_samples < 1:
+            raise ValueError("confirm_samples 必須大於 0")
+
+    def update(self, slots):
+        slot = next(
+            (item for item in slots if int(item.get("slot", 0)) == self.slot_number),
+            None,
+        )
+        if not slot or not slot.get("sensor_ok", False):
+            self.last_status = "unknown"
+            self.matching_samples = 0
+            return False
+
+        self.last_status = normalize_power_bank_status(slot.get("status"))
+        if self.task_type == "borrow":
+            matches = self.last_status == "empty"
+        else:
+            matches = self.last_status in OCCUPIED_SLOT_STATUSES
+        self.matching_samples = self.matching_samples + 1 if matches else 0
+        return self.matching_samples >= self.confirm_samples
+
+
 def select_power_bank(
     power_bank_slots,
     required_charge=0,
     status_aliases=None,
     power_bank_id=None,
 ):
-    if not 0 <= required_charge <= 100: raise ValueError("required_charge 必須介於 0 到 100")
+    if not 0 <= required_charge <= 100:
+        raise ValueError("required_charge 必須介於 0 到 100")
     candidates = []
     for slot_index, power_bank in enumerate(power_bank_slots):
-        if power_bank is None: continue
+        if power_bank is None:
+            continue
         bank_id = power_bank.get("bank_id") or power_bank.get("id")
         if power_bank_id is not None and bank_id != power_bank_id:
             continue
         status = normalize_power_bank_status(power_bank.get("status"), status_aliases)
-        if status not in BORROWABLE_STATUS_PRIORITY: continue
+        if status not in BORROWABLE_STATUS_PRIORITY:
+            continue
         charge = power_bank.get("charge")
-        if charge is not None:
+        if charge is None:
+            if required_charge > 0 and status != "full":
+                continue
+            effective_charge = 100.0 if status == "full" else 101.0
+        else:
             charge = float(charge)
-            if charge < required_charge: continue
+            if charge < required_charge:
+                continue
+            effective_charge = charge
 
-        best_fit_charge = charge if charge is not None else 101
-        candidates.append((BORROWABLE_STATUS_PRIORITY[status], best_fit_charge, slot_index, power_bank))
+        candidates.append(
+            (
+                BORROWABLE_STATUS_PRIORITY[status],
+                effective_charge,
+                slot_index,
+                power_bank,
+            )
+        )
 
-    if not candidates: return None
+    if not candidates:
+        return None
     _, _, slot_index, power_bank = min(candidates, key=lambda item: item[:3])
     return slot_index, power_bank
+
 
 def _prepare_slots(power_banks, slot_capacity, status_aliases=None):
     slots = []
@@ -72,12 +146,30 @@ def _prepare_slots(power_banks, slot_capacity, status_aliases=None):
         slots.append(None if bank["status"] == "empty" else bank)
     return slots + [None] * (slot_capacity - len(slots))
 
+
 def _returned_power_bank(order, route_number, status_aliases=None):
-    power_bank = dict(order.get("power_bank", {"id": f"returned-{route_number}", "status": order.get("return_status", "low"), "charge": order.get("charge")}))
+    power_bank = dict(
+        order.get(
+            "power_bank",
+            {
+                "id": f"returned-{route_number}",
+                "status": order.get("return_status", "low"),
+                "charge": order.get("charge"),
+            },
+        )
+    )
     power_bank["status"] = normalize_power_bank_status(power_bank.get("status"), status_aliases)
     return power_bank
 
-def schedule_orders(pending_orders, current_pos, power_banks, slot_capacity=3, status_aliases=None, borrow_distance_weight=BORROW_DISTANCE_WEIGHT):
+
+def schedule_orders(
+    pending_orders,
+    current_pos,
+    power_banks,
+    slot_capacity=3,
+    status_aliases=None,
+    borrow_distance_weight=BORROW_DISTANCE_WEIGHT,
+):
     orders = [dict(order) for order in pending_orders]
     slots = _prepare_slots(power_banks, slot_capacity, status_aliases)
     position = {"x": float(current_pos["x"]), "y": float(current_pos["y"])}
@@ -87,7 +179,9 @@ def schedule_orders(pending_orders, current_pos, power_banks, slot_capacity=3, s
         feasible_orders = []
         for order_index, order in enumerate(orders):
             order_type = order.get("type")
-            distance = math.hypot(float(order["x"]) - position["x"], float(order["y"]) - position["y"])
+            distance = math.hypot(
+                float(order["x"]) - position["x"], float(order["y"]) - position["y"]
+            )
 
             if order_type == "borrow":
                 selection = select_power_bank(
@@ -97,17 +191,30 @@ def schedule_orders(pending_orders, current_pos, power_banks, slot_capacity=3, s
                     order.get("power_bank_id"),
                 )
                 if selection is not None:
-                    feasible_orders.append((distance * borrow_distance_weight, distance, order_index, "borrow", selection))
+                    feasible_orders.append(
+                        (
+                            distance * borrow_distance_weight,
+                            distance,
+                            order_index,
+                            "borrow",
+                            selection,
+                        )
+                    )
             elif order_type == "return":
-                try: empty_slot = slots.index(None)
-                except ValueError: continue
+                try:
+                    empty_slot = slots.index(None)
+                except ValueError:
+                    continue
                 feasible_orders.append((distance, distance, order_index, "return", empty_slot))
             elif order_type in NAVIGATION_ONLY_TASK_TYPES:
                 feasible_orders.append((distance, distance, order_index, order_type, None))
 
-        if not feasible_orders: break
+        if not feasible_orders:
+            break
 
-        priority_score, distance, order_index, order_type, resource = min(feasible_orders, key=lambda item: (item[0], item[1], item[2]))
+        priority_score, distance, order_index, order_type, resource = min(
+            feasible_orders, key=lambda item: (item[0], item[1], item[2])
+        )
         order = orders.pop(order_index)
         scheduled_order = dict(order)
         scheduled_order["distance"] = distance
@@ -115,12 +222,14 @@ def schedule_orders(pending_orders, current_pos, power_banks, slot_capacity=3, s
         if order_type == "borrow":
             slot_index, power_bank = resource
             scheduled_order["selected_power_bank"] = dict(power_bank)
+            scheduled_order["slot_number"] = slot_index + 1
             slots[slot_index] = None
         elif order_type == "return":
             slot_index = resource
             power_bank = _returned_power_bank(order, len(optimized_route) + 1, status_aliases)
             slots[slot_index] = power_bank
             scheduled_order["returned_power_bank"] = dict(power_bank)
+            scheduled_order["slot_number"] = slot_index + 1
 
         optimized_route.append(scheduled_order)
         position = {"x": float(scheduled_order["x"]), "y": float(scheduled_order["y"])}
@@ -172,19 +281,41 @@ def order_payload_to_order(payload):
         **coordinates,
     }
     if task_type == "return":
-        order["power_bank"] = data.get(
-            "power_bank", {"id": "PB-RT", "status": "low", "charge": 20}
-        )
+        order["power_bank"] = data.get("power_bank", {"id": "PB-RT", "status": "low", "charge": 20})
     return order
 
 
-def publish_task_result(publisher, task_id, status, note):
+def publish_task_result(publisher, task_id, status, note, event_id=None):
     if not task_id:
-        return
+        return None
+    event_id = event_id or str(uuid.uuid4())
     message = String()
     message.data = json.dumps(
-        {"task_id": str(task_id), "status": status, "note": note}, ensure_ascii=False
+        {
+            "event_id": event_id,
+            "task_id": str(task_id),
+            "status": status,
+            "note": note,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+        ensure_ascii=False,
     )
+    publisher.publish(message)
+    return json.loads(message.data)
+
+
+def publish_task_state(publisher, task_id, state, **details):
+    if not task_id:
+        return
+    payload = {
+        "event_id": str(uuid.uuid4()),
+        "task_id": str(task_id),
+        "progress_state": state,
+        "progress_updated_at": datetime.now(UTC).isoformat(),
+        **details,
+    }
+    message = String()
+    message.data = json.dumps(payload, ensure_ascii=False)
     publisher.publish(message)
 
 
@@ -197,39 +328,50 @@ def infeasible_order_note(order):
         return "No empty power slot is available"
     return "Task is not executable with the current robot state"
 
+
 def yaw_to_quaternion(yaw):
     q = Quaternion()
     q.z = math.sin(yaw / 2.0)
     q.w = math.cos(yaw / 2.0)
     return q
 
+
 def go_to_standby(navigator, current_pos):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
     closest_standby = min(
-        STANDBY_POINTS, 
-        key=lambda pt: math.hypot(pt["x"] - current_pos["x"], pt["y"] - current_pos["y"])
+        STANDBY_POINTS,
+        key=lambda pt: math.hypot(pt["x"] - current_pos["x"], pt["y"] - current_pos["y"]),
     )
-    
+
     print(f"➡️ 前往待機點：{closest_standby['name']}")
     goal_pose = PoseStamped()
-    goal_pose.header.frame_id = 'map'
+    goal_pose.header.frame_id = "map"
     goal_pose.header.stamp = navigator.get_clock().now().to_msg()
-    goal_pose.pose.position.x = closest_standby['x']
-    goal_pose.pose.position.y = closest_standby['y']
-    goal_pose.pose.orientation = yaw_to_quaternion(closest_standby['yaw'])
+    goal_pose.pose.position.x = closest_standby["x"]
+    goal_pose.pose.position.y = closest_standby["y"]
+    goal_pose.pose.orientation = yaw_to_quaternion(closest_standby["yaw"])
 
     navigator.goToPose(goal_pose)
     while not navigator.isTaskComplete():
-        time.sleep(0.1) # 釋放 CPU
+        time.sleep(0.1)  # 釋放 CPU
         rclpy.spin_once(navigator, timeout_sec=0.05)
-        
+
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
-    return {"x": closest_standby['x'], "y": closest_standby['y']}
+    return {"x": closest_standby["x"], "y": closest_standby["y"]}
+
 
 def main():
     rclpy.init()
     navigator = BasicNavigator()
+    navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
+    navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
+    navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
+    warning_seconds = float(navigator.get_parameter("slot_confirmation_warning_sec").value)
+    timeout_seconds = float(navigator.get_parameter("slot_confirmation_timeout_sec").value)
+    confirmation_samples = int(navigator.get_parameter("slot_confirmation_samples").value)
+    if not 0 < warning_seconds < timeout_seconds or confirmation_samples < 1:
+        raise ValueError("槽位確認須符合 0 < warning < timeout，且樣本數大於 0")
 
     print("⏳ 等待 Nav2 系統上線...")
     navigator.waitUntilNav2Active()
@@ -237,16 +379,109 @@ def main():
 
     latest_power_banks = None
     latest_power_status_at = 0.0
+    latest_power_sequence = 0
     last_power_error_at = 0.0
+    pending_orders = []
+    active_task_id = None
+    cancellation_requests = {}
+    journal = DeliveryJournal()
+    recovered = journal.load()
+    pending_result = recovered.get("pending_result")
+    active_task = recovered.get("active_task")
+    last_result_publish_at = 0.0
+
     task_result_publisher = navigator.create_publisher(
-        String, "/smart_carrier/task_result", 10
+        String, "/smart_carrier/task_result", STATE_QOS
+    )
+    task_state_publisher = navigator.create_publisher(
+        String, "/smart_carrier/task_state", STATE_QOS
     )
 
+    def persist(active=None, state=None, result=None):
+        data = {}
+        if active is not None:
+            data["active_task"] = active
+        if state is not None:
+            data["state"] = state
+        if result is not None:
+            data["pending_result"] = result
+        if data:
+            journal.save(data)
+        else:
+            journal.clear()
+
+    def emit_result(result):
+        nonlocal last_result_publish_at
+        message = String()
+        message.data = json.dumps(result, ensure_ascii=False)
+        task_result_publisher.publish(message)
+        last_result_publish_at = time.monotonic()
+
+    def queue_result(task, fsm, status, note):
+        nonlocal pending_result
+        if fsm.state != "result_pending":
+            fsm.transition("result_pending")
+        publish_task_state(
+            task_state_publisher,
+            task.get("task_id"),
+            "result_pending",
+            progress_message=note,
+        )
+        pending_result = {
+            "event_id": str(uuid.uuid4()),
+            "task_id": str(task["task_id"]),
+            "status": status,
+            "note": note,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        persist(task, fsm.state, pending_result)
+        emit_result(pending_result)
+
+    def progress(task, fsm, state, **details):
+        fsm.transition(state)
+        persist(task, fsm.state, pending_result)
+        publish_task_state(task_state_publisher, task.get("task_id"), state, **details)
+
+    def result_ack_callback(message):
+        nonlocal pending_result
+        try:
+            ack = json.loads(message.data)
+            if pending_result and str(ack.get("event_id")) == pending_result["event_id"]:
+                publish_task_state(
+                    task_state_publisher,
+                    pending_result["task_id"],
+                    "result_acked",
+                )
+                pending_result = None
+                journal.clear()
+        except (TypeError, json.JSONDecodeError):
+            navigator.get_logger().warning("忽略無效 task_result_ack")
+
+    navigator.create_subscription(
+        String, "/smart_carrier/task_result_ack", result_ack_callback, STATE_QOS
+    )
+
+    if active_task and not pending_result:
+        task_id = active_task.get("task_id") or active_task.get("id")
+        pending_result = {
+            "event_id": str(uuid.uuid4()),
+            "task_id": str(task_id),
+            "status": "failed",
+            "note": "Robot restarted during an active task; manual recovery required",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        persist(active_task, "recovery_required", pending_result)
+        navigator.get_logger().error(
+            f"偵測到重啟前未完成任務 {task_id}；不自動續航，改回報復原失敗"
+        )
+
     def power_status_callback(msg):
-        nonlocal latest_power_banks, latest_power_status_at, last_power_error_at
+        nonlocal latest_power_banks, latest_power_status_at
+        nonlocal latest_power_sequence, last_power_error_at
         try:
             latest_power_banks = payload_to_slots(msg.data, require_healthy=True)
             latest_power_status_at = time.monotonic()
+            latest_power_sequence += 1
         except ValueError as exc:
             now = time.monotonic()
             if now - last_power_error_at >= 10.0:
@@ -255,200 +490,288 @@ def main():
 
     navigator.create_subscription(String, "power_status", power_status_callback, 10)
 
-    print("⏳ 等待 INA3221 三路電流資料...")
-    deadline = time.monotonic() + POWER_STATUS_TIMEOUT_SECONDS
-    while latest_power_banks is None and time.monotonic() < deadline:
-        rclpy.spin_once(navigator, timeout_sec=0.2)
-
-    if latest_power_banks is None:
-        print("❌ 超時未收到 power_status，請確認電源監控節點是否運行。")
-        rclpy.shutdown()
-        return
-
-    # --- 3. 動態訂單佇列與雲端訂單監聽 ---
-    pending_orders = []
-    active_task_id = None
-    cancellation_requested_task_ids = set()
-
     def order_callback(msg):
-        nonlocal pending_orders
+        nonlocal active_task
         task_id = None
         try:
-            new_order = json.loads(msg.data)
-            task_id = new_order.get("id")
-            if task_id and str(task_id) in cancellation_requested_task_ids:
-                publish_task_result(
-                    task_result_publisher,
-                    task_id,
-                    "cancelled",
-                    "Cancelled by administrator before navigation started",
-                )
+            raw = json.loads(msg.data)
+            task_id = raw.get("id")
+            order = order_payload_to_order(raw)
+            if pending_result:
+                navigator.get_logger().warning(f"結果尚待本機橋接確認，暫不接收任務 {task_id}")
                 return
-            order_data = order_payload_to_order(new_order)
-            if task_id and any(order.get("task_id") == str(task_id) for order in pending_orders):
-                navigator.get_logger().warning(f"忽略重複任務：{task_id}")
+            if any(item.get("task_id") == str(task_id) for item in pending_orders):
                 return
-            pending_orders.append(order_data)
-            print(
-                f"\n📥 收到雲端新訂單並加入排程："
-                f"{order_data['name']} ({order_data['type']})"
+            pending_orders.append(order)
+            active_task = order
+            persist(order, "task_accepted", None)
+            publish_task_state(
+                task_state_publisher,
+                task_id,
+                "task_accepted",
+                progress_message="Robot accepted the task",
             )
+            print(f"\n📥 收到雲端任務：{order['name']} ({order['type']})")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            print(f"\n❌ 訂單解析失敗: {exc}")
-            publish_task_result(task_result_publisher, task_id, "failed", str(exc))
+            navigator.get_logger().error(f"訂單解析失敗：{exc}")
+            if task_id:
+                invalid_task = {"task_id": str(task_id)}
+                queue_result(
+                    invalid_task,
+                    DeliveryStateMachine("task_accepted"),
+                    "failed",
+                    str(exc),
+                )
+
+    navigator.create_subscription(String, "order", order_callback, STATE_QOS)
 
     def task_cancel_callback(msg):
-        nonlocal pending_orders, active_task_id
+        nonlocal active_task_id
         try:
             cancellation = json.loads(msg.data)
             task_id = str(cancellation["task_id"])
             reason = str(cancellation.get("reason") or "Cancelled by administrator")
-            cancellation_requested_task_ids.add(task_id)
+            cancellation_requests[task_id] = reason
             if active_task_id == task_id:
                 navigator.get_logger().warning(f"正在停止管理員取消的任務：{task_id}")
-                return
-            for index, order in enumerate(pending_orders):
-                if order.get("task_id") == task_id:
-                    pending_orders.pop(index)
-                    publish_task_result(task_result_publisher, task_id, "cancelled", reason)
-                    navigator.get_logger().warning(f"已取消尚未開始導航的任務：{task_id}")
-                    return
+                navigator.cancelTask()
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             navigator.get_logger().error(f"無效的取消任務訊息：{exc}")
 
-    # 訂閱 cloud_bridge 發出的訂單話題
-    navigator.create_subscription(String, "order", order_callback, 10)
     navigator.create_subscription(
-        String, "/smart_carrier/task_cancel", task_cancel_callback, 10
+        String, "/smart_carrier/task_cancel", task_cancel_callback, STATE_QOS
     )
 
-    current_pos = {"x": 0.0, "y": 0.0}
-    is_standby = False  # 用來記錄目前是否已經在待機點
-    last_stale_warning_at = 0.0
-    
-    print("\n🚀 智慧動態派車系統已啟動！等待接收訂單...")
+    print("⏳ 等待 INA3221 電流資料...")
+    deadline = time.monotonic() + POWER_STATUS_TIMEOUT_SECONDS
+    while latest_power_banks is None and time.monotonic() < deadline:
+        rclpy.spin_once(navigator, timeout_sec=0.2)
+    if latest_power_banks is None:
+        navigator.get_logger().error("超時未收到健康的 power_status")
+        rclpy.shutdown()
+        return
 
-    # --- 4. 無窮迴圈：讓程式成為常駐服務 ---
+    current_pos = {"x": 0.0, "y": 0.0}
+    is_standby = False
+    last_stale_warning_at = 0.0
+    print("\n🚀 智慧動態派車系統已啟動")
+
     while rclpy.ok():
-        # 處理回呼函式 (讓 power_status 和 order 能夠隨時更新)
         rclpy.spin_once(navigator, timeout_sec=0.5)
 
-        if pending_orders:
-            now = time.monotonic()
-            if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
-                if now - last_stale_warning_at >= 10.0:
-                    navigator.get_logger().error("power_status 已逾時，暫停派送新任務")
-                    last_stale_warning_at = now
-                time.sleep(1.0)
-                continue
-
-            optimized_route, _, _ = schedule_orders(
-                pending_orders, current_pos, latest_power_banks, slot_capacity=3
-            )
-
-            if not optimized_route:
-                blocked_order = pending_orders.pop(0)
-                note = infeasible_order_note(blocked_order)
-                navigator.get_logger().warning(
-                    f"任務 {blocked_order.get('task_id')} 執行條件已改變，釋放回雲端：{note}"
-                )
-                publish_task_result(
-                    task_result_publisher,
-                    blocked_order.get("task_id"),
-                    "released",
-                    note,
-                )
-                continue
-
-            # 如果有可執行的訂單，解除待機狀態並準備出發
-            is_standby = False
-            target = optimized_route[0]
-
-            action = {
-                "borrow": "借用",
-                "return": "歸還",
-                "delivery": "配送",
-                "navigation": "導航",
-                "callbot": "呼叫機器人",
-            }[target["type"]]
-            bank = target.get("selected_power_bank") or target.get("returned_power_bank")
-            bank_text = f" {bank['id']}" if bank else ""
-            print(
-                f"\n➡️ 動態決策前往：{target['name']}"
-                f"（{action}{bank_text}，預計距離: {target['distance']:.2f}m）"
-            )
-
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
-            goal_pose.header.stamp = navigator.get_clock().now().to_msg()
-            goal_pose.pose.position.x = float(target['x'])
-            goal_pose.pose.position.y = float(target['y'])
-            goal_pose.pose.orientation = yaw_to_quaternion(target['yaw'])
-
-            navigator.goToPose(goal_pose)
-            active_task_id = target.get("task_id")
-            cancel_sent = False
-
-            # 在導航過程中依然要更新話題，確保能邊走邊接單
-            while not navigator.isTaskComplete():
-                time.sleep(0.1)
-                rclpy.spin_once(navigator, timeout_sec=0.05)
-                if active_task_id in cancellation_requested_task_ids and not cancel_sent:
-                    navigator.cancelTask()
-                    cancel_sent = True
-
-            result = navigator.getResult()
-            if active_task_id in cancellation_requested_task_ids:
-                print("⚠️ 任務已由管理員取消。")
-                result_status = "cancelled"
-                result_note = "Cancelled by administrator; navigation stopped"
-            elif result == TaskResult.SUCCEEDED:
-                if target["type"] == "borrow":
-                    msg_txt = "您的行動電源已送達！"
-                elif target["type"] == "return":
-                    msg_txt = "請將行動電源放入空槽！"
-                else:
-                    msg_txt = "機器人已抵達指定位置！"
-                print(f"🎉 成功抵達 {target['name']}！(語音：{msg_txt})")
-                current_pos = {"x": float(target['x']), "y": float(target['y'])}
-                result_status = "done"
-                result_note = "Nav2 goal reached"
-            elif result == TaskResult.CANCELED:
-                print("⚠️ 任務取消！")
-                result_status = "failed"
-                result_note = "Nav2 goal cancelled unexpectedly"
-            else:
-                print("❌ 導航失敗！")
-                result_status = "failed"
-                result_note = "Nav2 goal failed"
-
-            publish_task_result(
-                task_result_publisher,
-                target.get("task_id"),
-                result_status,
-                result_note,
-            )
-            if active_task_id:
-                cancellation_requested_task_ids.discard(active_task_id)
-            active_task_id = None
-
-            # 任務執行完畢，將這筆訂單移除
-            target_key = target.get("task_id") or (target["name"], target["type"])
-            for index, order in enumerate(pending_orders):
-                order_key = order.get("task_id") or (order["name"], order["type"])
-                if order_key == target_key:
-                    pending_orders.pop(index)
-                    break
-
-        else:
-            # 當佇列空了，且還沒回到待機點時，執行待機動作
+        if pending_result:
+            if time.monotonic() - last_result_publish_at >= 2.0:
+                emit_result(pending_result)
             if not is_standby:
-                print("\n🏁 目前無待處理訂單！準備靠牆待機。")
                 current_pos = go_to_standby(navigator, current_pos)
                 is_standby = True
+            continue
+
+        if not pending_orders:
+            if not is_standby:
+                print("\n🏁 無待處理任務，返回待機點")
+                current_pos = go_to_standby(navigator, current_pos)
+                is_standby = True
+            continue
+
+        cancelled_order = next(
+            (order for order in pending_orders if order.get("task_id") in cancellation_requests),
+            None,
+        )
+        if cancelled_order:
+            pending_orders.remove(cancelled_order)
+            fsm = DeliveryStateMachine("task_accepted")
+            queue_result(
+                cancelled_order,
+                fsm,
+                "cancelled",
+                cancellation_requests.pop(cancelled_order["task_id"]),
+            )
+            continue
+
+        now = time.monotonic()
+        if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
+            if now - last_stale_warning_at >= 10.0:
+                navigator.get_logger().error("power_status 已逾時，暫停新任務")
+                last_stale_warning_at = now
+            continue
+
+        optimized_route, _, _ = schedule_orders(
+            pending_orders, current_pos, latest_power_banks, slot_capacity=3
+        )
+        if not optimized_route:
+            target = pending_orders.pop(0)
+            fsm = DeliveryStateMachine("task_accepted")
+            progress(target, fsm, "precheck", progress_message="Checking slot availability")
+            queue_result(target, fsm, "released", infeasible_order_note(target))
+            continue
+
+        target = optimized_route[0]
+        fsm = DeliveryStateMachine("task_accepted")
+        is_standby = False
+        progress(target, fsm, "precheck", progress_message="Task precheck passed")
+        progress(
+            target,
+            fsm,
+            "navigating",
+            progress_message=f"Navigating to {target['name']}",
+            expected_slot=target.get("slot_number"),
+        )
+
+        print(f"\n➡️ 前往 {target['name']}（{target['type']}，距離 {target['distance']:.2f}m）")
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.header.stamp = navigator.get_clock().now().to_msg()
+        goal_pose.pose.position.x = float(target["x"])
+        goal_pose.pose.position.y = float(target["y"])
+        goal_pose.pose.orientation = yaw_to_quaternion(target["yaw"])
+        navigator.goToPose(goal_pose)
+        active_task_id = target.get("task_id")
+        cancel_sent = False
+        while not navigator.isTaskComplete():
+            time.sleep(0.1)
+            rclpy.spin_once(navigator, timeout_sec=0.05)
+            if active_task_id in cancellation_requests and not cancel_sent:
+                navigator.cancelTask()
+                cancel_sent = True
+
+        nav_result = navigator.getResult()
+        if active_task_id in cancellation_requests:
+            queue_result(
+                target,
+                fsm,
+                "cancelled",
+                cancellation_requests.pop(active_task_id),
+            )
+        elif nav_result != TaskResult.SUCCEEDED:
+            note = (
+                "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else "Nav2 goal failed"
+            )
+            queue_result(target, fsm, "failed", note)
+        else:
+            current_pos = {"x": float(target["x"]), "y": float(target["y"])}
+            progress(
+                target,
+                fsm,
+                "arrived",
+                progress_message=f"Arrived at {target['name']}",
+                expected_slot=target.get("slot_number"),
+            )
+            if target["type"] not in {"borrow", "return"}:
+                queue_result(target, fsm, "done", "Nav2 goal reached")
+            else:
+                slot_number = int(target["slot_number"])
+                try:
+                    verifier = SlotActionVerifier(
+                        target["type"],
+                        slot_number,
+                        latest_power_banks,
+                        confirm_samples=confirmation_samples,
+                    )
+                except ValueError as exc:
+                    queue_result(target, fsm, "failed", str(exc))
+                else:
+                    action_deadline = datetime.fromtimestamp(
+                        time.time() + timeout_seconds, UTC
+                    ).isoformat()
+                    progress(
+                        target,
+                        fsm,
+                        "waiting_action",
+                        progress_message=(
+                            f"請在 {slot_number} 號槽"
+                            f"{'取走' if target['type'] == 'borrow' else '放入'}行動電源"
+                        ),
+                        expected_slot=slot_number,
+                        action_deadline=action_deadline,
+                    )
+                    started = time.monotonic()
+                    warned = False
+                    last_sequence = latest_power_sequence
+                    last_verification = None
+                    confirmed = False
+                    action_cancelled = False
+                    while rclpy.ok() and time.monotonic() - started < timeout_seconds:
+                        rclpy.spin_once(navigator, timeout_sec=0.2)
+                        if active_task_id in cancellation_requests:
+                            action_cancelled = True
+                            break
+                        elapsed = time.monotonic() - started
+                        if not warned and elapsed >= warning_seconds:
+                            warned = True
+                            publish_task_state(
+                                task_state_publisher,
+                                target.get("task_id"),
+                                fsm.state,
+                                progress_message="尚未完成指定槽位操作；30 秒後任務將失敗",
+                                expected_slot=slot_number,
+                                action_deadline=action_deadline,
+                                warning=True,
+                            )
+                        if latest_power_sequence == last_sequence:
+                            continue
+                        last_sequence = latest_power_sequence
+                        verification = verifier.update(latest_power_banks)
+                        signature = (
+                            verification.state,
+                            verification.changed_slot,
+                            verification.message,
+                        )
+                        if signature != last_verification:
+                            state = (
+                                verification.state
+                                if verification.state
+                                in {"wrong_slot", "waiting_action", "verifying_action"}
+                                else "waiting_action"
+                            )
+                            progress(
+                                target,
+                                fsm,
+                                state,
+                                progress_message=verification.message,
+                                expected_slot=slot_number,
+                                changed_slot=verification.changed_slot,
+                                action_deadline=action_deadline,
+                                warning=warned,
+                            )
+                            last_verification = signature
+                        if verification.confirmed:
+                            confirmed = True
+                            break
+                    if action_cancelled:
+                        queue_result(
+                            target,
+                            fsm,
+                            "cancelled",
+                            cancellation_requests.pop(active_task_id),
+                        )
+                    elif confirmed:
+                        queue_result(
+                            target,
+                            fsm,
+                            "done",
+                            f"Nav2 goal reached and slot {slot_number} action confirmed",
+                        )
+                    else:
+                        queue_result(
+                            target,
+                            fsm,
+                            "failed",
+                            f"Timed out after {timeout_seconds:.0f}s waiting "
+                            f"for slot {slot_number}",
+                        )
+
+        target_key = target.get("task_id") or (target["name"], target["type"])
+        pending_orders[:] = [
+            order
+            for order in pending_orders
+            if (order.get("task_id") or (order["name"], order["type"])) != target_key
+        ]
+        active_task_id = None
 
     if rclpy.ok():
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

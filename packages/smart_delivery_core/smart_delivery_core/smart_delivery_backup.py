@@ -1,18 +1,15 @@
-import rclpy
-from rclpy.node import Node
-from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
-from geometry_msgs.msg import PoseStamped, Quaternion
-from std_msgs.msg import String
-
 import json
 import math
 import time
 
+import rclpy
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from power_monitor.power_status import payload_to_slots
+from std_msgs.msg import String
+
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
-EMPTY_CURRENT_A = 0.0005
-READY_CURRENT_MIN_A = 0.05
-LOW_CURRENT_MIN_A = 0.4
 
 # --- 預先定義的靠牆待機點 (可依實際地圖修改) ---
 STANDBY_POINTS = [
@@ -48,39 +45,16 @@ BORROWABLE_STATUS_PRIORITY = {
     "ready": 1,
 }
 
-def classify_current_status(current_a):
-    abs_current = abs(float(current_a))
-    if abs_current <= EMPTY_CURRENT_A: return "empty"
-    if abs_current >= LOW_CURRENT_MIN_A: return "low"
-    if abs_current >= READY_CURRENT_MIN_A: return "ready"
-    return "full"
-
-def estimate_charge_from_current(current_a, status):
-    status = normalize_power_bank_status(status)
-    current_a = abs(float(current_a))
-
-    if status == "empty": return 0
-    if status == "full": return 100
-    if status == "low": return min(79, max(1, round(80 * (1.0 - min(current_a, 1.0)))))
-
-    ready_ratio = (0.4 - min(max(current_a, 0.05), 0.4)) / 0.35
-    return round(80 + ready_ratio * 19)
-
 def power_status_payload_to_banks(payload):
     try:
-        power_data = json.loads(payload) if isinstance(payload, str) else payload
-        power_banks = []
-        for channel_number in range(1, 4):
-            channel = power_data[f"ch{channel_number}"]
-            current_a = float(channel["current"])
-            status = classify_current_status(current_a)
-            power_banks.append({
-                "id": f"PB-{channel_number:02d}",
-                "status": status,
-                "charge": estimate_charge_from_current(current_a, status),
-                "current": current_a,
-            })
-        return power_banks
+        slots = payload_to_slots(payload, require_healthy=True)
+        return [
+            {
+                **slot,
+                "id": slot.get("bank_id") or f"PB-{slot['slot']:02d}",
+            }
+            for slot in slots
+        ]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"無效的 power_status 數據：{exc}") from exc
 

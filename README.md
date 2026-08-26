@@ -55,7 +55,7 @@ source ~/.config/smart-carrier/robot.env
 ros2 launch smart_carrier_api api_bridge.launch.py
 ```
 
-The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, and `sensor_ok`. Bus voltage distinguishes an unpowered empty slot from a fully charged bank drawing almost no current. Canonical statuses are `empty`, `low`, `ready`, `full`, and `unknown`; `unknown` is used for an unavailable INA3221 reading instead of incorrectly reporting an empty slot.
+The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, `sensor_ok`, and `enabled`. The measured bus voltage is the shared 3S vehicle supply and is diagnostic only; slot presence is determined from current using hysteresis and six-sample confirmation. Canonical states are `empty`, `low` (charging), `full`, `unknown`, and `disabled`. Charging percentage cannot be inferred from input current, so `charge` is `null` while charging, `0` when empty, and `100` when full. Borrow and return tasks are completed only after the assigned slot confirms the physical removal or insertion; the user is warned after 30 seconds and the task fails after 60 seconds.
 
 ## Secrets
 

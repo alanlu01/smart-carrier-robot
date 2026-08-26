@@ -2,10 +2,16 @@
 testpaths = [
   "packages/power_monitor/test/test_power_status.py",
   "packages/smart_carrier_api/tests",
+  "packages/smart_delivery_core/test/test_wheel_feedback.py",
+  "packages/smart_delivery_core/test/test_cloud_order_logic.py",
+  "packages/smart_delivery_core/test/test_delivery_state.py",
+  "packages/hailo_vision/test/test_semantic_protocol.py",
 ]
 pythonpath = [
   "packages/power_monitor",
   "packages/smart_carrier_api",
+  "packages/smart_delivery_core",
+  "packages/hailo_vision",
 ]
 
 [tool.ruff]

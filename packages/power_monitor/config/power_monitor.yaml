@@ -6,10 +6,15 @@ ina3221_node:
     bus_voltage_lsb: 0.008
     window_size: 6
     sample_period: 0.5
-    # 無 bus voltage 才是空槽；有額定電壓但接近 0 A 視為充滿。
+    # bus voltage 是 3S 車輛母線，不能用來判斷槽位是否有行充。
     empty_voltage_max_v: 1.0
-    # 舊版或測試資料沒有 voltage 時的備援門檻；涵蓋實測空槽約 0.002 A。
-    empty_current_max_a: 0.005
-    # 實測滿電約 0.063 A；0.10 A 以下保留為 full 區間。
-    ready_current_min_a: 0.10
-    low_current_min_a: 0.4
+    # 2026-08 實測：正常快充模組空載 0.003–0.005 A。
+    empty_current_max_a: 0.008
+    # 0.008–0.020 A 是遲滯區，維持上一個可信狀態。
+    present_current_min_a: 0.020
+    # 滿電穩態約 0.038–0.039 A；較高電流視為仍在充電。
+    full_current_max_a: 0.080
+    # 0.5 秒取樣，連續 6 筆（約 3 秒）才確認狀態切換。
+    state_confirm_samples: 6
+    # Ch3 快充模組目前停用；修復後改為 true 並重啟節點。
+    slot_enabled: [true, true, false]
