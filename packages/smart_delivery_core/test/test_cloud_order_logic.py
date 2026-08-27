@@ -97,9 +97,7 @@ def test_navigation_task_does_not_require_a_power_bank():
     )
     empty_slots = [build_slot(number, 0.0) for number in range(1, 4)]
 
-    route, deferred, _ = schedule_orders(
-        [order], {"x": 0.0, "y": 0.0}, empty_slots
-    )
+    route, deferred, _ = schedule_orders([order], {"x": 0.0, "y": 0.0}, empty_slots)
 
     assert not deferred
     assert route[0]["type"] == "navigation"
@@ -121,9 +119,7 @@ def test_borrow_becomes_releasable_if_inventory_changes_after_claim():
         {"slot": 3, "status": "empty", "charge": 0, "sensor_ok": True},
     ]
 
-    route, deferred, _ = schedule_orders(
-        [order], {"x": 0.0, "y": 0.0}, slots
-    )
+    route, deferred, _ = schedule_orders([order], {"x": 0.0, "y": 0.0}, slots)
 
     assert not route
     assert deferred[0]["task_id"] == "task-race"
@@ -153,9 +149,7 @@ def test_borrow_does_not_substitute_a_different_power_bank():
         {"slot": 3, "bank_id": None, "status": "empty", "charge": 0, "sensor_ok": True},
     ]
 
-    route, deferred, _ = schedule_orders(
-        [order], {"x": 0.0, "y": 0.0}, slots
-    )
+    route, deferred, _ = schedule_orders([order], {"x": 0.0, "y": 0.0}, slots)
 
     assert not route
     assert deferred[0]["power_bank_id"] == "PB-02"
@@ -177,3 +171,36 @@ def test_invalid_cloud_order_is_rejected_before_navigation():
         order_payload_to_order(
             {"id": "task-4", "task_type": "navigation", "location": {"name": "bad"}}
         )
+
+
+def test_multiple_orders_apply_borrow_distance_weight_to_route_selection():
+    orders = [
+        order_payload_to_order(
+            {
+                "id": "near-navigation",
+                "task_type": "navigation",
+                "location": {"name": "near", "x": 7.5, "y": 0.0, "yaw": 0.0},
+            }
+        ),
+        order_payload_to_order(
+            {
+                "id": "farther-borrow",
+                "task_type": "borrow",
+                "required_charge": 80,
+                "location": {"name": "borrow", "x": 10.0, "y": 0.0, "yaw": 0.0},
+            }
+        ),
+    ]
+    available_slots = [
+        {"slot": 1, "status": "full", "charge": 100, "sensor_ok": True},
+        {"slot": 2, "status": "empty", "charge": 0, "sensor_ok": True},
+        {"slot": 3, "status": "disabled", "charge": None, "sensor_ok": False},
+    ]
+
+    route, deferred, _ = schedule_orders(orders, {"x": 0.0, "y": 0.0}, available_slots)
+
+    assert not deferred
+    assert [order["task_id"] for order in route] == [
+        "farther-borrow",
+        "near-navigation",
+    ]

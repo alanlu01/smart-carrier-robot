@@ -3,3 +3,5 @@ smart_carrier_api_bridge:
     poll_interval: 2.0
     heartbeat_interval: 5.0
     request_timeout: 5.0
+    order_republish_interval: 5.0
+    max_claimed_tasks: 3

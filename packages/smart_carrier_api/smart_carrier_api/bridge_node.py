@@ -10,6 +10,7 @@ from std_msgs.msg import String
 
 from smart_carrier_api.api_client import ApiError, SmartCarrierApi
 from smart_carrier_api.bridge_store import BridgeStore
+from smart_carrier_api.claim_queue import ClaimProjectionError, project_claimed_slots
 
 STATE_QOS = QoSProfile(
     depth=10,
@@ -32,6 +33,7 @@ class ApiBridgeNode(Node):
         self.declare_parameter("heartbeat_interval", 5.0)
         self.declare_parameter("request_timeout", 5.0)
         self.declare_parameter("order_republish_interval", 5.0)
+        self.declare_parameter("max_claimed_tasks", 3)
 
         api_url = str(self.get_parameter("api_url").value)
         robot_id = str(self.get_parameter("robot_id").value)
@@ -40,18 +42,19 @@ class ApiBridgeNode(Node):
         self.api = SmartCarrierApi(api_url, robot_id, token, timeout=request_timeout)
         self.store = BridgeStore()
         self.configured = bool(api_url and robot_id and token)
+        self.max_claimed_tasks = int(self.get_parameter("max_claimed_tasks").value)
+        if self.max_claimed_tasks < 1:
+            raise ValueError("max_claimed_tasks 必須至少為 1")
 
-        recovered = self.store.get_active_task()
-        self.active_task = recovered
-        self.active_task_id = str(recovered["id"]) if recovered else None
-        self.delivery_confirmed_task_id = None
-        self.last_order_publish_at = 0.0
+        self.claimed_tasks = self.store.get_claimed_tasks()
+        self.delivery_confirmed_task_ids = set()
+        self.last_order_publish_at = {}
         self.last_error_at = 0.0
         self.slots = []
         self.power_healthy = False
         self.power_received = False
         self.heartbeat_confirmed = False
-        self.cancel_notified_task_id = None
+        self.cancel_notified_task_ids = set()
 
         self.order_publisher = self.create_publisher(String, "order", STATE_QOS)
         self.cancel_publisher = self.create_publisher(
@@ -78,9 +81,9 @@ class ApiBridgeNode(Node):
             )
         else:
             self.get_logger().info(f"API bridge 已啟動：robot={robot_id}, api={api_url}")
-            if recovered:
+            if self.claimed_tasks:
                 self.get_logger().warning(
-                    f"已復原尚未完成的任務 {self.active_task_id}，等待配送節點確認狀態"
+                    f"已復原 {len(self.claimed_tasks)} 筆尚未完成任務，等待配送節點確認狀態"
                 )
 
     def on_power_status(self, message):
@@ -98,72 +101,95 @@ class ApiBridgeNode(Node):
             self.power_healthy = False
             self.get_logger().error(str(exc))
 
-    def publish_active_order(self):
-        if not self.active_task:
-            return
+    def task_ids(self):
+        return {str(task.get("id")) for task in self.claimed_tasks if task.get("id")}
+
+    def publish_order(self, task):
+        task_id = str(task["id"])
         message = String()
-        message.data = json.dumps(self.active_task, ensure_ascii=False)
+        message.data = json.dumps(task, ensure_ascii=False)
         self.order_publisher.publish(message)
-        self.last_order_publish_at = time.monotonic()
+        self.last_order_publish_at[task_id] = time.monotonic()
+
+    def publish_unconfirmed_orders(self):
+        interval = float(self.get_parameter("order_republish_interval").value)
+        now = time.monotonic()
+        for task in self.claimed_tasks:
+            task_id = str(task["id"])
+            if task_id in self.delivery_confirmed_task_ids:
+                continue
+            if now - self.last_order_publish_at.get(task_id, 0.0) >= interval:
+                self.publish_order(task)
 
     def poll(self):
         if not self.configured:
             return
-        if self.active_task_id:
-            self.poll_active_task()
-            interval = float(self.get_parameter("order_republish_interval").value)
-            if (
-                self.delivery_confirmed_task_id != self.active_task_id
-                and time.monotonic() - self.last_order_publish_at >= interval
-            ):
-                self.publish_active_order()
-            return
+        self.poll_claimed_tasks()
+        self.publish_unconfirmed_orders()
         if self.store.has_pending_results() or not self.power_healthy:
             return
         if self.order_publisher.get_subscription_count() == 0:
             return
-        try:
-            task = self.api.claim_task(self.slots)
-            if not task:
+        while len(self.claimed_tasks) < self.max_claimed_tasks:
+            try:
+                projected_slots = project_claimed_slots(self.slots, self.claimed_tasks)
+                task = self.api.claim_task(projected_slots)
+                if not task:
+                    return
+                task_id = task.get("id")
+                if not task_id:
+                    raise ApiError("API claimed task without an id")
+                if str(task_id) in self.task_ids():
+                    raise ApiError(f"API returned duplicate claimed task {task_id}")
+                self.claimed_tasks.append(task)
+                self.store.set_claimed_tasks(self.claimed_tasks)
+                self.publish_order(task)
+                self.get_logger().info(
+                    f"已領取並保存雲端任務 {task_id} "
+                    f"({len(self.claimed_tasks)}/{self.max_claimed_tasks})"
+                )
+                try:
+                    project_claimed_slots(projected_slots, [task])
+                except ClaimProjectionError as exc:
+                    # The backend already owns this task for the robot. Keep it
+                    # durable and let the delivery node safely release it.
+                    self.get_logger().error(f"API 回傳無法預約的任務 {task_id}：{exc}")
+                    return
+            except ClaimProjectionError as exc:
+                self.get_logger().error(f"多筆任務槽位預約失敗：{exc}")
                 return
-            task_id = task.get("id")
-            if not task_id:
-                raise ApiError("API claimed task without an id")
-            self.store.set_active_task(task)
-            self.active_task = task
-            self.active_task_id = str(task_id)
-            self.delivery_confirmed_task_id = None
-            self.publish_active_order()
-            self.get_logger().info(f"已領取並保存雲端任務 {self.active_task_id}")
-        except (ApiError, TypeError) as exc:
-            self.log_api_error(exc)
+            except (ApiError, TypeError) as exc:
+                self.log_api_error(exc)
+                return
 
-    def poll_active_task(self):
-        try:
-            task = self.api.get_task(self.active_task_id)
-            cancellation_requested = bool(task.get("cancel_requested_at"))
-            if task.get("status") == "cancelled":
-                cancellation_requested = True
-            if not cancellation_requested or self.cancel_notified_task_id == self.active_task_id:
-                return
-            message = String()
-            message.data = json.dumps(
-                {
-                    "task_id": self.active_task_id,
-                    "reason": task.get("cancel_reason") or "Cancelled by administrator",
-                },
-                ensure_ascii=False,
-            )
-            self.cancel_publisher.publish(message)
-            self.cancel_notified_task_id = self.active_task_id
-            self.get_logger().warning(f"收到雲端取消要求：{self.active_task_id}")
-        except (ApiError, AttributeError, TypeError) as exc:
-            self.log_api_error(exc)
+    def poll_claimed_tasks(self):
+        for claimed in list(self.claimed_tasks):
+            task_id = str(claimed["id"])
+            try:
+                task = self.api.get_task(task_id)
+                cancellation_requested = bool(task.get("cancel_requested_at"))
+                if task.get("status") == "cancelled":
+                    cancellation_requested = True
+                if not cancellation_requested or task_id in self.cancel_notified_task_ids:
+                    continue
+                message = String()
+                message.data = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "reason": task.get("cancel_reason") or "Cancelled by administrator",
+                    },
+                    ensure_ascii=False,
+                )
+                self.cancel_publisher.publish(message)
+                self.cancel_notified_task_ids.add(task_id)
+                self.get_logger().warning(f"收到雲端取消要求：{task_id}")
+            except (ApiError, AttributeError, TypeError) as exc:
+                self.log_api_error(exc)
 
     def send_heartbeat(self):
         if not self.configured:
             return
-        if self.active_task_id:
+        if self.claimed_tasks:
             mode = "dispatching"
         elif not self.power_healthy:
             mode = "power_sensor_error"
@@ -181,9 +207,9 @@ class ApiBridgeNode(Node):
         try:
             progress = json.loads(message.data)
             task_id = str(progress["task_id"])
-            if task_id != self.active_task_id:
+            if task_id not in self.task_ids():
                 return
-            self.delivery_confirmed_task_id = task_id
+            self.delivery_confirmed_task_ids.add(task_id)
             self.store.set_pending_progress(progress)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"忽略無效任務進度：{exc}")
@@ -196,7 +222,7 @@ class ApiBridgeNode(Node):
             return
         try:
             self.api.report_progress(str(progress["task_id"]), progress)
-            self.store.set_pending_progress(None)
+            self.store.clear_pending_progress(str(progress["task_id"]))
         except (ApiError, KeyError, TypeError) as exc:
             self.log_api_error(exc)
 
@@ -208,10 +234,8 @@ class ApiBridgeNode(Node):
             status = str(result["status"])
             if status not in {"done", "failed", "cancelled", "released"}:
                 raise ValueError(f"不支援的任務結果狀態：{status}")
-            if self.active_task_id and task_id != self.active_task_id:
-                self.get_logger().warning(
-                    f"保存非目前任務結果：{task_id}（目前：{self.active_task_id}）"
-                )
+            if task_id not in self.task_ids():
+                self.get_logger().warning(f"保存非目前 claimed queue 任務結果：{task_id}")
             self.store.enqueue_result(result)
             ack = String()
             ack.data = json.dumps({"event_id": event_id, "task_id": task_id})
@@ -233,13 +257,12 @@ class ApiBridgeNode(Node):
                     item["task_id"], item["event_id"], item["status"], item.get("note")
                 )
             self.store.mark_delivered(item["event_id"])
-            if item["task_id"] == self.active_task_id:
-                self.store.set_active_task(None)
-                self.store.set_pending_progress(None)
-                self.active_task = None
-                self.active_task_id = None
-                self.delivery_confirmed_task_id = None
-                self.cancel_notified_task_id = None
+            self.store.remove_claimed_task(item["task_id"])
+            self.claimed_tasks = self.store.get_claimed_tasks()
+            self.store.clear_pending_progress(item["task_id"])
+            self.delivery_confirmed_task_ids.discard(item["task_id"])
+            self.cancel_notified_task_ids.discard(item["task_id"])
+            self.last_order_publish_at.pop(item["task_id"], None)
             self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
         except ApiError as exc:
             self.store.mark_retry(item["event_id"], int(item["attempts"]))

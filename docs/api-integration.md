@@ -53,7 +53,9 @@ An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the 
 
 `smart_carrier_api` publishes the complete claimed-task JSON returned by the backend. `smart_delivery_core` accepts backend `location.x/y/yaw` coordinates and retains its original name-based lookup only for legacy local messages.
 
-The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It sends the normalized three-slot snapshot with every claim request. The backend scans pending tasks in creation order and returns the first task compatible with the current inventory, so an unavailable borrow or return does not block a later navigation task. When a borrow task contains `power_bank_id`, both the backend and delivery scheduler require that exact bank; another available bank is not silently substituted.
+The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It keeps a durable queue of up to three claimed tasks (`max_claimed_tasks`) and uses the existing single-task claim endpoint repeatedly. Before each additional claim it projects the slot changes reserved by the tasks already in the queue, so one power bank or empty slot cannot be promised to multiple orders. The backend scans pending tasks in creation order and returns the first task compatible with that projected inventory, so an unavailable borrow or return does not block a later navigation task. When a borrow task contains `power_bank_id`, both the backend and delivery scheduler require that exact bank; another available bank is not silently substituted.
+
+The delivery node reports `queued_on_robot` when each task enters its local queue. It still executes only one Nav2 goal at a time and recalculates the feasible route after every task using the latest real slot snapshot. Borrow distance keeps its `0.7` weight. The queue, per-task progress buffer, terminal outbox, cancellation state, and restart recovery all remain independent by task ID.
 
 ### `/smart_carrier/task_result` (`std_msgs/String`)
 

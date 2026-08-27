@@ -11,7 +11,7 @@ RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
 
 
 class BridgeStore:
-    """Durable active-task state and terminal-result outbox."""
+    """Durable claimed-task queue, progress buffer, and terminal-result outbox."""
 
     def __init__(self, path: str | Path | None = None):
         if path is None:
@@ -52,7 +52,7 @@ class BridgeStore:
     def close(self) -> None:
         self.connection.close()
 
-    def _set_json(self, key: str, value: dict[str, Any] | None) -> None:
+    def _set_json(self, key: str, value: Any | None) -> None:
         if value is None:
             self.connection.execute("DELETE FROM state WHERE key = ?", (key,))
         else:
@@ -65,10 +65,8 @@ class BridgeStore:
             )
         self.connection.commit()
 
-    def _get_json(self, key: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT value FROM state WHERE key = ?", (key,)
-        ).fetchone()
+    def _get_json(self, key: str) -> Any | None:
+        row = self.connection.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
         return json.loads(row["value"]) if row else None
 
     def set_active_task(self, task: dict[str, Any] | None) -> None:
@@ -77,11 +75,62 @@ class BridgeStore:
     def get_active_task(self) -> dict[str, Any] | None:
         return self._get_json("active_task")
 
+    def set_claimed_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        self._set_json("claimed_tasks", tasks if tasks else None)
+
+    def get_claimed_tasks(self) -> list[dict[str, Any]]:
+        tasks = self._get_json("claimed_tasks")
+        if isinstance(tasks, list):
+            return [task for task in tasks if isinstance(task, dict)]
+
+        # Migrate the pre-queue single active task without losing an owned order.
+        legacy = self.get_active_task()
+        if isinstance(legacy, dict):
+            self.set_claimed_tasks([legacy])
+            self.set_active_task(None)
+            return [legacy]
+        return []
+
+    def remove_claimed_task(self, task_id: str) -> None:
+        self.set_claimed_tasks(
+            [task for task in self.get_claimed_tasks() if str(task.get("id")) != str(task_id)]
+        )
+
+    def _get_pending_progresses(self) -> dict[str, dict[str, Any]]:
+        progresses = self._get_json("pending_progresses")
+        if isinstance(progresses, dict):
+            return {
+                str(task_id): progress
+                for task_id, progress in progresses.items()
+                if isinstance(progress, dict)
+            }
+
+        legacy = self._get_json("pending_progress")
+        if isinstance(legacy, dict) and legacy.get("task_id") is not None:
+            migrated = {str(legacy["task_id"]): legacy}
+            self._set_json("pending_progresses", migrated)
+            self._set_json("pending_progress", None)
+            return migrated
+        return {}
+
     def set_pending_progress(self, progress: dict[str, Any] | None) -> None:
-        self._set_json("pending_progress", progress)
+        if progress is None:
+            self._set_json("pending_progresses", None)
+            self._set_json("pending_progress", None)
+            return
+        task_id = str(progress["task_id"])
+        progresses = self._get_pending_progresses()
+        progresses[task_id] = progress
+        self._set_json("pending_progresses", progresses)
 
     def get_pending_progress(self) -> dict[str, Any] | None:
-        return self._get_json("pending_progress")
+        progresses = self._get_pending_progresses()
+        return next(iter(progresses.values()), None)
+
+    def clear_pending_progress(self, task_id: str) -> None:
+        progresses = self._get_pending_progresses()
+        progresses.pop(str(task_id), None)
+        self._set_json("pending_progresses", progresses if progresses else None)
 
     def enqueue_result(self, result: dict[str, Any]) -> None:
         self.connection.execute(
@@ -130,9 +179,7 @@ class BridgeStore:
         return next_attempt
 
     def mark_delivered(self, event_id: str) -> None:
-        self.connection.execute(
-            "DELETE FROM result_outbox WHERE event_id = ?", (event_id,)
-        )
+        self.connection.execute("DELETE FROM result_outbox WHERE event_id = ?", (event_id,))
         self.connection.commit()
 
     def has_pending_results(self) -> bool:

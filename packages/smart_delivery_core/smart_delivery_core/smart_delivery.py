@@ -443,7 +443,7 @@ def main():
         publish_task_state(task_state_publisher, task.get("task_id"), state, **details)
 
     def result_ack_callback(message):
-        nonlocal pending_result
+        nonlocal active_task, pending_result
         try:
             ack = json.loads(message.data)
             if pending_result and str(ack.get("event_id")) == pending_result["event_id"]:
@@ -453,6 +453,7 @@ def main():
                     "result_acked",
                 )
                 pending_result = None
+                active_task = None
                 journal.clear()
         except (TypeError, json.JSONDecodeError):
             navigator.get_logger().warning("忽略無效 task_result_ack")
@@ -491,7 +492,6 @@ def main():
     navigator.create_subscription(String, "power_status", power_status_callback, 10)
 
     def order_callback(msg):
-        nonlocal active_task
         task_id = None
         try:
             raw = json.loads(msg.data)
@@ -503,13 +503,11 @@ def main():
             if any(item.get("task_id") == str(task_id) for item in pending_orders):
                 return
             pending_orders.append(order)
-            active_task = order
-            persist(order, "task_accepted", None)
             publish_task_state(
                 task_state_publisher,
                 task_id,
-                "task_accepted",
-                progress_message="Robot accepted the task",
+                "queued_on_robot",
+                progress_message=f"Queued on robot ({len(pending_orders)} waiting)",
             )
             print(f"\n📥 收到雲端任務：{order['name']} ({order['type']})")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -580,7 +578,9 @@ def main():
         )
         if cancelled_order:
             pending_orders.remove(cancelled_order)
+            active_task = cancelled_order
             fsm = DeliveryStateMachine("task_accepted")
+            persist(active_task, fsm.state, None)
             queue_result(
                 cancelled_order,
                 fsm,
@@ -601,13 +601,17 @@ def main():
         )
         if not optimized_route:
             target = pending_orders.pop(0)
+            active_task = target
             fsm = DeliveryStateMachine("task_accepted")
+            persist(active_task, fsm.state, None)
             progress(target, fsm, "precheck", progress_message="Checking slot availability")
             queue_result(target, fsm, "released", infeasible_order_note(target))
             continue
 
         target = optimized_route[0]
+        active_task = target
         fsm = DeliveryStateMachine("task_accepted")
+        persist(active_task, fsm.state, None)
         is_standby = False
         progress(target, fsm, "precheck", progress_message="Task precheck passed")
         progress(
