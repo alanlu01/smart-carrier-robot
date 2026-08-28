@@ -1,20 +1,21 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import LaserScan, PointCloud2, PointField 
-from std_msgs.msg import String, Header
-from geometry_msgs.msg import Twist
 import json
 import math
-import numpy as np
-from collections import deque
 import struct 
 import time
+from collections import deque
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Twist
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from std_msgs.msg import Float32, Header, String
 
 from hailo_vision.semantic_protocol import (
+    closest_timestamped_item,
     parse_semantic_payload,
     semantic_data_age,
     semantic_safety_multiplier,
-    stamps_are_synchronized,
 )
 
 class SensorFusionNode(Node):
@@ -29,12 +30,18 @@ class SensorFusionNode(Node):
         self.semantic_health_state = 'starting'
         self.last_semantic_error_at = 0.0
         self.last_sync_warning_at = 0.0
+        self.scan_history = deque()
+        self.last_person_limit_at = None
+        self.held_person_multiplier = 1.0
+        self.person_safety_state = 'clear'
         self.history = {} 
 
         self.declare_parameter('semantic_timeout_sec', 0.50)
         self.declare_parameter('semantic_max_sync_skew_sec', 0.20)
         self.declare_parameter('semantic_stale_speed_multiplier', 0.50)
         self.declare_parameter('semantic_hard_stop_timeout_sec', 2.00)
+        self.declare_parameter('semantic_scan_history_sec', 1.00)
+        self.declare_parameter('person_clear_hold_sec', 0.50)
         self.semantic_timeout_sec = float(
             self.get_parameter('semantic_timeout_sec').value
         )
@@ -47,12 +54,22 @@ class SensorFusionNode(Node):
         self.semantic_hard_stop_timeout_sec = float(
             self.get_parameter('semantic_hard_stop_timeout_sec').value
         )
+        self.semantic_scan_history_sec = float(
+            self.get_parameter('semantic_scan_history_sec').value
+        )
+        self.person_clear_hold_sec = float(
+            self.get_parameter('person_clear_hold_sec').value
+        )
         if not 0 < self.semantic_timeout_sec < self.semantic_hard_stop_timeout_sec:
             raise ValueError('語意 soft timeout 必須大於 0 且小於 hard-stop timeout')
         if self.semantic_max_sync_skew_sec < 0:
             raise ValueError('語意與雷達最大時間差不得小於 0')
         if not 0 <= self.semantic_stale_speed_multiplier <= 1:
             raise ValueError('語意逾時速度乘數必須介於 0 到 1')
+        if self.semantic_scan_history_sec <= self.semantic_max_sync_skew_sec:
+            raise ValueError('雷達歷史長度必須大於語意與雷達最大時間差')
+        if self.person_clear_hold_sec < 0:
+            raise ValueError('人員減速保持時間不得小於 0')
         
         # 🌟 速度控制乘數
         self.speed_multiplier = 1.0
@@ -69,6 +86,9 @@ class SensorFusionNode(Node):
         # 2. 訂閱與發布速度 (確保 cmd_vel_to_serial 訂閱的是 /chassis_cmd_vel！)
         self.sub_nav2_cmd = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.pub_safe_cmd = self.create_publisher(Twist, '/chassis_cmd_vel', 10)
+        self.pub_speed_multiplier = self.create_publisher(
+            Float32, '/semantic/speed_multiplier', 10
+        )
 
         # 3. 發布虛擬玻璃點雲給 Nav2 代價地圖
         self.pub_virtual_glass = self.create_publisher(PointCloud2, '/visual_glass', 10)
@@ -92,6 +112,20 @@ class SensorFusionNode(Node):
             self.latest_semantic_received_at = time.monotonic()
             if packet.stamp_ns is not None:
                 self.last_semantic_source_stamp_ns = packet.stamp_ns
+            matching_scan = self._matching_scan(packet.stamp_ns)
+            if matching_scan is None:
+                now = time.monotonic()
+                if now - self.last_sync_warning_at >= 10.0:
+                    self.get_logger().warning(
+                        '找不到與語意影像同步的歷史雷達，本幀採保守半速'
+                    )
+                    self.last_sync_warning_at = now
+                self._set_speed_multiplier(
+                    min(self.speed_multiplier, self.semantic_stale_speed_multiplier),
+                    reason='scan_unmatched',
+                )
+                return
+            self._process_semantic_data(packet.detections, matching_scan)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             now = time.monotonic()
             if now - self.last_semantic_error_at >= 10.0:
@@ -155,40 +189,86 @@ class SensorFusionNode(Node):
         self.pub_safe_cmd.publish(real_cmd)
 
     def scan_callback(self, scan_msg):
-        if self.semantic_age() > self.semantic_timeout_sec:
-            self.latest_semantic_data = []
-            self.speed_multiplier = 1.0
-            self._update_glass_tracker([], scan_msg.header)
-            return
-
         scan_stamp_ns = (
             scan_msg.header.stamp.sec * 1_000_000_000
             + scan_msg.header.stamp.nanosec
         )
-        if not stamps_are_synchronized(
-            self.latest_semantic_stamp_ns,
-            scan_stamp_ns,
+        self.scan_history.append((scan_stamp_ns, scan_msg))
+        oldest_allowed = scan_stamp_ns - int(self.semantic_scan_history_sec * 1e9)
+        while self.scan_history and self.scan_history[0][0] < oldest_allowed:
+            self.scan_history.popleft()
+
+    def _matching_scan(self, semantic_stamp_ns):
+        match = closest_timestamped_item(
+            self.scan_history,
+            semantic_stamp_ns,
             self.semantic_max_sync_skew_sec,
+        )
+        return None if match is None else match[1]
+
+    def _apply_person_clear_hold(self, detected_multiplier):
+        now = time.monotonic()
+        if detected_multiplier < 1.0:
+            self.last_person_limit_at = now
+            self.held_person_multiplier = detected_multiplier
+            return detected_multiplier
+        if (
+            self.last_person_limit_at is not None
+            and now - self.last_person_limit_at <= self.person_clear_hold_sec
         ):
-            now = time.monotonic()
-            if now - self.last_sync_warning_at >= 10.0:
-                self.get_logger().warning(
-                    '語意影像與雷達時間差過大，本次不進行融合'
-                )
-                self.last_sync_warning_at = now
-            self.speed_multiplier = 1.0
+            return self.held_person_multiplier
+        self.last_person_limit_at = None
+        self.held_person_multiplier = 1.0
+        return 1.0
+
+    def _set_speed_multiplier(self, multiplier, reason='clear'):
+        multiplier = max(0.0, min(1.0, float(multiplier)))
+        previous_state = self.person_safety_state
+        if multiplier <= 0.0:
+            next_state = 'stopped'
+        elif multiplier < 1.0:
+            next_state = 'slowed'
+        else:
+            next_state = 'clear'
+
+        self.speed_multiplier = multiplier
+        status = Float32()
+        status.data = multiplier
+        self.pub_speed_multiplier.publish(status)
+
+        if next_state == previous_state:
+            return
+        if next_state == 'stopped':
+            self.get_logger().warning(f'🛑 語意安全煞停（{reason}）')
+            self.pub_safe_cmd.publish(Twist())
+        elif next_state == 'slowed':
+            self.get_logger().info(
+                f'⚠️ 語意安全減速至 {round(multiplier * 100)}%（{reason}）'
+            )
+        else:
+            self.get_logger().info('✅ 語意安全區域已清空，恢復導航速度')
+        self.person_safety_state = next_state
+
+    def _process_semantic_data(self, detections, scan_msg):
+        if self.semantic_age() > self.semantic_timeout_sec:
+            self.latest_semantic_data = []
+            self._set_speed_multiplier(
+                min(self.speed_multiplier, self.semantic_stale_speed_multiplier),
+                reason='semantic_stale',
+            )
             self._update_glass_tracker([], scan_msg.header)
             return
 
-        if not self.latest_semantic_data:
-            self.speed_multiplier = 1.0 
-            self._update_glass_tracker([]) # 沒看到東西，衰減玻璃計數
+        if not detections:
+            self._set_speed_multiplier(self._apply_person_clear_hold(1.0))
+            self._update_glass_tracker([], scan_msg.header)
             return
 
         current_multiplier = 1.0
+        person_limit_reason = 'clear'
         glass_points_this_frame = [] # 記錄這幀看到的有效玻璃座標
 
-        for target in self.latest_semantic_data:
+        for target in detections:
             cls_id = target['id']
             display_angle_deg = target['angle']
 
@@ -251,19 +331,16 @@ class SensorFusionNode(Node):
             # 禮讓邏輯 (人、車等)
             if cls_id in [0, 2, 3, 4]:
                 if smooth_dist < 0.6:
-                    current_multiplier = 0.0  
-                    self.get_logger().warn(f"🛑 緊急煞停！距離 {smooth_dist:.2f}m 發現優先禮讓目標！")
-                    
-                    # 👇 🌟 關鍵修改 2：立刻主動發布全 0 的停止指令給底盤，不等待 Nav2！
-                    stop_msg = Twist()
-                    self.pub_safe_cmd.publish(stop_msg)
-                    
+                    current_multiplier = 0.0
+                    person_limit_reason = f'優先禮讓目標距離 {smooth_dist:.2f} m'
                 elif smooth_dist < 1.5:
-                    current_multiplier = min(current_multiplier, 0.5) 
-                    self.get_logger().info(f"⚠️ 減速通過！距離 {smooth_dist:.2f}m 發現優先禮讓目標。")
+                    current_multiplier = min(current_multiplier, 0.5)
+                    if current_multiplier > 0.0:
+                        person_limit_reason = f'優先禮讓目標距離 {smooth_dist:.2f} m'
 
         # 更新全局速度與玻璃追蹤
-        self.speed_multiplier = current_multiplier
+        current_multiplier = self._apply_person_clear_hold(current_multiplier)
+        self._set_speed_multiplier(current_multiplier, person_limit_reason)
         self._update_glass_tracker(glass_points_this_frame, scan_msg.header)
 
     def _update_glass_tracker(self, glass_points, header=None):

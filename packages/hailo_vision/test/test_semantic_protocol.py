@@ -4,6 +4,7 @@ import pytest
 
 from hailo_vision.semantic_protocol import (
     build_semantic_payload,
+    closest_timestamped_item,
     parse_semantic_payload,
     semantic_data_age,
     semantic_safety_multiplier,
@@ -65,3 +66,26 @@ def test_invalid_stamp_is_rejected():
                 "detections": [],
             }
         )
+
+
+def test_closest_timestamped_item_uses_historical_sensor_sample():
+    samples = [
+        (1_000_000_000, "old"),
+        (1_100_000_000, "closest"),
+        (1_200_000_000, "new"),
+    ]
+
+    assert closest_timestamped_item(samples, 1_130_000_000, 0.05) == (
+        1_100_000_000,
+        "closest",
+    )
+
+
+def test_closest_timestamped_item_rejects_excessive_skew():
+    samples = [(1_000_000_000, "scan")]
+    assert closest_timestamped_item(samples, 1_210_000_000, 0.20) is None
+
+
+def test_closest_timestamped_item_accepts_latest_for_legacy_payload():
+    samples = [(1, "old"), (2, "latest")]
+    assert closest_timestamped_item(samples, None, 0.20) == (2, "latest")

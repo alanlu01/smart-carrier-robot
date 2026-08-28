@@ -85,3 +85,21 @@ def stamps_are_synchronized(first_stamp_ns, second_stamp_ns, max_skew_sec):
     if first_stamp_ns is None or second_stamp_ns is None:
         return True
     return abs(first_stamp_ns - second_stamp_ns) <= max_skew_sec * 1_000_000_000
+
+
+def closest_timestamped_item(items, target_stamp_ns, max_skew_sec):
+    """Return the closest ``(stamp_ns, value)`` pair inside the allowed skew."""
+    if target_stamp_ns is None:
+        return items[-1] if items else None
+    if max_skew_sec < 0:
+        raise ValueError("maximum timestamp skew must not be negative")
+    closest = min(
+        items,
+        key=lambda item: abs(int(item[0]) - int(target_stamp_ns)),
+        default=None,
+    )
+    if closest is None:
+        return None
+    if abs(int(closest[0]) - int(target_stamp_ns)) > max_skew_sec * 1_000_000_000:
+        return None
+    return closest
