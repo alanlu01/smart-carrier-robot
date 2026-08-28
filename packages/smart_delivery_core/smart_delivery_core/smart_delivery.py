@@ -9,8 +9,11 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
+from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from rclpy.time import Time
+from std_msgs.msg import Bool, String
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.delivery_state import (
     DeliveryJournal,
@@ -336,7 +339,7 @@ def yaw_to_quaternion(yaw):
     return q
 
 
-def go_to_standby(navigator, current_pos):
+def go_to_standby(navigator, current_pos, localization_is_ready=lambda: True):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
     closest_standby = min(
@@ -356,6 +359,12 @@ def go_to_standby(navigator, current_pos):
     while not navigator.isTaskComplete():
         time.sleep(0.1)  # 釋放 CPU
         rclpy.spin_once(navigator, timeout_sec=0.05)
+        if not localization_is_ready():
+            navigator.cancelTask()
+            navigator.get_logger().warning("定位可信度不足，已取消前往待機點")
+            while not navigator.isTaskComplete():
+                rclpy.spin_once(navigator, timeout_sec=0.05)
+            return None
 
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
     return {"x": closest_standby["x"], "y": closest_standby["y"]}
@@ -364,6 +373,8 @@ def go_to_standby(navigator, current_pos):
 def main():
     rclpy.init()
     navigator = BasicNavigator()
+    tf_buffer = Buffer()
+    tf_listener = TransformListener(tf_buffer, navigator)
     navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
     navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
     navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
@@ -373,9 +384,57 @@ def main():
     if not 0 < warning_seconds < timeout_seconds or confirmation_samples < 1:
         raise ValueError("槽位確認須符合 0 < warning < timeout，且樣本數大於 0")
 
+    localization_ready = False
+    localization_state = "UNINITIALIZED"
+    last_localization_warning_at = 0.0
+
+    def localization_ready_callback(message):
+        nonlocal localization_ready
+        localization_ready = bool(message.data)
+
+    def localization_state_callback(message):
+        nonlocal localization_state
+        try:
+            localization_state = json.loads(message.data).get("state", "UNKNOWN")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            localization_state = "UNKNOWN"
+
+    navigator.create_subscription(
+        Bool, "/localization/ready", localization_ready_callback, STATE_QOS
+    )
+    navigator.create_subscription(
+        String, "/localization/state", localization_state_callback, STATE_QOS
+    )
+
+    def refresh_current_position(fallback):
+        try:
+            transform = tf_buffer.lookup_transform(
+                "map", "base_footprint", Time(), timeout=Duration(seconds=0.2)
+            )
+        except TransformException as exc:
+            navigator.get_logger().warning(f"無法取得即時 map 位姿，暫用上次位置：{exc}")
+            return fallback
+        return {
+            "x": float(transform.transform.translation.x),
+            "y": float(transform.transform.translation.y),
+        }
+
     print("⏳ 等待 Nav2 系統上線...")
     navigator.waitUntilNav2Active()
     print("✅ Nav2 準備就緒！")
+
+    print("⏳ 等待定位管理器確認位置...")
+    while rclpy.ok() and not localization_ready:
+        rclpy.spin_once(navigator, timeout_sec=0.2)
+        now = time.monotonic()
+        if now - last_localization_warning_at >= 10.0:
+            navigator.get_logger().warning(
+                f"定位尚未就緒（{localization_state}），不會送出導航目標"
+            )
+            last_localization_warning_at = now
+    if not rclpy.ok():
+        return
+    print("✅ 定位可信度檢查通過！")
 
     latest_power_banks = None
     latest_power_status_at = 0.0
@@ -396,6 +455,16 @@ def main():
     task_state_publisher = navigator.create_publisher(
         String, "/smart_carrier/task_state", STATE_QOS
     )
+    motion_inhibit_publisher = navigator.create_publisher(
+        Bool, "/localization/motion_inhibited", STATE_QOS
+    )
+
+    def set_motion_inhibited(inhibited):
+        message = Bool()
+        message.data = bool(inhibited)
+        motion_inhibit_publisher.publish(message)
+
+    set_motion_inhibited(False)
 
     def persist(active=None, state=None, result=None):
         data = {}
@@ -557,19 +626,36 @@ def main():
     while rclpy.ok():
         rclpy.spin_once(navigator, timeout_sec=0.5)
 
+        if not localization_ready:
+            now = time.monotonic()
+            if now - last_localization_warning_at >= 10.0:
+                navigator.get_logger().warning(
+                    f"定位暫停（{localization_state}），保留訂單並等待恢復"
+                )
+                last_localization_warning_at = now
+            continue
+
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
             if not is_standby:
-                current_pos = go_to_standby(navigator, current_pos)
-                is_standby = True
+                standby_pos = go_to_standby(
+                    navigator, current_pos, lambda: localization_ready
+                )
+                if standby_pos is not None:
+                    current_pos = standby_pos
+                    is_standby = True
             continue
 
         if not pending_orders:
             if not is_standby:
                 print("\n🏁 無待處理任務，返回待機點")
-                current_pos = go_to_standby(navigator, current_pos)
-                is_standby = True
+                standby_pos = go_to_standby(
+                    navigator, current_pos, lambda: localization_ready
+                )
+                if standby_pos is not None:
+                    current_pos = standby_pos
+                    is_standby = True
             continue
 
         cancelled_order = next(
@@ -596,6 +682,7 @@ def main():
                 last_stale_warning_at = now
             continue
 
+        current_pos = refresh_current_position(current_pos)
         optimized_route, _, _ = schedule_orders(
             pending_orders, current_pos, latest_power_banks, slot_capacity=3
         )
@@ -632,15 +719,34 @@ def main():
         navigator.goToPose(goal_pose)
         active_task_id = target.get("task_id")
         cancel_sent = False
+        localization_aborted = False
         while not navigator.isTaskComplete():
             time.sleep(0.1)
             rclpy.spin_once(navigator, timeout_sec=0.05)
             if active_task_id in cancellation_requests and not cancel_sent:
                 navigator.cancelTask()
                 cancel_sent = True
+            elif not localization_ready and not cancel_sent:
+                navigator.get_logger().error(
+                    f"定位進入 {localization_state}，取消導航並保留任務等待重送"
+                )
+                navigator.cancelTask()
+                cancel_sent = True
+                localization_aborted = True
 
         nav_result = navigator.getResult()
-        if active_task_id in cancellation_requests:
+        keep_pending = False
+        if localization_aborted:
+            fsm.transition("waiting_localization")
+            persist(target, fsm.state, pending_result)
+            publish_task_state(
+                task_state_publisher,
+                target.get("task_id"),
+                "waiting_localization",
+                progress_message="Localization recovery in progress; task retained",
+            )
+            keep_pending = True
+        elif active_task_id in cancellation_requests:
             queue_result(
                 target,
                 fsm,
@@ -689,6 +795,7 @@ def main():
                         expected_slot=slot_number,
                         action_deadline=action_deadline,
                     )
+                    set_motion_inhibited(True)
                     started = time.monotonic()
                     warned = False
                     last_sequence = latest_power_sequence
@@ -742,6 +849,7 @@ def main():
                         if verification.confirmed:
                             confirmed = True
                             break
+                    set_motion_inhibited(False)
                     if action_cancelled:
                         queue_result(
                             target,
@@ -765,12 +873,13 @@ def main():
                             f"for slot {slot_number}",
                         )
 
-        target_key = target.get("task_id") or (target["name"], target["type"])
-        pending_orders[:] = [
-            order
-            for order in pending_orders
-            if (order.get("task_id") or (order["name"], order["type"])) != target_key
-        ]
+        if not keep_pending:
+            target_key = target.get("task_id") or (target["name"], target["type"])
+            pending_orders[:] = [
+                order
+                for order in pending_orders
+                if (order.get("task_id") or (order["name"], order["type"])) != target_key
+            ]
         active_task_id = None
 
     if rclpy.ok():

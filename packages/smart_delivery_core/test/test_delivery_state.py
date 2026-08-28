@@ -28,6 +28,12 @@ def test_delivery_state_machine_rejects_invalid_transition():
         raise AssertionError("invalid transition should fail")
 
 
+def test_navigation_can_pause_for_localization_recovery():
+    machine = DeliveryStateMachine("navigating")
+    assert machine.transition("waiting_localization") == "waiting_localization"
+    assert machine.transition("navigating") == "navigating"
+
+
 def test_borrow_requires_expected_slot_and_restored_wrong_slot():
     baseline = [slot(1, "full"), slot(2, "low"), slot(3, "disabled", enabled=False)]
     verifier = SlotActionVerifier("borrow", 1, baseline, confirm_samples=2)

@@ -15,7 +15,13 @@ ALLOWED_TRANSITIONS = {
     "idle": {"task_accepted", "result_pending", "recovery_required"},
     "task_accepted": {"precheck", "result_pending"},
     "precheck": {"navigating", "result_pending"},
-    "navigating": {"arrived", "result_pending", "recovery_required"},
+    "navigating": {
+        "arrived",
+        "waiting_localization",
+        "result_pending",
+        "recovery_required",
+    },
+    "waiting_localization": {"precheck", "navigating", "result_pending"},
     "arrived": {"waiting_action", "result_pending"},
     "waiting_action": {
         "wrong_slot",

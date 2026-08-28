@@ -14,10 +14,10 @@ setup(
         ('share/' + package_name, ['package.xml']),
         
         # 🌟 將外部資料夾全部打包，使用 glob('資料夾名稱/*') 抓取裡面所有檔案
-        (os.path.join('share', package_name, 'launch'), glob('launch/*')),
-        (os.path.join('share', package_name, 'rviz'), glob('rviz/*')),
-        (os.path.join('share', package_name, 'maps'), glob('maps/*')),
-        (os.path.join('share', package_name, 'config'), glob('config/*')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'maps'), glob('maps/*.*')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -32,6 +32,7 @@ setup(
             'serial_to_ros = smart_delivery_core.serial_to_ros:main',
             'mecanum_odom_real = smart_delivery_core.mecanum_odom_real:main',
             'serial_bridge = smart_delivery_core.serial_bridge:main',
+            'localization_manager = smart_delivery_core.localization_manager:main',
             'smart_delivery = smart_delivery_core.smart_delivery:main',
             'smart_delivery_backup = smart_delivery_core.smart_delivery_backup:main',
         ],

@@ -22,8 +22,9 @@ amcl:
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    # Allow AMCL's augmented-MCL recovery particles to respond to a kidnapped robot.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::OmniMotionModel"
     save_pose_rate: 0.5
@@ -37,6 +38,59 @@ amcl:
     z_rand: 0.1 #0.5
     z_short: 0.05
     scan_topic: scan_filtered  # 🌟 修改為 scan_filtered
+
+localization_manager:
+  ros__parameters:
+    # The physical power-on position is fixed. Other navigation coordinates are
+    # intentionally left untouched until they are measured on the new map.
+    initial_pose.x: 0.0
+    initial_pose.y: 0.0
+    initial_pose.yaw: 0.0
+    initial_pose.xy_std: 0.25
+    initial_pose.yaw_std: 0.26
+    auto_initialize: true
+    # Observe the command that actually reaches the serial bridge after all
+    # semantic/failsafe limits, not Nav2's raw /cmd_vel request.
+    motion_cmd_topic: /chassis_cmd_vel
+
+    # Conservative first-pass thresholds; tune from logs at the real start pose.
+    scan_timeout_sec: 2.0
+    amcl_pose_timeout_sec: 8.0
+    amcl_nomotion_refresh_sec: 1.0
+    verify_timeout_sec: 25.0
+    stable_samples: 5
+    healthy_xy_std: 0.25
+    healthy_yaw_std: 0.17
+    critical_xy_std: 0.50
+    critical_yaw_std: 0.45
+    seed_xy_tolerance: 0.60
+    seed_yaw_tolerance: 0.52
+    suspect_hold_sec: 5.0
+
+    # Stop navigation first, then try no-motion update, a collision-checked
+    # +/-20 degree sweep, and finally one collision-checked 360 degree spin.
+    cancel_grace_sec: 2.0
+    local_recovery_wait_sec: 6.0
+    global_recovery_wait_sec: 12.0
+    small_spin_angle: 0.349066
+    full_spin_angle: 6.283185
+    spin_time_allowance_sec: 35
+    automatic_motion_recovery: true
+
+    # Low-cost scan-to-map check: sample at most 60 valid beams once per second.
+    map_match_min_score: 0.35
+    map_match_critical_score: 0.20
+    map_match_check_period_sec: 1.0
+    map_match_max_beams: 60
+    map_match_min_beams: 10
+    map_match_neighborhood_cells: 2
+
+    # External-force / localization-jump detection. These intentionally favor
+    # stopping over continuing with a questionable pose.
+    pose_jump_distance: 0.40
+    pose_jump_angle: 0.436332
+    external_move_distance: 0.25
+    external_move_angle: 0.349066
 
 bt_navigator:
   ros__parameters:
