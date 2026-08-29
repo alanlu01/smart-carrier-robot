@@ -802,6 +802,9 @@ def main():
                     warned = False
                     last_sequence = latest_power_sequence
                     last_verification = None
+                    last_verification_result = None
+                    wrong_slot_signature = None
+                    wrong_slot_event_id = None
                     confirmed = False
                     action_cancelled = False
                     while rclpy.ok() and time.monotonic() - started < timeout_seconds:
@@ -812,12 +815,30 @@ def main():
                         elapsed = time.monotonic() - started
                         if not warned and elapsed >= warning_seconds:
                             warned = True
+                            warning_message = "尚未完成指定槽位操作；30 秒後任務將失敗"
+                            if last_verification_result is not None:
+                                warning_message = (
+                                    f"{last_verification_result.message}；30 秒後任務將失敗"
+                                )
                             publish_task_state(
                                 task_state_publisher,
                                 target.get("task_id"),
                                 fsm.state,
-                                progress_message="尚未完成指定槽位操作；30 秒後任務將失敗",
+                                event_id=(
+                                    wrong_slot_event_id if fsm.state == "wrong_slot" else None
+                                ),
+                                progress_message=warning_message,
                                 expected_slot=slot_number,
+                                changed_slot=(
+                                    last_verification_result.changed_slot
+                                    if last_verification_result is not None
+                                    else None
+                                ),
+                                changed_slots=(
+                                    list(last_verification_result.changed_slots)
+                                    if last_verification_result is not None
+                                    else []
+                                ),
                                 action_deadline=action_deadline,
                                 warning=True,
                             )
@@ -825,6 +846,7 @@ def main():
                             continue
                         last_sequence = latest_power_sequence
                         verification = verifier.update(latest_power_banks)
+                        last_verification_result = verification
                         signature = (
                             verification.state,
                             verification.changed_slot,
@@ -838,10 +860,21 @@ def main():
                                 in {"wrong_slot", "waiting_action", "verifying_action"}
                                 else "waiting_action"
                             )
+                            event_id = None
+                            if state == "wrong_slot":
+                                next_wrong_signature = verification.changed_slots
+                                if next_wrong_signature != wrong_slot_signature:
+                                    wrong_slot_event_id = str(uuid.uuid4())
+                                    wrong_slot_signature = next_wrong_signature
+                                event_id = wrong_slot_event_id
+                            else:
+                                wrong_slot_signature = None
+                                wrong_slot_event_id = None
                             progress(
                                 target,
                                 fsm,
                                 state,
+                                event_id=event_id,
                                 progress_message=verification.message,
                                 expected_slot=slot_number,
                                 changed_slot=verification.changed_slot,
