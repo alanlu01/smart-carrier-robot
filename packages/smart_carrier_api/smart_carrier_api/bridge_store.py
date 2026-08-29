@@ -123,8 +123,10 @@ class BridgeStore:
         progresses[task_id] = progress
         self._set_json("pending_progresses", progresses)
 
-    def get_pending_progress(self) -> dict[str, Any] | None:
+    def get_pending_progress(self, task_id: str | None = None) -> dict[str, Any] | None:
         progresses = self._get_pending_progresses()
+        if task_id is not None:
+            return progresses.get(str(task_id))
         return next(iter(progresses.values()), None)
 
     def clear_pending_progress(self, task_id: str) -> None:

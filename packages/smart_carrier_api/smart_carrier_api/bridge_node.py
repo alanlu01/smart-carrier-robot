@@ -249,6 +249,11 @@ class ApiBridgeNode(Node):
         item = self.store.next_result()
         if not item:
             return
+        pending_progress = self.store.get_pending_progress(item["task_id"])
+        if pending_progress and pending_progress.get("progress_state") == "result_pending":
+            # Preserve the user-visible sync state before making the task terminal.
+            # flush_progress will clear it after the API accepts it.
+            return
         try:
             if item["status"] == "released":
                 self.api.release_task(item["task_id"], item["event_id"], item.get("note"))

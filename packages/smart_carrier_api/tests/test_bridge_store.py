@@ -47,6 +47,8 @@ def test_pending_progress_keeps_only_latest_value(tmp_path):
     store.set_pending_progress({"task_id": "task-1", "progress_state": "navigating"})
     store.set_pending_progress({"task_id": "task-1", "progress_state": "arrived"})
     assert store.get_pending_progress()["progress_state"] == "arrived"
+    assert store.get_pending_progress("task-1")["progress_state"] == "arrived"
+    assert store.get_pending_progress("missing") is None
     store.set_pending_progress(None)
     assert store.get_pending_progress() is None
     store.close()
