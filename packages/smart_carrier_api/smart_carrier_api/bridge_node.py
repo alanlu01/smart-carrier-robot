@@ -237,9 +237,9 @@ class ApiBridgeNode(Node):
             if task_id not in self.task_ids():
                 self.get_logger().warning(f"保存非目前 claimed queue 任務結果：{task_id}")
             self.store.enqueue_result(result)
-            ack = String()
-            ack.data = json.dumps({"event_id": event_id, "task_id": task_id})
-            self.result_ack_publisher.publish(ack)
+            self.get_logger().info(
+                f"任務結果已保存至本機 outbox，等待雲端確認：{task_id} ({event_id})"
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"忽略無效任務結果：{exc}")
 
@@ -256,6 +256,9 @@ class ApiBridgeNode(Node):
                 self.api.report_result(
                     item["task_id"], item["event_id"], item["status"], item.get("note")
                 )
+            ack = String()
+            ack.data = json.dumps({"event_id": item["event_id"], "task_id": item["task_id"]})
+            self.result_ack_publisher.publish(ack)
             self.store.mark_delivered(item["event_id"])
             self.store.remove_claimed_task(item["task_id"])
             self.claimed_tasks = self.store.get_claimed_tasks()

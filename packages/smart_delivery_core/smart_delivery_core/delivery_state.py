@@ -84,6 +84,7 @@ class SlotVerification:
     state: str
     confirmed: bool = False
     changed_slot: int | None = None
+    changed_slots: tuple[int, ...] = ()
     message: str = ""
 
 
@@ -108,10 +109,7 @@ class SlotActionVerifier:
         self.expected_slot = expected_slot
         self.confirm_samples = confirm_samples
         self.matching_samples = 0
-        self.baseline = {
-            int(slot["slot"]): slot_presence(slot)
-            for slot in baseline_slots
-        }
+        self.baseline = {int(slot["slot"]): slot_presence(slot) for slot in baseline_slots}
         expected_baseline = self.baseline.get(expected_slot)
         required_baseline = task_type == "borrow"
         if expected_baseline is None:
@@ -129,6 +127,7 @@ class SlotActionVerifier:
                 message=f"{self.expected_slot} 號槽感測資料不可用",
             )
 
+        changed_slots = []
         for slot_number, baseline_presence in self.baseline.items():
             if baseline_presence is None or slot_number == self.expected_slot:
                 continue
@@ -140,16 +139,19 @@ class SlotActionVerifier:
                     message=f"{slot_number} 號槽感測資料不可用",
                 )
             if current_presence != baseline_presence:
-                self.matching_samples = 0
-                action = "放回" if baseline_presence else "取出"
-                return SlotVerification(
-                    "wrong_slot",
-                    changed_slot=slot_number,
-                    message=(
-                        f"操作槽位錯誤：請先{action}{slot_number}號槽，"
-                        f"再操作{self.expected_slot}號槽"
-                    ),
-                )
+                changed_slots.append(slot_number)
+
+        if changed_slots:
+            self.matching_samples = 0
+            changed_text = "、".join(str(slot) for slot in changed_slots)
+            return SlotVerification(
+                "wrong_slot",
+                changed_slot=changed_slots[0],
+                changed_slots=tuple(changed_slots),
+                message=(
+                    f"操作槽位錯誤：請先恢復{changed_text}號槽，再操作{self.expected_slot}號槽"
+                ),
+            )
 
         desired_presence = self.task_type == "return"
         if current[self.expected_slot] != desired_presence:

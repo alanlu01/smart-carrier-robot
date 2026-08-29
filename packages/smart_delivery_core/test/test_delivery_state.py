@@ -42,6 +42,7 @@ def test_borrow_requires_expected_slot_and_restored_wrong_slot():
     result = verifier.update(wrong)
     assert result.state == "wrong_slot"
     assert result.changed_slot == 2
+    assert result.changed_slots == (2,)
 
     correct = [slot(1, "empty"), slot(2, "low"), slot(3, "disabled", enabled=False)]
     assert verifier.update(correct).state == "verifying_action"
@@ -71,6 +72,18 @@ def test_charge_state_change_is_not_treated_as_wrong_slot():
         slot(3, "disabled", enabled=False),
     ]
     assert verifier.update(changed_charge).confirmed
+
+
+def test_multiple_wrong_slots_are_reported_together():
+    baseline = [slot(1, "full"), slot(2, "full"), slot(3, "empty")]
+    verifier = SlotActionVerifier("borrow", 1, baseline, confirm_samples=1)
+
+    result = verifier.update([slot(1, "full"), slot(2, "empty"), slot(3, "full")])
+
+    assert result.state == "wrong_slot"
+    assert result.changed_slot == 2
+    assert result.changed_slots == (2, 3)
+    assert "2、3號槽" in result.message
 
 
 def test_delivery_journal_round_trip(tmp_path):

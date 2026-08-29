@@ -307,11 +307,11 @@ def publish_task_result(publisher, task_id, status, note, event_id=None):
     return json.loads(message.data)
 
 
-def publish_task_state(publisher, task_id, state, **details):
+def publish_task_state(publisher, task_id, state, *, event_id=None, **details):
     if not task_id:
         return
     payload = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id or str(uuid.uuid4()),
         "task_id": str(task_id),
         "progress_state": state,
         "progress_updated_at": datetime.now(UTC).isoformat(),
@@ -374,7 +374,7 @@ def main():
     rclpy.init()
     navigator = BasicNavigator()
     tf_buffer = Buffer()
-    tf_listener = TransformListener(tf_buffer, navigator)
+    _tf_listener = TransformListener(tf_buffer, navigator)
     navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
     navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
     navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
@@ -494,7 +494,7 @@ def main():
             task_state_publisher,
             task.get("task_id"),
             "result_pending",
-            progress_message=note,
+            progress_message="操作已完成，正在同步結果，請勿重複操作",
         )
         pending_result = {
             "event_id": str(uuid.uuid4()),
@@ -541,6 +541,12 @@ def main():
             "created_at": datetime.now(UTC).isoformat(),
         }
         persist(active_task, "recovery_required", pending_result)
+        publish_task_state(
+            task_state_publisher,
+            task_id,
+            "recovery_required",
+            progress_message="機器人重啟後偵測到未完成任務，已停止移動並等待結果同步",
+        )
         navigator.get_logger().error(
             f"偵測到重啟前未完成任務 {task_id}；不自動續航，改回報復原失敗"
         )
@@ -639,9 +645,7 @@ def main():
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
             if not is_standby:
-                standby_pos = go_to_standby(
-                    navigator, current_pos, lambda: localization_ready
-                )
+                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
@@ -650,9 +654,7 @@ def main():
         if not pending_orders:
             if not is_standby:
                 print("\n🏁 無待處理任務，返回待機點")
-                standby_pos = go_to_standby(
-                    navigator, current_pos, lambda: localization_ready
-                )
+                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
@@ -826,6 +828,7 @@ def main():
                         signature = (
                             verification.state,
                             verification.changed_slot,
+                            verification.changed_slots,
                             verification.message,
                         )
                         if signature != last_verification:
@@ -842,6 +845,7 @@ def main():
                                 progress_message=verification.message,
                                 expected_slot=slot_number,
                                 changed_slot=verification.changed_slot,
+                                changed_slots=list(verification.changed_slots),
                                 action_deadline=action_deadline,
                                 warning=warned,
                             )
