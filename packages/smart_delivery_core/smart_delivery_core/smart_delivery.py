@@ -906,8 +906,8 @@ def main():
                             target,
                             fsm,
                             "failed",
-                            f"Timed out after {timeout_seconds:.0f}s waiting "
-                            f"for slot {slot_number}",
+                            f"等待 {slot_number} 號槽操作逾時（{timeout_seconds:.0f} 秒），"
+                            "任務已安全停止",
                         )
 
         if not keep_pending:
