@@ -43,7 +43,7 @@ class INA3221Node(Node):
         self.declare_parameter("present_current_min_a", 0.020)
         self.declare_parameter("full_current_max_a", 0.080)
         self.declare_parameter("state_confirm_samples", 6)
-        self.declare_parameter("slot_enabled", [True, True, False])
+        self.declare_parameter("slot_enabled", [True, True, True])
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)
         self.i2c_address = int(self.get_parameter("i2c_address").value)

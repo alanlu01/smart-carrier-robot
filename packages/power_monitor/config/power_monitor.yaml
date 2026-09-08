@@ -16,5 +16,5 @@ ina3221_node:
     full_current_max_a: 0.080
     # 0.5 秒取樣，連續 6 筆（約 3 秒）才確認狀態切換。
     state_confirm_samples: 6
-    # Ch3 快充模組目前停用；修復後改為 true 並重啟節點。
-    slot_enabled: [true, true, false]
+    # 三個快充槽皆已接上可用模組。
+    slot_enabled: [true, true, true]
