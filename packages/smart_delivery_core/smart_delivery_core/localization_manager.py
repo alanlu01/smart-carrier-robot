@@ -25,6 +25,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.localization_health import (
+    map_match_status,
     occupancy_match_score,
     pose_is_near,
     pose_jump,
@@ -108,9 +109,9 @@ class LocalizationManager(Node):
         self.latest_scan_at = 0.0
         self.latest_pose = None
         self.latest_quality = None
-        self.previous_amcl_pose = None
         self.last_amcl_at = 0.0
         self.stable_samples = 0
+        self.last_stable_map_score_at = 0.0
         self.verify_reference_required = True
         self.suspect_since = None
         self.recovery_step = None
@@ -120,6 +121,7 @@ class LocalizationManager(Node):
         self.spin_in_progress = False
         self.commanded_motion = False
         self.stationary_odom_anchor = None
+        self.stationary_amcl_anchor = None
         self.last_odom_pose = None
         self.manual_initial_pose_pending = False
         self.initial_pose_last_published = 0.0
@@ -281,6 +283,7 @@ class LocalizationManager(Node):
         )
         if self.commanded_motion:
             self.stationary_odom_anchor = None
+            self.stationary_amcl_anchor = None
 
     def _motion_inhibited_callback(self, message):
         self.motion_inhibited = bool(message.data)
@@ -321,17 +324,19 @@ class LocalizationManager(Node):
             self.critical_xy_std,
             self.critical_yaw_std,
         )
-        previous = self.latest_pose
-        self.previous_amcl_pose = previous
         self.latest_pose = current
         self.latest_quality = quality
         self.last_amcl_at = now
 
         if self.state == "LOCALIZED" and not self.commanded_motion:
-            distance, angle = pose_jump(previous, current)
+            if self.stationary_amcl_anchor is None:
+                self.stationary_amcl_anchor = current
+            distance, angle = pose_jump(self.stationary_amcl_anchor, current)
             if distance >= self.pose_jump_distance or angle >= self.pose_jump_angle:
+                self.stationary_amcl_anchor = current
                 self._begin_recovery(
-                    f"AMCL 位姿跳動 {distance:.2f} m / {math.degrees(angle):.1f} deg"
+                    f"無速度命令但 AMCL 累積位移 {distance:.2f} m / "
+                    f"{math.degrees(angle):.1f} deg"
                 )
                 return
 
@@ -356,11 +361,17 @@ class LocalizationManager(Node):
                 and now - self.latest_map_score_at <= 2.0 * self.map_match_period
             )
             if quality.healthy and reference_ok and map_match_ok and self._scan_is_fresh(now):
-                self.stable_samples += 1
-                if self.stable_samples >= self.stable_samples_required:
-                    self._mark_localized()
+                if self.latest_map_score_at > self.last_stable_map_score_at:
+                    self.last_stable_map_score_at = self.latest_map_score_at
+                    self.stable_samples += 1
+                    if self.stable_samples >= self.stable_samples_required:
+                        self._mark_localized()
             else:
                 self.stable_samples = 0
+                self.last_stable_map_score_at = max(
+                    self.last_stable_map_score_at,
+                    self.latest_map_score_at,
+                )
 
     def _external_initial_pose_callback(self, _message):
         if self.manual_initial_pose_pending:
@@ -368,6 +379,7 @@ class LocalizationManager(Node):
             return
         if self.state == "MANUAL_REQUIRED":
             self.stable_samples = 0
+            self.last_stable_map_score_at = self.latest_map_score_at
             self.verify_reference_required = False
             self._set_state("VERIFYING", "收到人工初始位置，正在驗證")
 
@@ -426,39 +438,39 @@ class LocalizationManager(Node):
             if amcl_pose_age > self.amcl_pose_timeout:
                 self._begin_recovery("AMCL 位姿資料逾時")
                 return
-            map_match_critical = (
-                self.latest_map_score is not None
-                and now - self.latest_map_score_at <= 2.0 * self.map_match_period
-                and self.latest_map_score <= self.map_match_critical_score
-            )
-            if self.latest_quality.critical or map_match_critical:
+            match_status = self._map_match_status(now)
+            map_match_bad = match_status in {"critical", "degraded"}
+            if self.latest_quality.critical or map_match_bad:
                 if self.suspect_since is None:
                     self.suspect_since = now
-                    reason = (
-                        f"雷達地圖吻合度過低 ({self.latest_map_score:.2f})"
-                        if map_match_critical
-                        else "AMCL 不確定度持續偏高"
-                    )
+                    if match_status == "critical":
+                        reason = f"雷達地圖吻合度過低 ({self.latest_map_score:.2f})"
+                    elif match_status == "degraded":
+                        reason = (
+                            f"雷達地圖吻合度未達可信門檻 "
+                            f"({self.latest_map_score:.2f} < {self.map_match_min_score:.2f})"
+                        )
+                    else:
+                        reason = "AMCL 不確定度持續偏高"
                     self._set_state("SUSPECT", reason)
             else:
                 self.suspect_since = None
             return
 
         if self.state == "SUSPECT":
-            map_match_critical = (
-                self.latest_map_score is not None
-                and now - self.latest_map_score_at <= 2.0 * self.map_match_period
-                and self.latest_map_score <= self.map_match_critical_score
-            )
+            match_status = self._map_match_status(now)
             if (
                 self.latest_quality is not None
                 and not self.latest_quality.critical
-                and not map_match_critical
+                and match_status == "healthy"
             ):
                 self.suspect_since = None
                 self._mark_localized()
             elif self.suspect_since is not None and now - self.suspect_since >= self.suspect_hold:
-                self._begin_recovery("AMCL 不確定度超過保守門檻")
+                if match_status in {"critical", "degraded", "unknown"}:
+                    self._begin_recovery("雷達地圖吻合度持續低於可信門檻")
+                else:
+                    self._begin_recovery("AMCL 不確定度超過保守門檻")
             return
 
         if self.state == "RECOVERING_LOCAL":
@@ -527,6 +539,15 @@ class LocalizationManager(Node):
             self.latest_map_score = score
             self.latest_map_score_at = now
 
+    def _map_match_status(self, now):
+        return map_match_status(
+            self.latest_map_score,
+            now - self.latest_map_score_at,
+            self.map_match_min_score,
+            self.map_match_critical_score,
+            2.0 * self.map_match_period,
+        )
+
     def _publish_initial_pose(self, retry=False):
         message = PoseWithCovarianceStamped()
         message.header.frame_id = "map"
@@ -542,6 +563,7 @@ class LocalizationManager(Node):
         message.pose.covariance[35] = yaw_std**2
         self.manual_initial_pose_pending = True
         self.stable_samples = 0
+        self.last_stable_map_score_at = self.latest_map_score_at
         self.verify_reference_required = True
         if not retry:
             self._set_state("SEEDING", "發布固定開機位置 (0,0,0)")
@@ -557,6 +579,8 @@ class LocalizationManager(Node):
         self.recovery_step = None
         self.spin_sequence = []
         self.spin_in_progress = False
+        self.stationary_odom_anchor = self.last_odom_pose
+        self.stationary_amcl_anchor = self.latest_pose
         quality = self.latest_quality
         reason = "AMCL 已穩定"
         if quality is not None:
@@ -577,6 +601,9 @@ class LocalizationManager(Node):
             return
         self._cancel_navigation()
         self.stable_samples = 0
+        self.last_stable_map_score_at = self.latest_map_score_at
+        self.stationary_odom_anchor = None
+        self.stationary_amcl_anchor = None
         self.verify_reference_required = False
         self.recovery_reason = reason
         self.recovery_step = "cancel_wait"
@@ -635,6 +662,7 @@ class LocalizationManager(Node):
             return
         self.global_localization_client.call_async(Empty.Request())
         self.stable_samples = 0
+        self.last_stable_map_score_at = self.latest_map_score_at
         self.recovery_step = "global_settle"
         self.recovery_step_started = time.monotonic()
         self._set_state("RECOVERING_GLOBAL", "全域粒子重新定位")

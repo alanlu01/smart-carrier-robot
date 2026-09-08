@@ -68,6 +68,17 @@ def pose_jump(previous, current):
     return distance, angle
 
 
+def map_match_status(score, age, minimum_score, critical_score, maximum_age):
+    """Classify a scan-to-map score using freshness and hysteresis thresholds."""
+    if score is None or age < 0.0 or age > maximum_age:
+        return "unknown"
+    if score <= critical_score:
+        return "critical"
+    if score < minimum_score:
+        return "degraded"
+    return "healthy"
+
+
 def occupancy_match_score(
     endpoints,
     occupancy_data,

@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 from smart_delivery_core.localization_health import (
+    map_match_status,
     normalize_angle,
     occupancy_match_score,
     pose_is_near,
@@ -41,6 +42,30 @@ def test_pose_jump_handles_wrapped_yaw():
     distance, angle = pose_jump((0.0, 0.0, math.pi - 0.05), (0.3, 0.4, -math.pi + 0.05))
     assert distance == 0.5
     assert math.isclose(angle, 0.1)
+
+
+def test_stationary_anchor_detects_cumulative_pose_drift():
+    anchor = (0.0, 0.0, 0.0)
+    samples = [(0.15, 0.0, 0.0), (0.30, 0.0, 0.0), (0.41, 0.0, 0.0)]
+    previous = anchor
+    for current in samples:
+        distance, _ = pose_jump(previous, current)
+        assert distance < 0.40
+        previous = current
+    distance, _ = pose_jump(anchor, samples[-1])
+    assert distance >= 0.40
+
+
+def test_map_match_status_keeps_degraded_scores_out_of_healthy_state():
+    assert map_match_status(0.19, 0.5, 0.35, 0.20, 2.0) == "critical"
+    assert map_match_status(0.21, 0.5, 0.35, 0.20, 2.0) == "degraded"
+    assert map_match_status(0.349, 0.5, 0.35, 0.20, 2.0) == "degraded"
+    assert map_match_status(0.35, 0.5, 0.35, 0.20, 2.0) == "healthy"
+
+
+def test_map_match_status_rejects_missing_or_stale_scores():
+    assert map_match_status(None, 0.0, 0.35, 0.20, 2.0) == "unknown"
+    assert map_match_status(0.95, 2.1, 0.35, 0.20, 2.0) == "unknown"
 
 
 def test_quaternion_to_yaw():
