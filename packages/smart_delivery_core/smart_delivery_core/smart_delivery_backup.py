@@ -8,14 +8,10 @@ from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from power_monitor.power_status import payload_to_slots
 from std_msgs.msg import String
 
+from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
+
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
-
-# --- 預先定義的靠牆待機點 (可依實際地圖修改) ---
-STANDBY_POINTS = [
-    {"name": "門口", "x": -0.45, "y": -0.35, "yaw": 0.0},
-    {"name": "走廊轉角", "x": 5.0, "y": 0.0, "yaw": -1.57}
-]
 
 # 行動電源狀態介面的預設數字值
 POWER_BANK_STATUS_CODES = {
@@ -209,9 +205,20 @@ def main():
         return
 
     pending_orders = [
-        # {"name": "廚房", "type": "return", "power_bank": {"id": "PB-03", "status": "low", "charge": 20}, "x": -1.5, "y": 5, "yaw": 0.0},
-        {"name": "廁所", "type": "return", "power_bank": {"id": "PB-04", "status": "low", "charge": 20}, "x": -4, "y": 1.5, "yaw": 3.14},
-        {"name": "客廳TV", "type": "borrow", "required_charge": 90, "x": 0.4, "y": 0, "yaw": 0.0},
+        # {
+        #     "name": "右樓梯口", "type": "return",
+        #     "power_bank": {"id": "PB-03", "status": "low", "charge": 20},
+        #     "x": 7.7, "y": -7.2, "yaw": 0.0,
+        # },
+        {
+            "name": "左樓梯口", "type": "return",
+            "power_bank": {"id": "PB-04", "status": "low", "charge": 20},
+            **LOCATION_DB["左樓梯口"],
+        },
+        {
+            "name": "電機工程學系", "type": "borrow", "required_charge": 90,
+            **LOCATION_DB["電機工程學系"],
+        },
     ]
 
     current_pos = {"x": 0.0, "y": 0.0}

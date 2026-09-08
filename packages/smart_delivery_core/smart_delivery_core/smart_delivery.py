@@ -20,6 +20,7 @@ from smart_delivery_core.delivery_state import (
     DeliveryStateMachine,
     SlotActionVerifier,
 )
+from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
@@ -32,21 +33,6 @@ STATE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
-
-# --- 1. 預先定義的靠牆待機點 ---
-STANDBY_POINTS = [
-    {"name": "門口", "x": -0.45, "y": -0.35, "yaw": 0.0},
-    # {"name": "走廊轉角", "x": 5.0, "y": 0.0, "yaw": -1.57}
-]
-
-# --- 2. 固定的配送座標清單 (查表法資料庫) ---
-LOCATION_DB = {
-    "門口": {"x": -0.45, "y": -0.35, "yaw": 0.0},
-    # "走廊轉角": {"x": 5.0, "y": 0.0, "yaw": -1.57},
-    "廚房": {"x": -1.5, "y": 5.0, "yaw": 0.0},
-    "廁所": {"x": -4.0, "y": 1.5, "yaw": 3.14},
-    "客廳TV": {"x": 0.4, "y": 0.0, "yaw": 0.0},
-}
 
 BORROWABLE_STATUS_PRIORITY = {
     "full": 0,
