@@ -70,7 +70,7 @@ class MecanumOdomReal(Node):
         
         # 🌟 7. 新增：自轉專屬微調係數
         # 如果實體轉 360 度，虛擬轉了 420 度，就把這裡調小 (例如 360/420 = 0.85)
-        self.yaw_ratio = 1.02
+        self.yaw_ratio = 1.0
         
         # 🌟 8. 新增：反向補償係數 (抹平 RViz 中的虛擬偏右現象)
         self.compensation = {
@@ -81,7 +81,7 @@ class MecanumOdomReal(Node):
         }
         
         # 🌟 9. 因為是反向偏移 (里程計少算)，所以數值要大於 1.0
-        self.angular_scale = 1.10  # 建議先從 1.05 到 1.15 之間開始測
+        # self.angular_scale = 1.10  # 建議先從 1.05 到 1.15 之間開始測
 
         self.last_time = time.monotonic()
         self.timer = self.create_timer(0.05, self.update_odometry)
