@@ -31,6 +31,7 @@ from smart_delivery_core.localization_health import (
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    update_stability_samples,
 )
 
 
@@ -360,18 +361,22 @@ class LocalizationManager(Node):
                 and self.latest_map_score >= self.map_match_min_score
                 and now - self.latest_map_score_at <= 2.0 * self.map_match_period
             )
-            if quality.healthy and reference_ok and map_match_ok and self._scan_is_fresh(now):
-                if self.latest_map_score_at > self.last_stable_map_score_at:
-                    self.last_stable_map_score_at = self.latest_map_score_at
-                    self.stable_samples += 1
-                    if self.stable_samples >= self.stable_samples_required:
-                        self._mark_localized()
-            else:
-                self.stable_samples = 0
-                self.last_stable_map_score_at = max(
-                    self.last_stable_map_score_at,
+            qualified = (
+                quality.healthy
+                and reference_ok
+                and map_match_ok
+                and self._scan_is_fresh(now)
+            )
+            self.stable_samples, self.last_stable_map_score_at = (
+                update_stability_samples(
+                    qualified,
                     self.latest_map_score_at,
+                    self.last_stable_map_score_at,
+                    self.stable_samples,
                 )
+            )
+            if qualified and self.stable_samples >= self.stable_samples_required:
+                self._mark_localized()
 
     def _external_initial_pose_callback(self, _message):
         if self.manual_initial_pose_pending:
@@ -443,6 +448,8 @@ class LocalizationManager(Node):
             if self.latest_quality.critical or map_match_bad:
                 if self.suspect_since is None:
                     self.suspect_since = now
+                    self.stable_samples = 0
+                    self.last_stable_map_score_at = self.latest_map_score_at
                     if match_status == "critical":
                         reason = f"雷達地圖吻合度過低 ({self.latest_map_score:.2f})"
                     elif match_status == "degraded":
@@ -459,14 +466,28 @@ class LocalizationManager(Node):
 
         if self.state == "SUSPECT":
             match_status = self._map_match_status(now)
-            if (
+            qualified = (
                 self.latest_quality is not None
-                and not self.latest_quality.critical
+                and self.latest_quality.healthy
                 and match_status == "healthy"
-            ):
-                self.suspect_since = None
+                and now - self.last_amcl_at <= self.amcl_pose_timeout
+                and self._scan_is_fresh(now)
+            )
+            self.stable_samples, self.last_stable_map_score_at = (
+                update_stability_samples(
+                    qualified,
+                    self.latest_map_score_at,
+                    self.last_stable_map_score_at,
+                    self.stable_samples,
+                )
+            )
+            if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
-            elif self.suspect_since is not None and now - self.suspect_since >= self.suspect_hold:
+            elif (
+                not qualified
+                and self.suspect_since is not None
+                and now - self.suspect_since >= self.suspect_hold
+            ):
                 if match_status in {"critical", "degraded", "unknown"}:
                     self._begin_recovery("雷達地圖吻合度持續低於可信門檻")
                 else:
@@ -620,19 +641,36 @@ class LocalizationManager(Node):
         self.get_logger().warning("AMCL 靜止更新服務尚未就緒")
         return False
 
+    def _request_nomotion_if_due(self, now):
+        if now - self.last_nomotion_request_at >= self.amcl_nomotion_refresh:
+            self._request_nomotion_update()
+
+    def _motion_pipeline_is_ready(self):
+        if self.count_publishers(self.motion_cmd_topic) > 0:
+            return True
+        self._require_manual(
+            f"底盤速度管線未就緒（{self.motion_cmd_topic} 無發布者；"
+            "請確認 fusion_node/start_ai 已啟動）"
+        )
+        return False
+
     def _tick_local_recovery(self, now):
         elapsed = now - self.recovery_step_started
         if self.recovery_step == "cancel_wait" and elapsed >= self.cancel_grace:
             self._request_nomotion_update()
             self.recovery_step = "nomotion_wait"
             self.recovery_step_started = now
-        elif self.recovery_step == "nomotion_wait" and elapsed >= self.local_wait:
-            if not self.auto_motion_recovery:
-                self._require_manual("自動旋轉恢復已停用")
-            else:
-                self._start_small_sweep()
-        elif self.recovery_step == "post_small" and elapsed >= self.local_wait:
-            self._start_global_recovery()
+        elif self.recovery_step == "nomotion_wait":
+            self._request_nomotion_if_due(now)
+            if elapsed >= self.local_wait:
+                if not self.auto_motion_recovery:
+                    self._require_manual("自動旋轉恢復已停用")
+                else:
+                    self._start_small_sweep()
+        elif self.recovery_step == "post_small":
+            self._request_nomotion_if_due(now)
+            if elapsed >= self.local_wait:
+                self._start_global_recovery()
         elif self.recovery_step == "motion_inhibited" and not self.motion_inhibited:
             self._start_small_sweep()
 
@@ -641,6 +679,8 @@ class LocalizationManager(Node):
             self.recovery_step = "motion_inhibited"
             self.recovery_step_started = time.monotonic()
             self.get_logger().warning("實體取還操作中，暫不執行自動旋轉")
+            return
+        if not self._motion_pipeline_is_ready():
             return
         if not self.spin_client.server_is_ready():
             self._require_manual("Spin 行為伺服器未就緒")
@@ -673,6 +713,8 @@ class LocalizationManager(Node):
             if self.motion_inhibited:
                 self.recovery_step_started = now
                 return
+            if not self._motion_pipeline_is_ready():
+                return
             if not self.spin_client.server_is_ready():
                 self._require_manual("Spin 行為伺服器未就緒")
                 return
@@ -680,8 +722,10 @@ class LocalizationManager(Node):
             self.spin_sequence = [self.full_spin_angle]
             self.get_logger().warning("開始碰撞檢查的 360 度低速定位自旋")
             self._send_next_spin()
-        elif self.recovery_step == "post_global" and elapsed >= self.global_wait:
-            self._require_manual("全域重新定位後仍未通過可信度檢查")
+        elif self.recovery_step == "post_global":
+            self._request_nomotion_if_due(now)
+            if elapsed >= self.global_wait:
+                self._require_manual("全域重新定位後仍未通過可信度檢查")
 
     def _send_next_spin(self):
         if self.spin_in_progress:

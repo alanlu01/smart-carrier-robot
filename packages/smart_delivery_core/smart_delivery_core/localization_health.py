@@ -79,6 +79,17 @@ def map_match_status(score, age, minimum_score, critical_score, maximum_age):
     return "healthy"
 
 
+def update_stability_samples(qualified, sample_at, last_sample_at, sample_count):
+    """Count each fresh qualified sample once and reset on an unhealthy sample."""
+    sample_at = float(sample_at)
+    last_sample_at = float(last_sample_at)
+    if not qualified:
+        return 0, max(last_sample_at, sample_at)
+    if sample_at <= last_sample_at:
+        return int(sample_count), last_sample_at
+    return int(sample_count) + 1, sample_at
+
+
 def occupancy_match_score(
     endpoints,
     occupancy_data,

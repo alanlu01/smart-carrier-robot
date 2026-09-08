@@ -9,6 +9,7 @@ from smart_delivery_core.localization_health import (
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    update_stability_samples,
 )
 
 
@@ -66,6 +67,22 @@ def test_map_match_status_keeps_degraded_scores_out_of_healthy_state():
 def test_map_match_status_rejects_missing_or_stale_scores():
     assert map_match_status(None, 0.0, 0.35, 0.20, 2.0) == "unknown"
     assert map_match_status(0.95, 2.1, 0.35, 0.20, 2.0) == "unknown"
+
+
+def test_stability_samples_only_count_each_timestamp_once():
+    count, timestamp = update_stability_samples(True, 10.0, 0.0, 0)
+    assert (count, timestamp) == (1, 10.0)
+    count, timestamp = update_stability_samples(True, 10.0, timestamp, count)
+    assert (count, timestamp) == (1, 10.0)
+    count, timestamp = update_stability_samples(True, 11.0, timestamp, count)
+    assert (count, timestamp) == (2, 11.0)
+
+
+def test_stability_samples_reset_and_consume_unhealthy_timestamp():
+    count, timestamp = update_stability_samples(False, 12.0, 11.0, 4)
+    assert (count, timestamp) == (0, 12.0)
+    count, timestamp = update_stability_samples(True, 12.0, timestamp, count)
+    assert (count, timestamp) == (0, 12.0)
 
 
 def test_quaternion_to_yaw():
