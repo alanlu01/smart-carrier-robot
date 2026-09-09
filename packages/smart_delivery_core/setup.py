@@ -18,6 +18,10 @@ setup(
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
         (os.path.join('share', package_name, 'maps'), glob('maps/*.*')),
         (os.path.join('share', package_name, 'config'), glob('config/*.*')),
+        (
+            os.path.join('share', package_name, 'behavior_trees'),
+            glob('behavior_trees/*.xml'),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

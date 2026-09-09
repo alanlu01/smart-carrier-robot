@@ -6,6 +6,7 @@ testpaths = [
   "packages/smart_delivery_core/test/test_cloud_order_logic.py",
   "packages/smart_delivery_core/test/test_delivery_state.py",
   "packages/smart_delivery_core/test/test_localization_health.py",
+  "packages/smart_delivery_core/test/test_navigation_behavior_tree.py",
   "packages/smart_delivery_core/test/test_service_locations.py",
   "packages/hailo_vision/test/test_semantic_protocol.py",
 ]
