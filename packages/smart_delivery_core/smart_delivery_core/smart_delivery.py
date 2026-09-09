@@ -452,19 +452,7 @@ def main():
     # waits for navigation activation and never writes to /initialpose.
     navigator.waitUntilNav2Active(localizer="robot_localization")
     print("✅ Nav2 準備就緒！")
-
-    print("⏳ 等待定位管理器確認位置...")
-    while rclpy.ok() and not localization_ready:
-        rclpy.spin_once(navigator, timeout_sec=0.2)
-        now = time.monotonic()
-        if now - last_localization_warning_at >= 10.0:
-            navigator.get_logger().warning(
-                f"定位尚未就緒（{localization_state}），不會送出導航目標"
-            )
-            last_localization_warning_at = now
-    if not rclpy.ok():
-        return
-    print("✅ 定位可信度檢查通過！")
+    print("⏳ 定位尚未就緒時會保留任務，但仍會接收訂單、取消與結果確認")
 
     latest_power_banks = None
     latest_power_status_at = 0.0
@@ -633,15 +621,20 @@ def main():
     navigator.create_subscription(String, "order", order_callback, COMMAND_QOS)
 
     def task_cancel_callback(msg):
-        nonlocal active_task_id
         try:
             cancellation = json.loads(msg.data)
             task_id = str(cancellation["task_id"])
             reason = str(cancellation.get("reason") or "Cancelled by administrator")
             cancellation_requests[task_id] = reason
             if active_task_id == task_id:
-                navigator.get_logger().warning(f"正在停止管理員取消的任務：{task_id}")
-                navigator.cancelTask()
+                # BasicNavigator.cancelTask() spins its executor while waiting for
+                # the action cancellation response.  Calling it from this callback
+                # would nest an executor spin and crash rclpy.  The navigation loop
+                # observes cancellation_requests and performs the cancellation on
+                # its next control cycle instead.
+                navigator.get_logger().warning(
+                    f"已收到管理員取消要求，下一控制週期停止任務：{task_id}"
+                )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             navigator.get_logger().error(f"無效的取消任務訊息：{exc}")
 
