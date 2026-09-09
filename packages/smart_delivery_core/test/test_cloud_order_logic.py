@@ -4,6 +4,7 @@ from smart_delivery_core.smart_delivery import (
     SlotConfirmationTracker,
     infeasible_order_note,
     order_payload_to_order,
+    recovered_slot_baseline,
     schedule_orders,
 )
 
@@ -204,3 +205,41 @@ def test_multiple_orders_apply_borrow_distance_weight_to_route_selection():
         "farther-borrow",
         "near-navigation",
     ]
+
+
+def test_recovered_slot_baseline_uses_saved_snapshot():
+    saved = [
+        {"slot": 1, "status": "full", "sensor_ok": True, "enabled": True},
+        {"slot": 2, "status": "empty", "sensor_ok": True, "enabled": True},
+    ]
+    task = {
+        "type": "borrow",
+        "slot_number": 1,
+        "_slot_baseline": saved,
+    }
+    current = [
+        {"slot": 1, "status": "empty", "sensor_ok": True, "enabled": True},
+        {"slot": 2, "status": "empty", "sensor_ok": True, "enabled": True},
+    ]
+
+    baseline = recovered_slot_baseline(task, current)
+
+    assert baseline == saved
+    assert baseline is not saved
+
+
+def test_recovered_slot_baseline_reconstructs_expected_pre_action_state():
+    current = [
+        {"slot": 1, "status": "empty", "sensor_ok": True, "enabled": True},
+        {"slot": 2, "status": "full", "sensor_ok": True, "enabled": True},
+    ]
+
+    borrow = recovered_slot_baseline(
+        {"type": "borrow", "slot_number": 1}, current
+    )
+    returned = recovered_slot_baseline(
+        {"type": "return", "slot_number": 2}, current
+    )
+
+    assert borrow[0]["status"] == "full"
+    assert returned[1]["status"] == "empty"

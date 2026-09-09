@@ -17,6 +17,11 @@ STATE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
+COMMAND_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 
 class ApiBridgeNode(Node):
@@ -33,6 +38,7 @@ class ApiBridgeNode(Node):
         self.declare_parameter("heartbeat_interval", 5.0)
         self.declare_parameter("request_timeout", 5.0)
         self.declare_parameter("order_republish_interval", 5.0)
+        self.declare_parameter("cancel_republish_interval", 2.0)
         self.declare_parameter("max_claimed_tasks", 3)
 
         api_url = str(self.get_parameter("api_url").value)
@@ -47,18 +53,17 @@ class ApiBridgeNode(Node):
             raise ValueError("max_claimed_tasks 必須至少為 1")
 
         self.claimed_tasks = self.store.get_claimed_tasks()
-        self.delivery_confirmed_task_ids = set()
         self.last_order_publish_at = {}
+        self.last_cancel_publish_at = {}
         self.last_error_at = 0.0
         self.slots = []
         self.power_healthy = False
         self.power_received = False
         self.heartbeat_confirmed = False
-        self.cancel_notified_task_ids = set()
 
-        self.order_publisher = self.create_publisher(String, "order", STATE_QOS)
+        self.order_publisher = self.create_publisher(String, "order", COMMAND_QOS)
         self.cancel_publisher = self.create_publisher(
-            String, "/smart_carrier/task_cancel", STATE_QOS
+            String, "/smart_carrier/task_cancel", COMMAND_QOS
         )
         self.result_ack_publisher = self.create_publisher(
             String, "/smart_carrier/task_result_ack", STATE_QOS
@@ -111,13 +116,12 @@ class ApiBridgeNode(Node):
         self.order_publisher.publish(message)
         self.last_order_publish_at[task_id] = time.monotonic()
 
-    def publish_unconfirmed_orders(self):
+    def publish_claimed_orders(self):
+        """Republish locally owned tasks until a terminal result is acknowledged."""
         interval = float(self.get_parameter("order_republish_interval").value)
         now = time.monotonic()
         for task in self.claimed_tasks:
             task_id = str(task["id"])
-            if task_id in self.delivery_confirmed_task_ids:
-                continue
             if now - self.last_order_publish_at.get(task_id, 0.0) >= interval:
                 self.publish_order(task)
 
@@ -125,7 +129,7 @@ class ApiBridgeNode(Node):
         if not self.configured:
             return
         self.poll_claimed_tasks()
-        self.publish_unconfirmed_orders()
+        self.publish_claimed_orders()
         if self.store.has_pending_results() or not self.power_healthy:
             return
         if self.order_publisher.get_subscription_count() == 0:
@@ -163,6 +167,8 @@ class ApiBridgeNode(Node):
                 return
 
     def poll_claimed_tasks(self):
+        interval = float(self.get_parameter("cancel_republish_interval").value)
+        now = time.monotonic()
         for claimed in list(self.claimed_tasks):
             task_id = str(claimed["id"])
             try:
@@ -170,8 +176,12 @@ class ApiBridgeNode(Node):
                 cancellation_requested = bool(task.get("cancel_requested_at"))
                 if task.get("status") == "cancelled":
                     cancellation_requested = True
-                if not cancellation_requested or task_id in self.cancel_notified_task_ids:
+                if not cancellation_requested:
+                    self.last_cancel_publish_at.pop(task_id, None)
                     continue
+                if now - self.last_cancel_publish_at.get(task_id, 0.0) < interval:
+                    continue
+                first_notification = task_id not in self.last_cancel_publish_at
                 message = String()
                 message.data = json.dumps(
                     {
@@ -181,8 +191,11 @@ class ApiBridgeNode(Node):
                     ensure_ascii=False,
                 )
                 self.cancel_publisher.publish(message)
-                self.cancel_notified_task_ids.add(task_id)
-                self.get_logger().warning(f"收到雲端取消要求：{task_id}")
+                self.last_cancel_publish_at[task_id] = now
+                if first_notification:
+                    self.get_logger().warning(f"收到雲端取消要求：{task_id}")
+                else:
+                    self.get_logger().debug(f"重送雲端取消要求：{task_id}")
             except (ApiError, AttributeError, TypeError) as exc:
                 self.log_api_error(exc)
 
@@ -209,7 +222,6 @@ class ApiBridgeNode(Node):
             task_id = str(progress["task_id"])
             if task_id not in self.task_ids():
                 return
-            self.delivery_confirmed_task_ids.add(task_id)
             self.store.set_pending_progress(progress)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"忽略無效任務進度：{exc}")
@@ -268,9 +280,8 @@ class ApiBridgeNode(Node):
             self.store.remove_claimed_task(item["task_id"])
             self.claimed_tasks = self.store.get_claimed_tasks()
             self.store.clear_pending_progress(item["task_id"])
-            self.delivery_confirmed_task_ids.discard(item["task_id"])
-            self.cancel_notified_task_ids.discard(item["task_id"])
             self.last_order_publish_at.pop(item["task_id"], None)
+            self.last_cancel_publish_at.pop(item["task_id"], None)
             self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
         except ApiError as exc:
             self.store.mark_retry(item["event_id"], int(item["attempts"]))

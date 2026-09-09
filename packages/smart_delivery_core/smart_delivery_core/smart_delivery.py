@@ -33,6 +33,18 @@ STATE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
+COMMAND_QOS = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+RECOVERABLE_ACTION_STATES = {
+    "arrived",
+    "waiting_action",
+    "wrong_slot",
+    "verifying_action",
+}
 
 BORROWABLE_STATUS_PRIORITY = {
     "full": 0,
@@ -325,6 +337,26 @@ def yaw_to_quaternion(yaw):
     return q
 
 
+def recovered_slot_baseline(task, current_slots):
+    """Return the saved pre-action slot snapshot, or reconstruct it safely."""
+    saved = task.get("_slot_baseline")
+    if isinstance(saved, list) and saved:
+        return [dict(slot) for slot in saved]
+
+    baseline = [dict(slot) for slot in current_slots]
+    slot_number = int(task["slot_number"])
+    target = next(
+        (slot for slot in baseline if int(slot.get("slot", 0)) == slot_number),
+        None,
+    )
+    if target is None:
+        raise ValueError(f"找不到 {slot_number} 號槽狀態")
+    target["enabled"] = True
+    target["sensor_ok"] = True
+    target["status"] = "full" if task["type"] == "borrow" else "empty"
+    return baseline
+
+
 def go_to_standby(navigator, current_pos, localization_is_ready=lambda: True):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
@@ -415,7 +447,10 @@ def main():
         }
 
     print("⏳ 等待 Nav2 系統上線...")
-    navigator.waitUntilNav2Active()
+    # The AMCL mode publishes BasicNavigator's default initial pose. Treat the
+    # external LocalizationManager as the localization owner so this call only
+    # waits for navigation activation and never writes to /initialpose.
+    navigator.waitUntilNav2Active(localizer="robot_localization")
     print("✅ Nav2 準備就緒！")
 
     print("⏳ 等待定位管理器確認位置...")
@@ -442,7 +477,9 @@ def main():
     recovered = journal.load()
     pending_result = recovered.get("pending_result")
     active_task = recovered.get("active_task")
+    recovered_state = recovered.get("state")
     last_result_publish_at = 0.0
+    terminal_task_ids = set()
 
     task_result_publisher = navigator.create_publisher(
         String, "/smart_carrier/task_result", STATE_QOS
@@ -511,6 +548,7 @@ def main():
         try:
             ack = json.loads(message.data)
             if pending_result and str(ack.get("event_id")) == pending_result["event_id"]:
+                terminal_task_ids.add(str(pending_result["task_id"]))
                 publish_task_state(
                     task_state_publisher,
                     pending_result["task_id"],
@@ -528,22 +566,19 @@ def main():
 
     if active_task and not pending_result:
         task_id = active_task.get("task_id") or active_task.get("id")
-        pending_result = {
-            "event_id": str(uuid.uuid4()),
-            "task_id": str(task_id),
-            "status": "failed",
-            "note": "Robot restarted during an active task; manual recovery required",
-            "created_at": datetime.now(UTC).isoformat(),
-        }
-        persist(active_task, "recovery_required", pending_result)
+        active_task = dict(active_task)
+        active_task["_resume_state"] = recovered_state or "task_accepted"
+        pending_orders.insert(0, active_task)
+        persist(active_task, recovered_state or "task_accepted", None)
         publish_task_state(
             task_state_publisher,
             task_id,
-            "recovery_required",
-            progress_message="機器人重啟後偵測到未完成任務，已停止移動並等待結果同步",
+            "queued_on_robot",
+            progress_message="Recovered after delivery process restart; waiting for safe resume",
         )
-        navigator.get_logger().error(
-            f"偵測到重啟前未完成任務 {task_id}；不自動續航，改回報復原失敗"
+        navigator.get_logger().warning(
+            f"已復原重啟前未完成任務 {task_id}（原狀態 {recovered_state}），"
+            "定位可信後將安全續行"
         )
 
     def power_status_callback(msg):
@@ -567,10 +602,14 @@ def main():
             raw = json.loads(msg.data)
             task_id = raw.get("id")
             order = order_payload_to_order(raw)
-            if pending_result:
-                navigator.get_logger().warning(f"結果尚待本機橋接確認，暫不接收任務 {task_id}")
+            task_id = str(task_id)
+            active_id = None
+            if active_task:
+                active_id = str(active_task.get("task_id") or active_task.get("id"))
+            result_id = str(pending_result["task_id"]) if pending_result else None
+            if task_id in terminal_task_ids or task_id in {active_id, result_id}:
                 return
-            if any(item.get("task_id") == str(task_id) for item in pending_orders):
+            if any(item.get("task_id") == task_id for item in pending_orders):
                 return
             pending_orders.append(order)
             publish_task_state(
@@ -591,7 +630,7 @@ def main():
                     str(exc),
                 )
 
-    navigator.create_subscription(String, "order", order_callback, STATE_QOS)
+    navigator.create_subscription(String, "order", order_callback, COMMAND_QOS)
 
     def task_cancel_callback(msg):
         nonlocal active_task_id
@@ -607,8 +646,155 @@ def main():
             navigator.get_logger().error(f"無效的取消任務訊息：{exc}")
 
     navigator.create_subscription(
-        String, "/smart_carrier/task_cancel", task_cancel_callback, STATE_QOS
+        String, "/smart_carrier/task_cancel", task_cancel_callback, COMMAND_QOS
     )
+
+    def wait_for_slot_action(target, fsm, baseline_slots, *, resumed=False):
+        slot_number = int(target["slot_number"])
+        try:
+            verifier = SlotActionVerifier(
+                target["type"],
+                slot_number,
+                baseline_slots,
+                confirm_samples=confirmation_samples,
+            )
+        except ValueError as exc:
+            queue_result(target, fsm, "failed", str(exc))
+            return
+
+        target["_slot_baseline"] = [dict(slot) for slot in baseline_slots]
+        action_deadline = datetime.fromtimestamp(
+            time.time() + timeout_seconds, UTC
+        ).isoformat()
+        progress_message = (
+            f"請在 {slot_number} 號槽"
+            f"{'取走' if target['type'] == 'borrow' else '放入'}行動電源"
+        )
+        if resumed:
+            progress_message += "（配送程式重啟後已恢復確認）"
+        progress(
+            target,
+            fsm,
+            "waiting_action",
+            progress_message=progress_message,
+            expected_slot=slot_number,
+            action_deadline=action_deadline,
+        )
+        set_motion_inhibited(True)
+        started = time.monotonic()
+        warned = False
+        last_sequence = latest_power_sequence
+        last_verification = None
+        last_verification_result = None
+        wrong_slot_signature = None
+        wrong_slot_event_id = None
+        confirmed = False
+        action_cancelled = False
+        try:
+            while rclpy.ok() and time.monotonic() - started < timeout_seconds:
+                rclpy.spin_once(navigator, timeout_sec=0.2)
+                if active_task_id in cancellation_requests:
+                    action_cancelled = True
+                    break
+                elapsed = time.monotonic() - started
+                if not warned and elapsed >= warning_seconds:
+                    warned = True
+                    warning_message = "尚未完成指定槽位操作；30 秒後任務將失敗"
+                    if last_verification_result is not None:
+                        warning_message = (
+                            f"{last_verification_result.message}；30 秒後任務將失敗"
+                        )
+                    publish_task_state(
+                        task_state_publisher,
+                        target.get("task_id"),
+                        fsm.state,
+                        event_id=(
+                            wrong_slot_event_id if fsm.state == "wrong_slot" else None
+                        ),
+                        progress_message=warning_message,
+                        expected_slot=slot_number,
+                        changed_slot=(
+                            last_verification_result.changed_slot
+                            if last_verification_result is not None
+                            else None
+                        ),
+                        changed_slots=(
+                            list(last_verification_result.changed_slots)
+                            if last_verification_result is not None
+                            else []
+                        ),
+                        action_deadline=action_deadline,
+                        warning=True,
+                    )
+                if latest_power_sequence == last_sequence:
+                    continue
+                last_sequence = latest_power_sequence
+                verification = verifier.update(latest_power_banks)
+                last_verification_result = verification
+                signature = (
+                    verification.state,
+                    verification.changed_slot,
+                    verification.changed_slots,
+                    verification.message,
+                )
+                if signature != last_verification:
+                    state = (
+                        verification.state
+                        if verification.state
+                        in {"wrong_slot", "waiting_action", "verifying_action"}
+                        else "waiting_action"
+                    )
+                    event_id = None
+                    if state == "wrong_slot":
+                        next_wrong_signature = verification.changed_slots
+                        if next_wrong_signature != wrong_slot_signature:
+                            wrong_slot_event_id = str(uuid.uuid4())
+                            wrong_slot_signature = next_wrong_signature
+                        event_id = wrong_slot_event_id
+                    else:
+                        wrong_slot_signature = None
+                        wrong_slot_event_id = None
+                    progress(
+                        target,
+                        fsm,
+                        state,
+                        event_id=event_id,
+                        progress_message=verification.message,
+                        expected_slot=slot_number,
+                        changed_slot=verification.changed_slot,
+                        changed_slots=list(verification.changed_slots),
+                        action_deadline=action_deadline,
+                        warning=warned,
+                    )
+                    last_verification = signature
+                if verification.confirmed:
+                    confirmed = True
+                    break
+        finally:
+            set_motion_inhibited(False)
+
+        if action_cancelled:
+            queue_result(
+                target,
+                fsm,
+                "cancelled",
+                cancellation_requests.pop(active_task_id),
+            )
+        elif confirmed:
+            queue_result(
+                target,
+                fsm,
+                "done",
+                f"Service point reached and slot {slot_number} action confirmed",
+            )
+        else:
+            queue_result(
+                target,
+                fsm,
+                "failed",
+                f"等待 {slot_number} 號槽操作逾時（{timeout_seconds:.0f} 秒），"
+                "任務已安全停止",
+            )
 
     print("⏳ 等待 INA3221 電流資料...")
     deadline = time.monotonic() + POWER_STATUS_TIMEOUT_SECONDS
@@ -626,29 +812,10 @@ def main():
     while rclpy.ok():
         rclpy.spin_once(navigator, timeout_sec=0.5)
 
-        if not localization_ready:
-            now = time.monotonic()
-            if now - last_localization_warning_at >= 10.0:
-                navigator.get_logger().warning(
-                    f"定位暫停（{localization_state}），保留訂單並等待恢復"
-                )
-                last_localization_warning_at = now
-            continue
-
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
-            if not is_standby:
-                current_pos = refresh_current_position(current_pos)
-                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
-                if standby_pos is not None:
-                    current_pos = standby_pos
-                    is_standby = True
-            continue
-
-        if not pending_orders:
-            if not is_standby:
-                print("\n🏁 無待處理任務，返回待機點")
+            if localization_ready and not is_standby:
                 current_pos = refresh_current_position(current_pos)
                 standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
@@ -673,11 +840,53 @@ def main():
             )
             continue
 
+        if not localization_ready:
+            now = time.monotonic()
+            if now - last_localization_warning_at >= 10.0:
+                navigator.get_logger().warning(
+                    f"定位暫停（{localization_state}），保留訂單並等待恢復"
+                )
+                last_localization_warning_at = now
+            continue
+
+        if not pending_orders:
+            if not is_standby:
+                print("\n🏁 無待處理任務，返回待機點")
+                current_pos = refresh_current_position(current_pos)
+                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
+                if standby_pos is not None:
+                    current_pos = standby_pos
+                    is_standby = True
+            continue
+
         now = time.monotonic()
         if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
             if now - last_stale_warning_at >= 10.0:
                 navigator.get_logger().error("power_status 已逾時，暫停新任務")
                 last_stale_warning_at = now
+            continue
+
+        resume_state = pending_orders[0].get("_resume_state")
+        if (
+            resume_state in RECOVERABLE_ACTION_STATES
+            and pending_orders[0].get("slot_number") is not None
+        ):
+            target = pending_orders[0]
+            active_task = target
+            active_task_id = target.get("task_id")
+            fsm = DeliveryStateMachine(resume_state)
+            is_standby = False
+            try:
+                baseline_slots = recovered_slot_baseline(target, latest_power_banks)
+            except (KeyError, TypeError, ValueError) as exc:
+                queue_result(target, fsm, "failed", f"無法恢復槽位確認：{exc}")
+            else:
+                navigator.get_logger().warning(
+                    f"恢復任務 {active_task_id} 的 {resume_state} 槽位確認階段"
+                )
+                wait_for_slot_action(target, fsm, baseline_slots, resumed=True)
+            pending_orders.remove(target)
+            active_task_id = None
             continue
 
         current_pos = refresh_current_position(current_pos)
@@ -768,143 +977,7 @@ def main():
             if target["type"] not in {"borrow", "return"}:
                 queue_result(target, fsm, "done", "Nav2 goal reached")
             else:
-                slot_number = int(target["slot_number"])
-                try:
-                    verifier = SlotActionVerifier(
-                        target["type"],
-                        slot_number,
-                        latest_power_banks,
-                        confirm_samples=confirmation_samples,
-                    )
-                except ValueError as exc:
-                    queue_result(target, fsm, "failed", str(exc))
-                else:
-                    action_deadline = datetime.fromtimestamp(
-                        time.time() + timeout_seconds, UTC
-                    ).isoformat()
-                    progress(
-                        target,
-                        fsm,
-                        "waiting_action",
-                        progress_message=(
-                            f"請在 {slot_number} 號槽"
-                            f"{'取走' if target['type'] == 'borrow' else '放入'}行動電源"
-                        ),
-                        expected_slot=slot_number,
-                        action_deadline=action_deadline,
-                    )
-                    set_motion_inhibited(True)
-                    started = time.monotonic()
-                    warned = False
-                    last_sequence = latest_power_sequence
-                    last_verification = None
-                    last_verification_result = None
-                    wrong_slot_signature = None
-                    wrong_slot_event_id = None
-                    confirmed = False
-                    action_cancelled = False
-                    while rclpy.ok() and time.monotonic() - started < timeout_seconds:
-                        rclpy.spin_once(navigator, timeout_sec=0.2)
-                        if active_task_id in cancellation_requests:
-                            action_cancelled = True
-                            break
-                        elapsed = time.monotonic() - started
-                        if not warned and elapsed >= warning_seconds:
-                            warned = True
-                            warning_message = "尚未完成指定槽位操作；30 秒後任務將失敗"
-                            if last_verification_result is not None:
-                                warning_message = (
-                                    f"{last_verification_result.message}；30 秒後任務將失敗"
-                                )
-                            publish_task_state(
-                                task_state_publisher,
-                                target.get("task_id"),
-                                fsm.state,
-                                event_id=(
-                                    wrong_slot_event_id if fsm.state == "wrong_slot" else None
-                                ),
-                                progress_message=warning_message,
-                                expected_slot=slot_number,
-                                changed_slot=(
-                                    last_verification_result.changed_slot
-                                    if last_verification_result is not None
-                                    else None
-                                ),
-                                changed_slots=(
-                                    list(last_verification_result.changed_slots)
-                                    if last_verification_result is not None
-                                    else []
-                                ),
-                                action_deadline=action_deadline,
-                                warning=True,
-                            )
-                        if latest_power_sequence == last_sequence:
-                            continue
-                        last_sequence = latest_power_sequence
-                        verification = verifier.update(latest_power_banks)
-                        last_verification_result = verification
-                        signature = (
-                            verification.state,
-                            verification.changed_slot,
-                            verification.changed_slots,
-                            verification.message,
-                        )
-                        if signature != last_verification:
-                            state = (
-                                verification.state
-                                if verification.state
-                                in {"wrong_slot", "waiting_action", "verifying_action"}
-                                else "waiting_action"
-                            )
-                            event_id = None
-                            if state == "wrong_slot":
-                                next_wrong_signature = verification.changed_slots
-                                if next_wrong_signature != wrong_slot_signature:
-                                    wrong_slot_event_id = str(uuid.uuid4())
-                                    wrong_slot_signature = next_wrong_signature
-                                event_id = wrong_slot_event_id
-                            else:
-                                wrong_slot_signature = None
-                                wrong_slot_event_id = None
-                            progress(
-                                target,
-                                fsm,
-                                state,
-                                event_id=event_id,
-                                progress_message=verification.message,
-                                expected_slot=slot_number,
-                                changed_slot=verification.changed_slot,
-                                changed_slots=list(verification.changed_slots),
-                                action_deadline=action_deadline,
-                                warning=warned,
-                            )
-                            last_verification = signature
-                        if verification.confirmed:
-                            confirmed = True
-                            break
-                    set_motion_inhibited(False)
-                    if action_cancelled:
-                        queue_result(
-                            target,
-                            fsm,
-                            "cancelled",
-                            cancellation_requests.pop(active_task_id),
-                        )
-                    elif confirmed:
-                        queue_result(
-                            target,
-                            fsm,
-                            "done",
-                            f"Nav2 goal reached and slot {slot_number} action confirmed",
-                        )
-                    else:
-                        queue_result(
-                            target,
-                            fsm,
-                            "failed",
-                            f"等待 {slot_number} 號槽操作逾時（{timeout_seconds:.0f} 秒），"
-                            "任務已安全停止",
-                        )
+                wait_for_slot_action(target, fsm, latest_power_banks)
 
         if not keep_pending:
             target_key = target.get("task_id") or (target["name"], target["type"])
