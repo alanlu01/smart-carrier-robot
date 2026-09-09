@@ -2,6 +2,8 @@ from smart_delivery_core.delivery_state import (
     DeliveryJournal,
     DeliveryStateMachine,
     SlotActionVerifier,
+    interrupted_localization_order,
+    localization_ready_for_resume,
 )
 
 
@@ -32,6 +34,21 @@ def test_navigation_can_pause_for_localization_recovery():
     machine = DeliveryStateMachine("navigating")
     assert machine.transition("waiting_localization") == "waiting_localization"
     assert machine.transition("navigating") == "navigating"
+
+
+def test_localization_resume_requires_continuous_ready_grace():
+    assert not localization_ready_for_resume(True, 10.0, 12.9, 3.0)
+    assert localization_ready_for_resume(True, 10.0, 13.0, 3.0)
+    assert not localization_ready_for_resume(False, 10.0, 20.0, 3.0)
+    assert not localization_ready_for_resume(True, None, 20.0, 3.0)
+
+
+def test_interrupted_order_is_resumed_before_route_reordering():
+    queued = [
+        {"task_id": "new"},
+        {"task_id": "interrupted", "_resume_state": "waiting_localization"},
+    ]
+    assert interrupted_localization_order(queued)["task_id"] == "interrupted"
 
 
 def test_borrow_requires_expected_slot_and_restored_wrong_slot():

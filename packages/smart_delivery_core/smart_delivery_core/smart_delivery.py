@@ -19,6 +19,8 @@ from smart_delivery_core.delivery_state import (
     DeliveryJournal,
     DeliveryStateMachine,
     SlotActionVerifier,
+    interrupted_localization_order,
+    localization_ready_for_resume,
 )
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 
@@ -27,6 +29,7 @@ POWER_STATUS_TIMEOUT_SECONDS = 10.0
 SLOT_CONFIRMATION_WARNING_SECONDS = 30.0
 SLOT_CONFIRMATION_TIMEOUT_SECONDS = 60.0
 SLOT_CONFIRMATION_SAMPLES = 6
+LOCALIZATION_RESUME_DELAY_SECONDS = 3.0
 OCCUPIED_SLOT_STATUSES = {"low", "ready", "full"}
 STATE_QOS = QoSProfile(
     depth=10,
@@ -396,21 +399,32 @@ def main():
     navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
     navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
     navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
+    navigator.declare_parameter(
+        "localization_resume_delay_sec", LOCALIZATION_RESUME_DELAY_SECONDS
+    )
     warning_seconds = float(navigator.get_parameter("slot_confirmation_warning_sec").value)
     timeout_seconds = float(navigator.get_parameter("slot_confirmation_timeout_sec").value)
     confirmation_samples = int(navigator.get_parameter("slot_confirmation_samples").value)
+    localization_resume_delay = float(
+        navigator.get_parameter("localization_resume_delay_sec").value
+    )
     if not 0 < warning_seconds < timeout_seconds or confirmation_samples < 1:
         raise ValueError("槽位確認須符合 0 < warning < timeout，且樣本數大於 0")
 
     localization_ready = False
+    localization_ready_since = None
     localization_state = "UNINITIALIZED"
     last_localization_warning_at = 0.0
     is_standby = False
 
     def localization_ready_callback(message):
-        nonlocal localization_ready, is_standby
+        nonlocal localization_ready, localization_ready_since, is_standby
         was_ready = localization_ready
         localization_ready = bool(message.data)
+        if localization_ready and not was_ready:
+            localization_ready_since = time.monotonic()
+        elif not localization_ready:
+            localization_ready_since = None
         if was_ready and not localization_ready:
             # A remembered arrival is no longer trustworthy after AMCL loses
             # localization or an external move is detected.
@@ -418,6 +432,14 @@ def main():
             navigator.get_logger().warning(
                 "定位可信度下降，已取消既有待機位置記錄"
             )
+
+    def localization_can_resume():
+        return localization_ready_for_resume(
+            localization_ready,
+            localization_ready_since,
+            time.monotonic(),
+            localization_resume_delay,
+        )
 
     def localization_state_callback(message):
         nonlocal localization_state
@@ -808,7 +830,7 @@ def main():
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
-            if localization_ready and not is_standby:
+            if localization_can_resume() and not is_standby:
                 current_pos = refresh_current_position(current_pos)
                 standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
@@ -833,11 +855,14 @@ def main():
             )
             continue
 
-        if not localization_ready:
+        if not localization_can_resume():
             now = time.monotonic()
             if now - last_localization_warning_at >= 10.0:
+                wait_reason = localization_state
+                if localization_ready:
+                    wait_reason = "STABILIZING_BEFORE_RESUME"
                 navigator.get_logger().warning(
-                    f"定位暫停（{localization_state}），保留訂單並等待恢復"
+                    f"定位暫停（{wait_reason}），保留訂單並等待恢復"
                 )
                 last_localization_warning_at = now
             continue
@@ -883,23 +908,37 @@ def main():
             continue
 
         current_pos = refresh_current_position(current_pos)
-        optimized_route, _, _ = schedule_orders(
-            pending_orders, current_pos, latest_power_banks, slot_capacity=3
-        )
-        if not optimized_route:
-            target = pending_orders.pop(0)
-            active_task = target
-            fsm = DeliveryStateMachine("task_accepted")
-            persist(active_task, fsm.state, None)
-            progress(target, fsm, "precheck", progress_message="Checking slot availability")
-            queue_result(target, fsm, "released", infeasible_order_note(target))
-            continue
+        target = interrupted_localization_order(pending_orders)
+        resumed_after_localization = target is not None
+        if target is None:
+            optimized_route, _, _ = schedule_orders(
+                pending_orders, current_pos, latest_power_banks, slot_capacity=3
+            )
+            if not optimized_route:
+                target = pending_orders.pop(0)
+                active_task = target
+                fsm = DeliveryStateMachine("task_accepted")
+                persist(active_task, fsm.state, None)
+                progress(
+                    target,
+                    fsm,
+                    "precheck",
+                    progress_message="Checking slot availability",
+                )
+                queue_result(target, fsm, "released", infeasible_order_note(target))
+                continue
+            target = optimized_route[0]
 
-        target = optimized_route[0]
         active_task = target
-        fsm = DeliveryStateMachine("task_accepted")
+        initial_state = "waiting_localization" if resumed_after_localization else "task_accepted"
+        fsm = DeliveryStateMachine(initial_state)
+        target.pop("_resume_state", None)
         persist(active_task, fsm.state, None)
         is_standby = False
+        if resumed_after_localization:
+            navigator.get_logger().warning(
+                f"定位已穩定，恢復原任務 {target.get('task_id')} 的導航目標"
+            )
         progress(target, fsm, "precheck", progress_message="Task precheck passed")
         progress(
             target,
@@ -938,6 +977,7 @@ def main():
         keep_pending = False
         if localization_aborted:
             fsm.transition("waiting_localization")
+            target["_resume_state"] = "waiting_localization"
             persist(target, fsm.state, pending_result)
             publish_task_state(
                 task_state_publisher,

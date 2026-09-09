@@ -1,6 +1,7 @@
 import json
 import math
 import time
+from collections import deque
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -32,6 +33,9 @@ from smart_delivery_core.localization_health import (
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    select_scan_samples,
+    smoothed_map_score,
+    suspect_requires_recovery,
     update_stability_samples,
 )
 
@@ -76,6 +80,10 @@ class LocalizationManager(Node):
         self.seed_xy_tolerance = float(self.get_parameter("seed_xy_tolerance").value)
         self.seed_yaw_tolerance = float(self.get_parameter("seed_yaw_tolerance").value)
         self.suspect_hold = float(self.get_parameter("suspect_hold_sec").value)
+        self.suspect_max = max(
+            self.suspect_hold,
+            float(self.get_parameter("suspect_max_sec").value),
+        )
         self.cancel_grace = float(self.get_parameter("cancel_grace_sec").value)
         self.local_wait = float(self.get_parameter("local_recovery_wait_sec").value)
         self.global_wait = float(self.get_parameter("global_recovery_wait_sec").value)
@@ -109,6 +117,35 @@ class LocalizationManager(Node):
         self.map_match_neighborhood = int(
             self.get_parameter("map_match_neighborhood_cells").value
         )
+        self.map_match_window_size = max(
+            1, int(self.get_parameter("map_match_window_size").value)
+        )
+        self.map_match_window_min_samples = min(
+            self.map_match_window_size,
+            max(1, int(self.get_parameter("map_match_window_min_samples").value)),
+        )
+        self.map_match_ignore_below_range = float(
+            self.get_parameter("map_match_ignore_below_range").value
+        )
+        self.map_match_min_sectors = max(
+            1, int(self.get_parameter("map_match_min_sectors").value)
+        )
+        self.map_match_sector_total = max(
+            self.map_match_min_sectors,
+            int(self.get_parameter("map_match_sector_total").value),
+        )
+        self.map_match_stale_grace = float(
+            self.get_parameter("map_match_stale_grace_sec").value
+        )
+        self.verification_pose_distance = float(
+            self.get_parameter("verification_pose_distance").value
+        )
+        self.verification_pose_angle = float(
+            self.get_parameter("verification_pose_angle").value
+        )
+        self.diagnostic_log_period = float(
+            self.get_parameter("diagnostic_log_period_sec").value
+        )
 
         self.state = "UNINITIALIZED"
         self.state_since = time.monotonic()
@@ -122,6 +159,7 @@ class LocalizationManager(Node):
         self.last_stable_map_score_at = 0.0
         self.verify_reference_required = True
         self.suspect_since = None
+        self.map_match_unknown_since = None
         self.recovery_step = None
         self.recovery_step_started = 0.0
         self.recovery_reason = ""
@@ -140,7 +178,16 @@ class LocalizationManager(Node):
         self.map_message = None
         self.latest_scan = None
         self.latest_map_score = None
+        self.latest_map_score_raw = None
         self.latest_map_score_at = 0.0
+        self.map_score_window = deque(maxlen=self.map_match_window_size)
+        self.latest_map_near_fraction = 0.0
+        self.latest_map_sector_count = 0
+        self.latest_scan_stamp_age = None
+        self.map_match_tf_failures = 0
+        self.last_map_match_error = ""
+        self.last_diagnostic_log_at = 0.0
+        self.verification_pose_anchor = None
         self.last_map_match_check_at = 0.0
         self.last_nomotion_request_at = 0.0
 
@@ -210,7 +257,7 @@ class LocalizationManager(Node):
             "amcl_pose_timeout_sec": 8.0,
             "amcl_nomotion_refresh_sec": 1.0,
             "verify_timeout_sec": 15.0,
-            "stable_samples": 5,
+            "stable_samples": 6,
             "healthy_xy_std": 0.20,
             "healthy_yaw_std": 0.17,
             "critical_xy_std": 0.50,
@@ -218,8 +265,9 @@ class LocalizationManager(Node):
             "seed_xy_tolerance": 0.60,
             "seed_yaw_tolerance": 0.52,
             "suspect_hold_sec": 5.0,
+            "suspect_max_sec": 12.0,
             "cancel_grace_sec": 2.0,
-            "local_recovery_wait_sec": 6.0,
+            "local_recovery_wait_sec": 9.0,
             "global_recovery_wait_sec": 12.0,
             "small_spin_angle": math.radians(20.0),
             "full_spin_angle": 2.0 * math.pi,
@@ -237,6 +285,15 @@ class LocalizationManager(Node):
             "map_match_max_beams": 60,
             "map_match_min_beams": 10,
             "map_match_neighborhood_cells": 2,
+            "map_match_window_size": 5,
+            "map_match_window_min_samples": 3,
+            "map_match_ignore_below_range": 0.60,
+            "map_match_min_sectors": 4,
+            "map_match_sector_total": 12,
+            "map_match_stale_grace_sec": 5.0,
+            "verification_pose_distance": 0.20,
+            "verification_pose_angle": math.radians(10.0),
+            "diagnostic_log_period_sec": 5.0,
         }
         for name, default in defaults.items():
             self.declare_parameter(name, default)
@@ -261,15 +318,26 @@ class LocalizationManager(Node):
         self._publish_state()
 
     def _publish_state(self):
+        now = time.monotonic()
         message = String()
         payload = {
             "state": self.state,
             "ready": self.ready,
             "reason": self.state_reason,
             "scan_age_sec": (
-                None if not self.latest_scan_at else time.monotonic() - self.latest_scan_at
+                None if not self.latest_scan_at else now - self.latest_scan_at
             ),
+            "scan_stamp_age_sec": self.latest_scan_stamp_age,
+            "map_match_age_sec": (
+                None if not self.latest_map_score_at else now - self.latest_map_score_at
+            ),
+            "map_match_samples": len(self.map_score_window),
+            "map_match_near_fraction": round(self.latest_map_near_fraction, 4),
+            "map_match_sector_count": self.latest_map_sector_count,
+            "map_match_tf_failures": self.map_match_tf_failures,
         }
+        if self.suspect_since is not None:
+            payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
         if self.latest_quality is not None:
             payload.update(
                 {
@@ -279,15 +347,73 @@ class LocalizationManager(Node):
             )
         if self.latest_map_score is not None:
             payload["map_match_score"] = round(self.latest_map_score, 4)
+        if self.latest_map_score_raw is not None:
+            payload["map_match_raw_score"] = round(self.latest_map_score_raw, 4)
+        if self.last_map_match_error:
+            payload["map_match_error"] = self.last_map_match_error
         message.data = json.dumps(payload, ensure_ascii=False)
         self.state_publisher.publish(message)
 
     def _scan_callback(self, message):
         self.latest_scan_at = time.monotonic()
         self.latest_scan = message
+        stamp_ns = int(message.header.stamp.sec) * 1_000_000_000 + int(
+            message.header.stamp.nanosec
+        )
+        if stamp_ns > 0:
+            self.latest_scan_stamp_age = (
+                self.get_clock().now().nanoseconds - stamp_ns
+            ) / 1_000_000_000.0
+        else:
+            self.latest_scan_stamp_age = None
 
     def _map_callback(self, message):
         self.map_message = message
+
+    def _sensor_tf_is_ready(self):
+        if self.latest_scan is None:
+            return False
+        try:
+            self.tf_buffer.lookup_transform(
+                "base_footprint",
+                self.latest_scan.header.frame_id,
+                Time(),
+                timeout=RclpyDuration(seconds=0.05),
+            )
+            self.tf_buffer.lookup_transform(
+                "odom",
+                "base_footprint",
+                Time(),
+                timeout=RclpyDuration(seconds=0.05),
+            )
+        except TransformException as exc:
+            self.last_map_match_error = f"感測器 TF 尚未就緒：{exc}"
+            return False
+        return True
+
+    def _reset_map_match_history(self):
+        self.map_score_window.clear()
+        self.latest_map_score = None
+        self.latest_map_score_raw = None
+        self.latest_map_score_at = 0.0
+        self.latest_map_sector_count = 0
+        self.verification_pose_anchor = self.latest_pose
+        self.last_stable_map_score_at = 0.0
+
+    def _verification_pose_is_consistent(self):
+        if self.latest_pose is None:
+            return False
+        if self.verification_pose_anchor is None:
+            self.verification_pose_anchor = self.latest_pose
+            return False
+        distance, angle = pose_jump(self.verification_pose_anchor, self.latest_pose)
+        if (
+            distance > self.verification_pose_distance
+            or angle > self.verification_pose_angle
+        ):
+            self.verification_pose_anchor = self.latest_pose
+            return False
+        return True
 
     def _cmd_vel_callback(self, message):
         self.commanded_motion = (
@@ -379,6 +505,7 @@ class LocalizationManager(Node):
                 quality.healthy
                 and reference_ok
                 and map_match_ok
+                and self._verification_pose_is_consistent()
                 and self._scan_is_fresh(now)
                 and recovery_motion_complete
             )
@@ -399,7 +526,7 @@ class LocalizationManager(Node):
             return
         if self.state == "MANUAL_REQUIRED":
             self.stable_samples = 0
-            self.last_stable_map_score_at = self.latest_map_score_at
+            self._reset_map_match_history()
             self.verify_reference_required = False
             self._set_state("VERIFYING", "收到人工初始位置，正在驗證")
 
@@ -425,8 +552,14 @@ class LocalizationManager(Node):
             if not self.auto_initialize:
                 self._require_manual("自動初始位置已停用")
                 return
+            if self.map_message is None:
+                self._set_state("WAITING_FOR_SENSORS", "等待靜態地圖")
+                return
             if self.initial_pose_publisher.get_subscription_count() < 1:
                 self._set_state("WAITING_FOR_SENSORS", "等待 AMCL /initialpose 訂閱者")
+                return
+            if not self._sensor_tf_is_ready():
+                self._set_state("WAITING_FOR_SENSORS", "等待雷達與里程計 TF")
                 return
             self._publish_initial_pose()
             return
@@ -459,12 +592,22 @@ class LocalizationManager(Node):
                 self._begin_recovery("AMCL 位姿資料逾時")
                 return
             match_status = self._map_match_status(now)
-            map_match_bad = match_status in {"critical", "degraded"}
+            if match_status == "unknown":
+                if self.map_match_unknown_since is None:
+                    self.map_match_unknown_since = now
+            else:
+                self.map_match_unknown_since = None
+            map_match_stale = (
+                self.map_match_unknown_since is not None
+                and now - self.map_match_unknown_since >= self.map_match_stale_grace
+            )
+            map_match_bad = match_status in {"critical", "degraded"} or map_match_stale
             if self.latest_quality.critical or map_match_bad:
                 if self.suspect_since is None:
                     self.suspect_since = now
                     self.stable_samples = 0
                     self.last_stable_map_score_at = self.latest_map_score_at
+                    self.verification_pose_anchor = self.latest_pose
                     if match_status == "critical":
                         reason = f"雷達地圖吻合度過低 ({self.latest_map_score:.2f})"
                     elif match_status == "degraded":
@@ -472,6 +615,8 @@ class LocalizationManager(Node):
                             f"雷達地圖吻合度未達可信門檻 "
                             f"({self.latest_map_score:.2f} < {self.map_match_min_score:.2f})"
                         )
+                    elif map_match_stale:
+                        reason = "雷達地圖吻合度資料持續無法更新"
                     else:
                         reason = "AMCL 不確定度持續偏高"
                     self._set_state("SUSPECT", reason)
@@ -485,6 +630,7 @@ class LocalizationManager(Node):
                 self.latest_quality is not None
                 and self.latest_quality.healthy
                 and self._map_match_has_recovered(now)
+                and self._verification_pose_is_consistent()
                 and now - self.last_amcl_at <= self.amcl_pose_timeout
                 and self._scan_is_fresh(now)
             )
@@ -498,15 +644,41 @@ class LocalizationManager(Node):
             )
             if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
-            elif (
-                not qualified
-                and self.suspect_since is not None
-                and now - self.suspect_since >= self.suspect_hold
-            ):
-                if match_status in {"critical", "degraded", "unknown"}:
-                    self._begin_recovery("雷達地圖吻合度持續低於可信門檻")
-                elif self.latest_quality is not None and self.latest_quality.critical:
-                    self._begin_recovery("AMCL 不確定度超過保守門檻")
+            elif self.suspect_since is not None:
+                suspect_age = now - self.suspect_since
+                quality_critical = (
+                    self.latest_quality is not None and self.latest_quality.critical
+                )
+                if suspect_requires_recovery(
+                    qualified,
+                    match_status,
+                    quality_critical,
+                    suspect_age,
+                    self.suspect_hold,
+                    self.suspect_max,
+                ):
+                    reason = "定位可信度持續不足"
+                    if suspect_age >= self.suspect_max:
+                        reason = "定位疑慮超過最大等待時間"
+                    elif quality_critical:
+                        reason = "AMCL 不確定度超過保守門檻"
+                    elif match_status in {"critical", "degraded", "unknown"}:
+                        reason = "雷達地圖吻合度持續低於可信門檻"
+                    self._begin_recovery(reason)
+                elif now - self.last_diagnostic_log_at >= self.diagnostic_log_period:
+                    score_text = (
+                        "unknown"
+                        if self.latest_map_score is None
+                        else f"{self.latest_map_score:.2f}"
+                    )
+                    self.get_logger().warning(
+                        "定位仍在 SUSPECT："
+                        f"age={suspect_age:.1f}s, score={score_text}, "
+                        f"samples={len(self.map_score_window)}, "
+                        f"near={self.latest_map_near_fraction:.0%}, "
+                        f"sectors={self.latest_map_sector_count}"
+                    )
+                    self.last_diagnostic_log_at = now
             return
 
         if self.state == "RECOVERING_LOCAL":
@@ -525,28 +697,43 @@ class LocalizationManager(Node):
                 Time.from_msg(scan.header.stamp),
                 timeout=RclpyDuration(seconds=0.05),
             )
-        except TransformException:
+        except TransformException as exc:
+            self.map_match_tf_failures += 1
+            self.last_map_match_error = f"雷達地圖 TF 失敗：{exc}"
+            if now - self.last_diagnostic_log_at >= self.diagnostic_log_period:
+                self.get_logger().warning(self.last_map_match_error)
+                self.last_diagnostic_log_at = now
             return
 
-        valid = []
-        for index, distance in enumerate(scan.ranges):
-            distance = float(distance)
-            if not math.isfinite(distance):
-                continue
-            if distance < float(scan.range_min) or distance >= float(scan.range_max) * 0.995:
-                continue
-            valid.append((index, distance))
-        if len(valid) < self.map_match_min_beams:
+        selection = select_scan_samples(
+            scan.ranges,
+            scan.range_min,
+            scan.range_max,
+            self.map_match_ignore_below_range,
+            self.map_match_max_beams,
+            self.map_match_sector_total,
+        )
+        self.latest_map_near_fraction = selection.near_fraction
+        self.latest_map_sector_count = selection.sector_count
+        if len(selection.samples) < self.map_match_min_beams:
+            self.last_map_match_error = (
+                f"可用雷達端點不足 ({len(selection.samples)} < "
+                f"{self.map_match_min_beams})"
+            )
             return
-        stride = max(1, math.ceil(len(valid) / self.map_match_max_beams))
-        sampled = valid[::stride][: self.map_match_max_beams]
+        if selection.sector_count < self.map_match_min_sectors:
+            self.last_map_match_error = (
+                f"雷達有效視野不足 ({selection.sector_count} < "
+                f"{self.map_match_min_sectors} sectors)"
+            )
+            return
 
         laser_yaw = quaternion_to_yaw(transform.transform.rotation)
         cosine = math.cos(laser_yaw)
         sine = math.sin(laser_yaw)
         translation = transform.transform.translation
         endpoints = []
-        for index, distance in sampled:
+        for index, distance in selection.samples:
             angle = float(scan.angle_min) + index * float(scan.angle_increment)
             laser_x = distance * math.cos(angle)
             laser_y = distance * math.sin(angle)
@@ -572,8 +759,14 @@ class LocalizationManager(Node):
             minimum_endpoints=self.map_match_min_beams,
         )
         if score is not None and len(endpoints) >= self.map_match_min_beams:
-            self.latest_map_score = score
+            self.latest_map_score_raw = score
+            self.map_score_window.append(score)
+            self.latest_map_score = smoothed_map_score(
+                self.map_score_window,
+                self.map_match_window_min_samples,
+            )
             self.latest_map_score_at = now
+            self.last_map_match_error = ""
 
     def _map_match_status(self, now):
         return map_match_status(
@@ -588,6 +781,7 @@ class LocalizationManager(Node):
         return (
             self.latest_map_score is not None
             and self.latest_map_score >= self.map_match_recovery_score
+            and len(self.map_score_window) >= self.map_match_window_min_samples
             and now - self.latest_map_score_at <= 2.0 * self.map_match_period
         )
 
@@ -606,7 +800,10 @@ class LocalizationManager(Node):
         message.pose.covariance[35] = yaw_std**2
         self.manual_initial_pose_pending = True
         self.stable_samples = 0
-        self.last_stable_map_score_at = self.latest_map_score_at
+        if not retry:
+            self._reset_map_match_history()
+        else:
+            self.last_stable_map_score_at = self.latest_map_score_at
         self.verify_reference_required = True
         if not retry:
             self._set_state("SEEDING", "發布固定開機位置 (0,0,0)")
@@ -621,6 +818,7 @@ class LocalizationManager(Node):
         if self.spin_in_progress or self.spin_sequence or self.spin_restoring_heading:
             return
         self.suspect_since = None
+        self.map_match_unknown_since = None
         self.recovery_step = None
         self.spin_sequence = []
         self.spin_in_progress = False
@@ -649,7 +847,7 @@ class LocalizationManager(Node):
             return
         self._cancel_navigation()
         self.stable_samples = 0
-        self.last_stable_map_score_at = self.latest_map_score_at
+        self._reset_map_match_history()
         self.stationary_odom_anchor = None
         self.stationary_amcl_anchor = None
         self.verify_reference_required = False
@@ -744,7 +942,7 @@ class LocalizationManager(Node):
             return
         self.global_localization_client.call_async(Empty.Request())
         self.stable_samples = 0
-        self.last_stable_map_score_at = self.latest_map_score_at
+        self._reset_map_match_history()
         self.recovery_step = "global_settle"
         self.recovery_step_started = time.monotonic()
         self._set_state("RECOVERING_GLOBAL", "全域粒子重新定位")

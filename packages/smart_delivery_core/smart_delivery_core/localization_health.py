@@ -1,4 +1,5 @@
 import math
+import statistics
 from dataclasses import dataclass
 
 
@@ -26,6 +27,16 @@ class PoseQuality:
     yaw_std: float
     healthy: bool
     critical: bool
+
+
+@dataclass(frozen=True)
+class ScanSampleSelection:
+    """Laser samples retained for localization-only map matching."""
+
+    samples: tuple[tuple[int, float], ...]
+    near_fraction: float
+    sector_count: int
+    valid_count: int
 
 
 def pose_quality(
@@ -94,6 +105,79 @@ def update_stability_samples(qualified, sample_at, last_sample_at, sample_count)
     if sample_at <= last_sample_at:
         return int(sample_count), last_sample_at
     return int(sample_count) + 1, sample_at
+
+
+def smoothed_map_score(scores, minimum_samples=1):
+    """Return a median score only after enough finite observations exist."""
+    finite_scores = [float(score) for score in scores if math.isfinite(float(score))]
+    if len(finite_scores) < int(minimum_samples):
+        return None
+    return float(statistics.median(finite_scores))
+
+
+def suspect_requires_recovery(
+    qualified,
+    match_status,
+    quality_critical,
+    elapsed,
+    hold_seconds,
+    maximum_seconds,
+):
+    """Ensure SUSPECT cannot remain forever inside the hysteresis band."""
+    if qualified or float(elapsed) < float(hold_seconds):
+        return False
+    if float(elapsed) >= float(maximum_seconds):
+        return True
+    return match_status in {"critical", "degraded", "unknown"} or bool(
+        quality_critical
+    )
+
+
+def select_scan_samples(
+    ranges,
+    range_min,
+    range_max,
+    ignore_below_range,
+    maximum_samples,
+    sector_total=12,
+):
+    """Select broad, non-near-field scan samples for localization scoring.
+
+    Close returns are still available to Nav2 and collision monitoring. They are
+    excluded only from the static-map score because nearby people commonly
+    occlude the mapped wall behind them.
+    """
+    range_min = float(range_min)
+    range_max = float(range_max)
+    ignore_below_range = max(range_min, float(ignore_below_range))
+    maximum_samples = max(1, int(maximum_samples))
+    sector_total = max(1, int(sector_total))
+    total_ranges = len(ranges)
+    valid = []
+    nearby_count = 0
+    for index, raw_distance in enumerate(ranges):
+        distance = float(raw_distance)
+        if not math.isfinite(distance):
+            continue
+        if distance < range_min or distance >= range_max * 0.995:
+            continue
+        if distance < ignore_below_range:
+            nearby_count += 1
+            continue
+        valid.append((index, distance))
+
+    valid_count = len(valid) + nearby_count
+    near_fraction = nearby_count / valid_count if valid_count else 0.0
+    if not valid:
+        return ScanSampleSelection((), near_fraction, 0, valid_count)
+
+    stride = max(1, math.ceil(len(valid) / maximum_samples))
+    sampled = tuple(valid[::stride][:maximum_samples])
+    sectors = {
+        min(sector_total - 1, index * sector_total // max(1, total_ranges))
+        for index, _distance in sampled
+    }
+    return ScanSampleSelection(sampled, near_fraction, len(sectors), valid_count)
 
 
 def occupancy_match_score(

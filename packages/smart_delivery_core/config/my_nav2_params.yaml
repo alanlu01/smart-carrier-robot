@@ -58,7 +58,7 @@ localization_manager:
     amcl_pose_timeout_sec: 8.0
     amcl_nomotion_refresh_sec: 1.0
     verify_timeout_sec: 25.0
-    stable_samples: 5
+    stable_samples: 6
     healthy_xy_std: 0.25
     healthy_yaw_std: 0.17
     critical_xy_std: 0.50
@@ -66,11 +66,13 @@ localization_manager:
     seed_xy_tolerance: 0.60
     seed_yaw_tolerance: 0.52
     suspect_hold_sec: 5.0
+    # Never remain in the 0.30-0.35 hysteresis band indefinitely.
+    suspect_max_sec: 12.0
 
     # Stop navigation first, then try no-motion update, a collision-checked
     # +/-20 degree sweep, and finally one collision-checked 360 degree spin.
     cancel_grace_sec: 2.0
-    local_recovery_wait_sec: 6.0
+    local_recovery_wait_sec: 9.0
     global_recovery_wait_sec: 12.0
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
@@ -78,9 +80,9 @@ localization_manager:
     spin_heading_tolerance: 0.052360
     automatic_motion_recovery: true
 
-    # Low-cost scan-to-map check: sample at most 60 valid beams once per second.
-    # Enter suspicion below 0.30, but require 0.35 to leave it. This hysteresis
-    # avoids the 0.32/0.33 boundary oscillation seen in the large service test.
+    # Low-cost scan-to-map check. Very close returns are omitted from this score
+    # only (not Nav2/collision_monitor) so nearby people do not hide every mapped
+    # wall. A rolling median rejects one-frame occlusion and TF jitter.
     map_match_min_score: 0.30
     map_match_recovery_score: 0.35
     map_match_critical_score: 0.20
@@ -88,6 +90,15 @@ localization_manager:
     map_match_max_beams: 60
     map_match_min_beams: 10
     map_match_neighborhood_cells: 2
+    map_match_window_size: 5
+    map_match_window_min_samples: 3
+    map_match_ignore_below_range: 0.60
+    map_match_min_sectors: 4
+    map_match_sector_total: 12
+    map_match_stale_grace_sec: 5.0
+    verification_pose_distance: 0.20
+    verification_pose_angle: 0.174533
+    diagnostic_log_period_sec: 5.0
 
     # External-force / localization-jump detection. These intentionally favor
     # stopping over continuing with a questionable pose.

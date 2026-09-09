@@ -10,6 +10,9 @@ from smart_delivery_core.localization_health import (
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    select_scan_samples,
+    smoothed_map_score,
+    suspect_requires_recovery,
     update_stability_samples,
 )
 
@@ -90,6 +93,41 @@ def test_stability_samples_reset_and_consume_unhealthy_timestamp():
     assert (count, timestamp) == (0, 12.0)
     count, timestamp = update_stability_samples(True, 12.0, timestamp, count)
     assert (count, timestamp) == (0, 12.0)
+
+
+def test_smoothed_map_score_rejects_single_frame_drop():
+    assert smoothed_map_score([0.38, 0.37], minimum_samples=3) is None
+    score = smoothed_map_score([0.38, 0.37, 0.04, 0.36, 0.39], minimum_samples=3)
+    assert math.isclose(score, 0.37)
+
+
+def test_suspect_hysteresis_band_has_a_maximum_wait():
+    assert not suspect_requires_recovery(False, "healthy", False, 6.0, 5.0, 12.0)
+    assert suspect_requires_recovery(False, "healthy", False, 12.0, 5.0, 12.0)
+    assert suspect_requires_recovery(False, "degraded", False, 5.0, 5.0, 12.0)
+    assert not suspect_requires_recovery(True, "healthy", False, 20.0, 5.0, 12.0)
+
+
+def test_scan_selection_ignores_near_people_but_keeps_broad_static_view():
+    ranges = [0.4, 1.0, 2.0, 0.5, 3.0, 4.0, 1.5, 2.5]
+    selection = select_scan_samples(
+        ranges,
+        range_min=0.1,
+        range_max=12.0,
+        ignore_below_range=0.6,
+        maximum_samples=8,
+        sector_total=4,
+    )
+    assert [distance for _index, distance in selection.samples] == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        1.5,
+        2.5,
+    ]
+    assert math.isclose(selection.near_fraction, 0.25)
+    assert selection.sector_count == 4
 
 
 def test_quaternion_to_yaw():

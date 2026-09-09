@@ -66,6 +66,25 @@ class DeliveryStateMachine:
         return self.state
 
 
+def localization_ready_for_resume(ready, ready_since, now, delay_seconds):
+    """Gate new motion until localization has stayed ready for a short grace period."""
+    if not ready or ready_since is None:
+        return False
+    return float(now) - float(ready_since) >= max(0.0, float(delay_seconds))
+
+
+def interrupted_localization_order(orders):
+    """Return the exact order interrupted by localization before route reordering."""
+    return next(
+        (
+            order
+            for order in orders
+            if order.get("_resume_state") == "waiting_localization"
+        ),
+        None,
+    )
+
+
 def slot_presence(slot: dict[str, Any]) -> bool | None:
     if not slot.get("enabled", True):
         return None
