@@ -7,6 +7,7 @@ from hailo_vision.semantic_protocol import (
     closest_timestamped_item,
     parse_semantic_payload,
     semantic_data_age,
+    semantic_health_state,
     semantic_safety_multiplier,
     stamps_are_synchronized,
 )
@@ -42,6 +43,13 @@ def test_legacy_detection_list_remains_accepted_during_rollout():
 )
 def test_semantic_freshness_policy(age, expected):
     assert semantic_safety_multiplier(age, 0.5, 0.5, 2.0) == expected
+
+
+def test_semantic_health_hysteresis_prevents_soft_timeout_flapping():
+    assert semantic_health_state(0.81, 'healthy', 0.8, 0.4, 2.0) == 'stale'
+    assert semantic_health_state(0.60, 'stale', 0.8, 0.4, 2.0) == 'stale'
+    assert semantic_health_state(0.39, 'stale', 0.8, 0.4, 2.0) == 'healthy'
+    assert semantic_health_state(2.01, 'healthy', 0.8, 0.4, 2.0) == 'stopped'
 
 
 def test_semantic_source_and_scan_stamp_skew():

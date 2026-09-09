@@ -25,6 +25,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.localization_health import (
+    heading_correction,
     map_match_status,
     occupancy_match_score,
     pose_is_near,
@@ -81,6 +82,9 @@ class LocalizationManager(Node):
         self.small_spin_angle = float(self.get_parameter("small_spin_angle").value)
         self.full_spin_angle = float(self.get_parameter("full_spin_angle").value)
         self.spin_time_allowance = int(self.get_parameter("spin_time_allowance_sec").value)
+        self.spin_heading_tolerance = float(
+            self.get_parameter("spin_heading_tolerance").value
+        )
         self.pose_jump_distance = float(self.get_parameter("pose_jump_distance").value)
         self.pose_jump_angle = float(self.get_parameter("pose_jump_angle").value)
         self.external_move_distance = float(
@@ -91,6 +95,9 @@ class LocalizationManager(Node):
             self.get_parameter("automatic_motion_recovery").value
         )
         self.map_match_min_score = float(self.get_parameter("map_match_min_score").value)
+        self.map_match_recovery_score = float(
+            self.get_parameter("map_match_recovery_score").value
+        )
         self.map_match_critical_score = float(
             self.get_parameter("map_match_critical_score").value
         )
@@ -120,6 +127,9 @@ class LocalizationManager(Node):
         self.recovery_reason = ""
         self.spin_sequence = []
         self.spin_in_progress = False
+        self.spin_restoring_heading = False
+        self.spin_failure_reason = None
+        self.recovery_start_yaw = None
         self.commanded_motion = False
         self.stationary_odom_anchor = None
         self.stationary_amcl_anchor = None
@@ -214,12 +224,14 @@ class LocalizationManager(Node):
             "small_spin_angle": math.radians(20.0),
             "full_spin_angle": 2.0 * math.pi,
             "spin_time_allowance_sec": 35,
+            "spin_heading_tolerance": math.radians(3.0),
             "pose_jump_distance": 0.40,
             "pose_jump_angle": math.radians(25.0),
             "external_move_distance": 0.25,
             "external_move_angle": math.radians(20.0),
             "automatic_motion_recovery": True,
-            "map_match_min_score": 0.35,
+            "map_match_min_score": 0.30,
+            "map_match_recovery_score": 0.35,
             "map_match_critical_score": 0.20,
             "map_match_check_period_sec": 1.0,
             "map_match_max_beams": 60,
@@ -356,16 +368,19 @@ class LocalizationManager(Node):
                     self.seed_xy_tolerance,
                     self.seed_yaw_tolerance,
                 )
-            map_match_ok = (
-                self.latest_map_score is not None
-                and self.latest_map_score >= self.map_match_min_score
-                and now - self.latest_map_score_at <= 2.0 * self.map_match_period
+            map_match_ok = self._map_match_has_recovered(now)
+            recovery_motion_complete = not (
+                self.spin_in_progress
+                or self.spin_sequence
+                or self.spin_restoring_heading
+                or self.recovery_step in {"small_spin", "full_spin", "restore_heading"}
             )
             qualified = (
                 quality.healthy
                 and reference_ok
                 and map_match_ok
                 and self._scan_is_fresh(now)
+                and recovery_motion_complete
             )
             self.stable_samples, self.last_stable_map_score_at = (
                 update_stability_samples(
@@ -469,7 +484,7 @@ class LocalizationManager(Node):
             qualified = (
                 self.latest_quality is not None
                 and self.latest_quality.healthy
-                and match_status == "healthy"
+                and self._map_match_has_recovered(now)
                 and now - self.last_amcl_at <= self.amcl_pose_timeout
                 and self._scan_is_fresh(now)
             )
@@ -490,7 +505,7 @@ class LocalizationManager(Node):
             ):
                 if match_status in {"critical", "degraded", "unknown"}:
                     self._begin_recovery("雷達地圖吻合度持續低於可信門檻")
-                else:
+                elif self.latest_quality is not None and self.latest_quality.critical:
                     self._begin_recovery("AMCL 不確定度超過保守門檻")
             return
 
@@ -569,6 +584,13 @@ class LocalizationManager(Node):
             2.0 * self.map_match_period,
         )
 
+    def _map_match_has_recovered(self, now):
+        return (
+            self.latest_map_score is not None
+            and self.latest_map_score >= self.map_match_recovery_score
+            and now - self.latest_map_score_at <= 2.0 * self.map_match_period
+        )
+
     def _publish_initial_pose(self, retry=False):
         message = PoseWithCovarianceStamped()
         message.header.frame_id = "map"
@@ -596,10 +618,15 @@ class LocalizationManager(Node):
             self._set_state("VERIFYING", "等待 AMCL 收斂")
 
     def _mark_localized(self):
+        if self.spin_in_progress or self.spin_sequence or self.spin_restoring_heading:
+            return
         self.suspect_since = None
         self.recovery_step = None
         self.spin_sequence = []
         self.spin_in_progress = False
+        self.spin_restoring_heading = False
+        self.spin_failure_reason = None
+        self.recovery_start_yaw = None
         self.stationary_odom_anchor = self.last_odom_pose
         self.stationary_amcl_anchor = self.latest_pose
         quality = self.latest_quality
@@ -627,6 +654,11 @@ class LocalizationManager(Node):
         self.stationary_amcl_anchor = None
         self.verify_reference_required = False
         self.recovery_reason = reason
+        self.spin_sequence = []
+        self.spin_in_progress = False
+        self.spin_restoring_heading = False
+        self.spin_failure_reason = None
+        self.recovery_start_yaw = None
         self.recovery_step = "cancel_wait"
         self.recovery_step_started = time.monotonic()
         self._set_state("RECOVERING_LOCAL", reason)
@@ -671,6 +703,11 @@ class LocalizationManager(Node):
             self._request_nomotion_if_due(now)
             if elapsed >= self.local_wait:
                 self._start_global_recovery()
+        elif self.recovery_step == "post_failed_small":
+            self._request_nomotion_if_due(now)
+            if elapsed >= self.local_wait:
+                reason = self.recovery_reason or "小幅定位掃描未安全完成"
+                self._require_manual(f"{reason}；回正後定位仍未恢復")
         elif self.recovery_step == "motion_inhibited" and not self.motion_inhibited:
             self._start_small_sweep()
 
@@ -686,6 +723,11 @@ class LocalizationManager(Node):
             self._require_manual("Spin 行為伺服器未就緒")
             return
         self.recovery_step = "small_spin"
+        self.recovery_start_yaw = (
+            None if self.last_odom_pose is None else self.last_odom_pose[2]
+        )
+        self.spin_restoring_heading = False
+        self.spin_failure_reason = None
         self.spin_sequence = [
             self.small_spin_angle,
             -2.0 * self.small_spin_angle,
@@ -719,6 +761,11 @@ class LocalizationManager(Node):
                 self._require_manual("Spin 行為伺服器未就緒")
                 return
             self.recovery_step = "full_spin"
+            self.recovery_start_yaw = (
+                None if self.last_odom_pose is None else self.last_odom_pose[2]
+            )
+            self.spin_restoring_heading = False
+            self.spin_failure_reason = None
             self.spin_sequence = [self.full_spin_angle]
             self.get_logger().warning("開始碰撞檢查的 360 度低速定位自旋")
             self._send_next_spin()
@@ -731,11 +778,7 @@ class LocalizationManager(Node):
         if self.spin_in_progress:
             return
         if not self.spin_sequence:
-            self._request_nomotion_update()
-            self.recovery_step = (
-                "post_global" if self.state == "RECOVERING_GLOBAL" else "post_small"
-            )
-            self.recovery_step_started = time.monotonic()
+            self._complete_spin_sequence()
             return
         goal = Spin.Goal()
         goal.target_yaw = float(self.spin_sequence.pop(0))
@@ -766,15 +809,95 @@ class LocalizationManager(Node):
             self._require_manual(f"Spin 執行失敗：{exc}")
             return
         if result.status != GoalStatus.STATUS_SUCCEEDED:
-            self._require_manual(
-                f"Spin 未安全完成（action status={result.status}），停止自動恢復"
+            self._handle_spin_failure(
+                f"Spin 未安全完成（action status={result.status}）"
             )
             return
         self._send_next_spin()
 
+    def _heading_restore_command(self):
+        if self.recovery_start_yaw is None or self.last_odom_pose is None:
+            return None
+        return heading_correction(
+            self.recovery_start_yaw,
+            self.last_odom_pose[2],
+            self.spin_heading_tolerance,
+        )
+
+    def _complete_spin_sequence(self):
+        if self.spin_restoring_heading:
+            self.spin_restoring_heading = False
+            self.recovery_start_yaw = None
+            if self.spin_failure_reason:
+                self._finish_failed_small_spin()
+            else:
+                self._finish_spin_sequence()
+            return
+
+        correction = self._heading_restore_command()
+        if correction is not None and correction != 0.0:
+            self.spin_restoring_heading = True
+            self.recovery_step = "restore_heading"
+            self.spin_sequence = [correction]
+            self.get_logger().warning(
+                f"定位掃描完成後回正 {math.degrees(correction):+.1f} deg"
+            )
+            self._send_next_spin()
+            return
+
+        self.recovery_start_yaw = None
+        self._finish_spin_sequence()
+
+    def _finish_spin_sequence(self):
+        self._request_nomotion_update()
+        self.recovery_step = (
+            "post_global" if self.state == "RECOVERING_GLOBAL" else "post_small"
+        )
+        self.recovery_step_started = time.monotonic()
+
+    def _handle_spin_failure(self, reason):
+        if self.spin_restoring_heading:
+            self._require_manual(f"{reason}；回到定位掃描原始方向也未安全完成")
+            return
+
+        self.spin_sequence = []
+        self.spin_failure_reason = reason
+        correction = self._heading_restore_command()
+        if correction is None:
+            self._require_manual(f"{reason}；沒有里程計角度可安全回正")
+            return
+        if correction == 0.0:
+            self.recovery_start_yaw = None
+            self._finish_failed_small_spin()
+            return
+
+        self.spin_restoring_heading = True
+        self.recovery_step = "restore_heading"
+        self.spin_sequence = [correction]
+        self.get_logger().warning(
+            f"{reason}；先嘗試回到掃描前方向 {math.degrees(correction):+.1f} deg"
+        )
+        self._send_next_spin()
+
+    def _finish_failed_small_spin(self):
+        reason = self.spin_failure_reason or "定位掃描未安全完成"
+        self.spin_failure_reason = None
+        if self.state == "RECOVERING_GLOBAL":
+            self._require_manual(f"{reason}；全域旋轉失敗但已嘗試回正")
+            return
+        self._request_nomotion_update()
+        self.recovery_step = "post_failed_small"
+        self.recovery_step_started = time.monotonic()
+        self.get_logger().warning(
+            f"{reason}；車頭已回正，先用現有雷達資料重新驗證定位"
+        )
+
     def _require_manual(self, reason):
         self.spin_sequence = []
         self.spin_in_progress = False
+        self.spin_restoring_heading = False
+        self.spin_failure_reason = None
+        self.recovery_start_yaw = None
         self.recovery_step = None
         self._cancel_navigation()
         self._set_state("MANUAL_REQUIRED", reason)

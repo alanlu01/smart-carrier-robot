@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String  
 from cv_bridge import CvBridge
@@ -12,6 +13,13 @@ from ament_index_python.packages import get_package_share_directory
 from hailo_platform import HEF, VDevice, InferVStreams, InputVStreamParams, OutputVStreamParams, FormatType
 
 from hailo_vision.semantic_protocol import build_semantic_payload
+
+
+CAMERA_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 # 分類字典
 CLASS_NAMES = {
@@ -101,7 +109,11 @@ class SemanticVisionNode(Node):
         self.input_name = network_group.get_input_vstream_infos()[0].name
         self.bridge = CvBridge()
         
-        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        # Inference is synchronous, so processing queued camera frames would only
+        # increase source-stamp age. Keep the newest frame and drop stale backlog.
+        self.subscription = self.create_subscription(
+            Image, '/camera/image_raw', self.image_callback, CAMERA_QOS
+        )
         self.image_pub = self.create_publisher(Image, '/hailo_vision/semantic_image', 10)
         self.info_pub = self.create_publisher(String, '/vision/semantic_info', 10)
         

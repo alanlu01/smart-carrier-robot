@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 from smart_delivery_core.localization_health import (
+    heading_correction,
     map_match_status,
     normalize_angle,
     occupancy_match_score,
@@ -43,6 +44,12 @@ def test_pose_jump_handles_wrapped_yaw():
     distance, angle = pose_jump((0.0, 0.0, math.pi - 0.05), (0.3, 0.4, -math.pi + 0.05))
     assert distance == 0.5
     assert math.isclose(angle, 0.1)
+
+
+def test_heading_correction_returns_to_reference_across_angle_wrap():
+    correction = heading_correction(-math.pi + 0.05, math.pi - 0.05)
+    assert math.isclose(correction, 0.1)
+    assert heading_correction(0.0, math.radians(2.0), math.radians(3.0)) == 0.0
 
 
 def test_stationary_anchor_detects_cumulative_pose_drift():

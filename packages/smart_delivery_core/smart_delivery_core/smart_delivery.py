@@ -373,10 +373,19 @@ def main():
     localization_ready = False
     localization_state = "UNINITIALIZED"
     last_localization_warning_at = 0.0
+    is_standby = False
 
     def localization_ready_callback(message):
-        nonlocal localization_ready
+        nonlocal localization_ready, is_standby
+        was_ready = localization_ready
         localization_ready = bool(message.data)
+        if was_ready and not localization_ready:
+            # A remembered arrival is no longer trustworthy after AMCL loses
+            # localization or an external move is detected.
+            is_standby = False
+            navigator.get_logger().warning(
+                "定位可信度下降，已取消既有待機位置記錄"
+            )
 
     def localization_state_callback(message):
         nonlocal localization_state
@@ -611,7 +620,6 @@ def main():
         return
 
     current_pos = {"x": 0.0, "y": 0.0}
-    is_standby = False
     last_stale_warning_at = 0.0
     print("\n🚀 智慧動態派車系統已啟動")
 
@@ -631,6 +639,7 @@ def main():
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
             if not is_standby:
+                current_pos = refresh_current_position(current_pos)
                 standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
                     current_pos = standby_pos
@@ -640,6 +649,7 @@ def main():
         if not pending_orders:
             if not is_standby:
                 print("\n🏁 無待處理任務，返回待機點")
+                current_pos = refresh_current_position(current_pos)
                 standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
                 if standby_pos is not None:
                     current_pos = standby_pos

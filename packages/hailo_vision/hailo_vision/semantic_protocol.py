@@ -72,6 +72,26 @@ def semantic_safety_multiplier(
     return 0.0
 
 
+def semantic_health_state(
+    age_sec,
+    previous_state,
+    timeout_sec,
+    recovery_timeout_sec,
+    hard_stop_timeout_sec,
+):
+    """Classify semantic freshness with hysteresis around the soft timeout."""
+    age_sec = max(0.0, float(age_sec))
+    if not 0.0 <= recovery_timeout_sec < timeout_sec < hard_stop_timeout_sec:
+        raise ValueError("semantic freshness thresholds must be ordered")
+    if age_sec > hard_stop_timeout_sec:
+        return "stopped"
+    if previous_state in {"stale", "stopped"} and age_sec > recovery_timeout_sec:
+        return "stale"
+    if age_sec > timeout_sec:
+        return "stale"
+    return "healthy"
+
+
 def semantic_data_age(receipt_age_sec, source_stamp_ns=None, now_ns=None):
     """Return the older age from transport receipt and the source image stamp."""
     receipt_age_sec = max(0.0, float(receipt_age_sec))

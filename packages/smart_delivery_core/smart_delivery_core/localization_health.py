@@ -68,6 +68,12 @@ def pose_jump(previous, current):
     return distance, angle
 
 
+def heading_correction(reference_yaw, current_yaw, tolerance=0.0):
+    """Return the shortest safe-to-request yaw correction back to a reference."""
+    correction = normalize_angle(float(reference_yaw) - float(current_yaw))
+    return 0.0 if abs(correction) <= float(tolerance) else correction
+
+
 def map_match_status(score, age, minimum_score, critical_score, maximum_age):
     """Classify a scan-to-map score using freshness and hysteresis thresholds."""
     if score is None or age < 0.0 or age > maximum_age:

@@ -75,10 +75,14 @@ localization_manager:
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
     spin_time_allowance_sec: 35
+    spin_heading_tolerance: 0.052360
     automatic_motion_recovery: true
 
     # Low-cost scan-to-map check: sample at most 60 valid beams once per second.
-    map_match_min_score: 0.35
+    # Enter suspicion below 0.30, but require 0.35 to leave it. This hysteresis
+    # avoids the 0.32/0.33 boundary oscillation seen in the large service test.
+    map_match_min_score: 0.30
+    map_match_recovery_score: 0.35
     map_match_critical_score: 0.20
     map_match_check_period_sec: 1.0
     map_match_max_beams: 60

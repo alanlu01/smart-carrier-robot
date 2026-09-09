@@ -15,7 +15,7 @@ from hailo_vision.semantic_protocol import (
     closest_timestamped_item,
     parse_semantic_payload,
     semantic_data_age,
-    semantic_safety_multiplier,
+    semantic_health_state,
 )
 
 class SensorFusionNode(Node):
@@ -36,7 +36,8 @@ class SensorFusionNode(Node):
         self.person_safety_state = 'clear'
         self.history = {} 
 
-        self.declare_parameter('semantic_timeout_sec', 0.50)
+        self.declare_parameter('semantic_timeout_sec', 0.80)
+        self.declare_parameter('semantic_recovery_timeout_sec', 0.40)
         self.declare_parameter('semantic_max_sync_skew_sec', 0.20)
         self.declare_parameter('semantic_stale_speed_multiplier', 0.50)
         self.declare_parameter('semantic_hard_stop_timeout_sec', 2.00)
@@ -44,6 +45,9 @@ class SensorFusionNode(Node):
         self.declare_parameter('person_clear_hold_sec', 0.50)
         self.semantic_timeout_sec = float(
             self.get_parameter('semantic_timeout_sec').value
+        )
+        self.semantic_recovery_timeout_sec = float(
+            self.get_parameter('semantic_recovery_timeout_sec').value
         )
         self.semantic_max_sync_skew_sec = float(
             self.get_parameter('semantic_max_sync_skew_sec').value
@@ -60,8 +64,14 @@ class SensorFusionNode(Node):
         self.person_clear_hold_sec = float(
             self.get_parameter('person_clear_hold_sec').value
         )
-        if not 0 < self.semantic_timeout_sec < self.semantic_hard_stop_timeout_sec:
-            raise ValueError('語意 soft timeout 必須大於 0 且小於 hard-stop timeout')
+        if not (
+            0 < self.semantic_recovery_timeout_sec
+            < self.semantic_timeout_sec
+            < self.semantic_hard_stop_timeout_sec
+        ):
+            raise ValueError(
+                '語意逾時門檻須符合 0 < recovery < soft timeout < hard-stop timeout'
+            )
         if self.semantic_max_sync_skew_sec < 0:
             raise ValueError('語意與雷達最大時間差不得小於 0')
         if not 0 <= self.semantic_stale_speed_multiplier <= 1:
@@ -145,23 +155,29 @@ class SensorFusionNode(Node):
         )
 
     def semantic_speed_limit(self, now=None):
-        return semantic_safety_multiplier(
+        state = semantic_health_state(
             self.semantic_age(now),
+            self.semantic_health_state,
             self.semantic_timeout_sec,
-            self.semantic_stale_speed_multiplier,
+            self.semantic_recovery_timeout_sec,
             self.semantic_hard_stop_timeout_sec,
         )
+        if state == 'stopped':
+            return 0.0
+        if state == 'stale':
+            return self.semantic_stale_speed_multiplier
+        return 1.0
 
     def semantic_watchdog_callback(self):
-        speed_limit = self.semantic_speed_limit()
-        if self.latest_semantic_received_at is None and speed_limit == 1.0:
+        next_state = semantic_health_state(
+            self.semantic_age(),
+            self.semantic_health_state,
+            self.semantic_timeout_sec,
+            self.semantic_recovery_timeout_sec,
+            self.semantic_hard_stop_timeout_sec,
+        )
+        if self.latest_semantic_received_at is None and next_state == 'healthy':
             next_state = 'starting'
-        elif speed_limit == 1.0:
-            next_state = 'healthy'
-        elif speed_limit > 0.0:
-            next_state = 'stale'
-        else:
-            next_state = 'stopped'
 
         if next_state == self.semantic_health_state:
             return
