@@ -68,6 +68,9 @@ localization_manager:
     suspect_hold_sec: 5.0
     # Never remain in the 0.30-0.35 hysteresis band indefinitely.
     suspect_max_sec: 12.0
+    # A recovered map score with non-critical covariance is evidence that AMCL
+    # is converging. Keep navigation paused, but avoid an unnecessary new spin.
+    suspect_promising_max_sec: 30.0
 
     # Stop navigation first, then try no-motion update, a collision-checked
     # +/-20 degree sweep, and finally one collision-checked 360 degree spin.
@@ -85,7 +88,7 @@ localization_manager:
     # zero. Wait for the real chassis command to settle before measuring yaw.
     spin_settle_sec: 1.0
     spin_settle_timeout_sec: 5.0
-    spin_heading_max_corrections: 2
+    spin_heading_max_corrections: 1
     automatic_motion_recovery: true
 
     # Low-cost scan-to-map check. Very close returns are omitted from this score
@@ -423,7 +426,9 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
+    # Keep localization and BT spins slow enough for the smoothed chassis
+    # command to stop without the 14-18 degree overshoot seen in real tests.
+    max_rotational_vel: 0.35
     min_rotational_vel: 0.1 #0.4
     rotational_acc_lim: 3.2
 

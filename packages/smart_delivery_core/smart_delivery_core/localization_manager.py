@@ -85,6 +85,10 @@ class LocalizationManager(Node):
             self.suspect_hold,
             float(self.get_parameter("suspect_max_sec").value),
         )
+        self.suspect_promising_max = max(
+            self.suspect_max,
+            float(self.get_parameter("suspect_promising_max_sec").value),
+        )
         self.cancel_grace = float(self.get_parameter("cancel_grace_sec").value)
         self.local_wait = float(self.get_parameter("local_recovery_wait_sec").value)
         self.global_wait = float(self.get_parameter("global_recovery_wait_sec").value)
@@ -288,6 +292,7 @@ class LocalizationManager(Node):
             "seed_yaw_tolerance": 0.52,
             "suspect_hold_sec": 5.0,
             "suspect_max_sec": 12.0,
+            "suspect_promising_max_sec": 30.0,
             "cancel_grace_sec": 2.0,
             "local_recovery_wait_sec": 9.0,
             "global_recovery_wait_sec": 12.0,
@@ -298,7 +303,7 @@ class LocalizationManager(Node):
             "spin_heading_tolerance": math.radians(3.0),
             "spin_settle_sec": 1.0,
             "spin_settle_timeout_sec": 5.0,
-            "spin_heading_max_corrections": 2,
+            "spin_heading_max_corrections": 1,
             "pose_jump_distance": 0.40,
             "pose_jump_angle": math.radians(25.0),
             "external_move_distance": 0.25,
@@ -693,6 +698,13 @@ class LocalizationManager(Node):
                 quality_critical = (
                     self.latest_quality is not None and self.latest_quality.critical
                 )
+                convergence_promising = (
+                    self._map_match_has_recovered(now)
+                    and self.latest_quality is not None
+                    and not quality_critical
+                    and now - self.last_amcl_at <= self.amcl_pose_timeout
+                    and self._scan_is_fresh(now)
+                )
                 if suspect_requires_recovery(
                     qualified,
                     match_status,
@@ -700,6 +712,8 @@ class LocalizationManager(Node):
                     suspect_age,
                     self.suspect_hold,
                     self.suspect_max,
+                    convergence_promising,
+                    self.suspect_promising_max,
                 ):
                     reason = "定位可信度持續不足"
                     if suspect_age >= self.suspect_max:
@@ -720,7 +734,8 @@ class LocalizationManager(Node):
                         f"age={suspect_age:.1f}s, score={score_text}, "
                         f"samples={len(self.map_score_window)}, "
                         f"near={self.latest_map_near_fraction:.0%}, "
-                        f"sectors={self.latest_map_sector_count}"
+                        f"sectors={self.latest_map_sector_count}, "
+                        f"convergence_grace={convergence_promising}"
                     )
                     self.last_diagnostic_log_at = now
             return

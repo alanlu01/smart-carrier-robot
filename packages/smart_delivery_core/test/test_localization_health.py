@@ -109,6 +109,24 @@ def test_suspect_hysteresis_band_has_a_maximum_wait():
     assert not suspect_requires_recovery(True, "healthy", False, 20.0, 5.0, 12.0)
 
 
+def test_suspect_allows_finite_grace_for_promising_convergence():
+    assert not suspect_requires_recovery(
+        False, "healthy", False, 12.0, 5.0, 12.0, True, 30.0
+    )
+    assert not suspect_requires_recovery(
+        False, "healthy", False, 29.9, 5.0, 12.0, True, 30.0
+    )
+    assert suspect_requires_recovery(
+        False, "healthy", False, 30.0, 5.0, 12.0, True, 30.0
+    )
+    assert suspect_requires_recovery(
+        False, "degraded", False, 12.0, 5.0, 12.0, False, 30.0
+    )
+    assert suspect_requires_recovery(
+        False, "healthy", True, 12.0, 5.0, 12.0, False, 30.0
+    )
+
+
 def test_global_recovery_extends_only_for_fresh_map_match():
     assert not should_extend_global_recovery(11.9, 12.0, 30.0, True)
     assert should_extend_global_recovery(12.0, 12.0, 30.0, True)

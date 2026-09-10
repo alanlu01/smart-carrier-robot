@@ -122,10 +122,22 @@ def suspect_requires_recovery(
     elapsed,
     hold_seconds,
     maximum_seconds,
+    promising=False,
+    extended_maximum_seconds=None,
 ):
     """Ensure SUSPECT cannot remain forever inside the hysteresis band."""
     if qualified or float(elapsed) < float(hold_seconds):
         return False
+    if promising:
+        extended_maximum = max(
+            float(maximum_seconds),
+            float(
+                maximum_seconds
+                if extended_maximum_seconds is None
+                else extended_maximum_seconds
+            ),
+        )
+        return float(elapsed) >= extended_maximum
     if float(elapsed) >= float(maximum_seconds):
         return True
     return match_status in {"critical", "degraded", "unknown"} or bool(
