@@ -133,6 +133,23 @@ def suspect_requires_recovery(
     )
 
 
+def should_extend_global_recovery(
+    elapsed,
+    normal_wait_seconds,
+    maximum_wait_seconds,
+    map_match_recovered,
+):
+    """Allow extra AMCL convergence time only for a map-consistent hypothesis."""
+    elapsed = float(elapsed)
+    normal_wait_seconds = float(normal_wait_seconds)
+    maximum_wait_seconds = max(normal_wait_seconds, float(maximum_wait_seconds))
+    return (
+        bool(map_match_recovered)
+        and elapsed >= normal_wait_seconds
+        and elapsed < maximum_wait_seconds
+    )
+
+
 def select_scan_samples(
     ranges,
     range_min,

@@ -74,10 +74,18 @@ localization_manager:
     cancel_grace_sec: 2.0
     local_recovery_wait_sec: 9.0
     global_recovery_wait_sec: 12.0
+    # If scan-to-map is already good, let AMCL eliminate secondary hypotheses
+    # without weakening the covariance safety thresholds.
+    global_recovery_max_wait_sec: 30.0
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
     spin_time_allowance_sec: 35
     spin_heading_tolerance: 0.052360
+    # Nav2 Spin may finish before velocity_smoother's deceleration tail reaches
+    # zero. Wait for the real chassis command to settle before measuring yaw.
+    spin_settle_sec: 1.0
+    spin_settle_timeout_sec: 5.0
+    spin_heading_max_corrections: 2
     automatic_motion_recovery: true
 
     # Low-cost scan-to-map check. Very close returns are omitted from this score

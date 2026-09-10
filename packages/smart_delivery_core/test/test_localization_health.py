@@ -11,6 +11,7 @@ from smart_delivery_core.localization_health import (
     pose_quality,
     quaternion_to_yaw,
     select_scan_samples,
+    should_extend_global_recovery,
     smoothed_map_score,
     suspect_requires_recovery,
     update_stability_samples,
@@ -106,6 +107,14 @@ def test_suspect_hysteresis_band_has_a_maximum_wait():
     assert suspect_requires_recovery(False, "healthy", False, 12.0, 5.0, 12.0)
     assert suspect_requires_recovery(False, "degraded", False, 5.0, 5.0, 12.0)
     assert not suspect_requires_recovery(True, "healthy", False, 20.0, 5.0, 12.0)
+
+
+def test_global_recovery_extends_only_for_fresh_map_match():
+    assert not should_extend_global_recovery(11.9, 12.0, 30.0, True)
+    assert should_extend_global_recovery(12.0, 12.0, 30.0, True)
+    assert should_extend_global_recovery(29.9, 12.0, 30.0, True)
+    assert not should_extend_global_recovery(12.0, 12.0, 30.0, False)
+    assert not should_extend_global_recovery(30.0, 12.0, 30.0, True)
 
 
 def test_scan_selection_ignores_near_people_but_keeps_broad_static_view():
