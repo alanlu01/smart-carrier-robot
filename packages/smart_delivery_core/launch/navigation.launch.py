@@ -77,6 +77,13 @@ def generate_launch_description():
         ],
     )
 
+    delivery_goal_guard = Node(
+        package="smart_delivery_core",
+        executable="delivery_goal_guard",
+        name="delivery_goal_guard",
+        output="screen",
+    )
+
     return LaunchDescription(
         [
             map_argument,
@@ -86,5 +93,6 @@ def generate_launch_description():
             auto_initialize_argument,
             nav2,
             localization_manager,
+            delivery_goal_guard,
         ]
     )

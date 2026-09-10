@@ -360,7 +360,12 @@ def recovered_slot_baseline(task, current_slots):
     return baseline
 
 
-def go_to_standby(navigator, current_pos, localization_is_ready=lambda: True):
+def go_to_standby(
+    navigator,
+    current_pos,
+    localization_is_ready=lambda: True,
+    set_navigation_active=lambda _active: None,
+):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
     closest_standby = min(
@@ -376,6 +381,7 @@ def go_to_standby(navigator, current_pos, localization_is_ready=lambda: True):
     goal_pose.pose.position.y = closest_standby["y"]
     goal_pose.pose.orientation = yaw_to_quaternion(closest_standby["yaw"])
 
+    set_navigation_active(True)
     navigator.goToPose(goal_pose)
     while not navigator.isTaskComplete():
         time.sleep(0.1)  # 釋放 CPU
@@ -385,8 +391,10 @@ def go_to_standby(navigator, current_pos, localization_is_ready=lambda: True):
             navigator.get_logger().warning("定位可信度不足，已取消前往待機點")
             while not navigator.isTaskComplete():
                 rclpy.spin_once(navigator, timeout_sec=0.05)
+            set_navigation_active(False)
             return None
 
+    set_navigation_active(False)
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
     return {"x": closest_standby["x"], "y": closest_standby["y"]}
 
@@ -500,11 +508,31 @@ def main():
     motion_inhibit_publisher = navigator.create_publisher(
         Bool, "/localization/motion_inhibited", STATE_QOS
     )
+    navigation_lease_publisher = navigator.create_publisher(
+        Bool, "/smart_carrier/delivery_navigation_active", STATE_QOS
+    )
+    delivery_navigation_active = False
 
     def set_motion_inhibited(inhibited):
         message = Bool()
         message.data = bool(inhibited)
         motion_inhibit_publisher.publish(message)
+
+    def publish_navigation_lease():
+        if not delivery_navigation_active:
+            return
+        message = Bool()
+        message.data = True
+        navigation_lease_publisher.publish(message)
+
+    def set_navigation_active(active):
+        nonlocal delivery_navigation_active
+        delivery_navigation_active = bool(active)
+        message = Bool()
+        message.data = delivery_navigation_active
+        navigation_lease_publisher.publish(message)
+
+    navigator.create_timer(0.2, publish_navigation_lease)
 
     set_motion_inhibited(False)
 
@@ -832,7 +860,12 @@ def main():
                 emit_result(pending_result)
             if localization_can_resume() and not is_standby:
                 current_pos = refresh_current_position(current_pos)
-                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
+                standby_pos = go_to_standby(
+                    navigator,
+                    current_pos,
+                    lambda: localization_ready,
+                    set_navigation_active,
+                )
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
@@ -871,7 +904,12 @@ def main():
             if not is_standby:
                 print("\n🏁 無待處理任務，返回待機點")
                 current_pos = refresh_current_position(current_pos)
-                standby_pos = go_to_standby(navigator, current_pos, lambda: localization_ready)
+                standby_pos = go_to_standby(
+                    navigator,
+                    current_pos,
+                    lambda: localization_ready,
+                    set_navigation_active,
+                )
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
@@ -955,6 +993,7 @@ def main():
         goal_pose.pose.position.x = float(target["x"])
         goal_pose.pose.position.y = float(target["y"])
         goal_pose.pose.orientation = yaw_to_quaternion(target["yaw"])
+        set_navigation_active(True)
         navigator.goToPose(goal_pose)
         active_task_id = target.get("task_id")
         cancel_sent = False
@@ -973,6 +1012,7 @@ def main():
                 cancel_sent = True
                 localization_aborted = True
 
+        set_navigation_active(False)
         nav_result = navigator.getResult()
         keep_pending = False
         if localization_aborted:

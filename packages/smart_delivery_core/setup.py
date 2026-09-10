@@ -37,6 +37,7 @@ setup(
             'mecanum_odom_real = smart_delivery_core.mecanum_odom_real:main',
             'serial_bridge = smart_delivery_core.serial_bridge:main',
             'localization_manager = smart_delivery_core.localization_manager:main',
+            'delivery_goal_guard = smart_delivery_core.delivery_goal_guard:main',
             'smart_delivery = smart_delivery_core.smart_delivery:main',
             'smart_delivery_backup = smart_delivery_core.smart_delivery_backup:main',
         ],

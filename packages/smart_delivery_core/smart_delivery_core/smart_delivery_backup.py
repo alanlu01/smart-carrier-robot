@@ -6,12 +6,18 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from power_monitor.power_status import payload_to_slots
-from std_msgs.msg import String
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool, String
 
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
+LEASE_QOS = QoSProfile(
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 # 行動電源狀態介面的預設數字值
 POWER_BANK_STATUS_CODES = {
@@ -153,7 +159,7 @@ def yaw_to_quaternion(yaw):
     q.w = math.cos(yaw / 2.0)
     return q
 
-def go_to_standby(navigator, current_pos):
+def go_to_standby(navigator, current_pos, set_navigation_active=lambda _active: None):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
     closest_standby = min(
@@ -169,17 +175,39 @@ def go_to_standby(navigator, current_pos):
     goal_pose.pose.position.y = closest_standby['y']
     goal_pose.pose.orientation = yaw_to_quaternion(closest_standby['yaw'])
 
+    set_navigation_active(True)
     navigator.goToPose(goal_pose)
     while not navigator.isTaskComplete():
         time.sleep(0.1) # 釋放 CPU
         rclpy.spin_once(navigator, timeout_sec=0.05)
         
+    set_navigation_active(False)
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
     return {"x": closest_standby['x'], "y": closest_standby['y']}
 
 def main():
     rclpy.init()
     navigator = BasicNavigator()
+    navigation_lease_publisher = navigator.create_publisher(
+        Bool, "/smart_carrier/delivery_navigation_active", LEASE_QOS
+    )
+    delivery_navigation_active = False
+
+    def publish_navigation_lease():
+        if not delivery_navigation_active:
+            return
+        message = Bool()
+        message.data = True
+        navigation_lease_publisher.publish(message)
+
+    def set_navigation_active(active):
+        nonlocal delivery_navigation_active
+        delivery_navigation_active = bool(active)
+        message = Bool()
+        message.data = delivery_navigation_active
+        navigation_lease_publisher.publish(message)
+
+    navigator.create_timer(0.2, publish_navigation_lease)
 
     print("⏳ 等待 Nav2 系統上線...")
     navigator.waitUntilNav2Active()
@@ -251,6 +279,7 @@ def main():
         goal_pose.pose.position.y = float(target['y'])
         goal_pose.pose.orientation = yaw_to_quaternion(target['yaw'])
 
+        set_navigation_active(True)
         navigator.goToPose(goal_pose)
 
         # --- 修改亮點 2：加入 time.sleep(0.1) 拯救樹莓派 CPU ---
@@ -259,6 +288,7 @@ def main():
             # 在導航過程中持續更新 Topic 資料
             rclpy.spin_once(navigator, timeout_sec=0.05)
 
+        set_navigation_active(False)
         result = navigator.getResult()
         if result == TaskResult.SUCCEEDED:
             msg = "您的行動電源已送達！" if target["type"] == "borrow" else "請將行動電源放入空槽！"
@@ -282,7 +312,7 @@ def main():
         print("\n🏁 所有訂單配送完畢！")
 
     # --- 呼叫靠牆避讓待機函式 ---
-    current_pos = go_to_standby(navigator, current_pos)
+    current_pos = go_to_standby(navigator, current_pos, set_navigation_active)
 
     rclpy.shutdown()
 
