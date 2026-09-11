@@ -26,7 +26,9 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.localization_health import (
+    damped_heading_command,
     heading_correction,
+    heading_error_is_improving,
     map_match_status,
     occupancy_match_score,
     pose_is_near,
@@ -101,6 +103,15 @@ class LocalizationManager(Node):
         self.spin_time_allowance = int(self.get_parameter("spin_time_allowance_sec").value)
         self.spin_heading_tolerance = float(
             self.get_parameter("spin_heading_tolerance").value
+        )
+        self.spin_heading_correction_gain = float(
+            self.get_parameter("spin_heading_correction_gain").value
+        )
+        self.spin_heading_max_correction = float(
+            self.get_parameter("spin_heading_max_correction").value
+        )
+        self.spin_heading_min_improvement = float(
+            self.get_parameter("spin_heading_min_improvement").value
         )
         self.spin_settle = max(
             0.0, float(self.get_parameter("spin_settle_sec").value)
@@ -191,8 +202,12 @@ class LocalizationManager(Node):
         self.last_odom_motion_at = 0.0
         self.spin_restoring_heading = False
         self.spin_heading_corrections = 0
+        self.spin_previous_heading_error = None
         self.spin_failure_reason = None
+        self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
+        self.spin_goal_target = 0.0
+        self.spin_goal_started_at = 0.0
         self.commanded_motion = False
         self.stationary_odom_anchor = None
         self.stationary_amcl_anchor = None
@@ -300,10 +315,13 @@ class LocalizationManager(Node):
             "small_spin_angle": math.radians(20.0),
             "full_spin_angle": 2.0 * math.pi,
             "spin_time_allowance_sec": 35,
-            "spin_heading_tolerance": math.radians(3.0),
+            "spin_heading_tolerance": math.radians(5.0),
+            "spin_heading_correction_gain": 0.65,
+            "spin_heading_max_correction": math.radians(20.0),
+            "spin_heading_min_improvement": math.radians(1.0),
             "spin_settle_sec": 1.0,
             "spin_settle_timeout_sec": 5.0,
-            "spin_heading_max_corrections": 1,
+            "spin_heading_max_corrections": 2,
             "pose_jump_distance": 0.40,
             "pose_jump_angle": math.radians(25.0),
             "external_move_distance": 0.25,
@@ -889,7 +907,9 @@ class LocalizationManager(Node):
         self.spin_waiting_for_stop = False
         self.spin_restoring_heading = False
         self.spin_heading_corrections = 0
+        self.spin_previous_heading_error = None
         self.spin_failure_reason = None
+        self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
         self.stationary_odom_anchor = self.last_odom_pose
         self.stationary_amcl_anchor = self.latest_pose
@@ -923,7 +943,9 @@ class LocalizationManager(Node):
         self.spin_waiting_for_stop = False
         self.spin_restoring_heading = False
         self.spin_heading_corrections = 0
+        self.spin_previous_heading_error = None
         self.spin_failure_reason = None
+        self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
         self.recovery_step = "cancel_wait"
         self.recovery_step_started = time.monotonic()
@@ -994,7 +1016,9 @@ class LocalizationManager(Node):
         )
         self.spin_restoring_heading = False
         self.spin_heading_corrections = 0
+        self.spin_previous_heading_error = None
         self.spin_failure_reason = None
+        self.spin_pending_failure_reason = None
         self.spin_sequence = [
             self.small_spin_angle,
             -2.0 * self.small_spin_angle,
@@ -1034,7 +1058,9 @@ class LocalizationManager(Node):
             )
             self.spin_restoring_heading = False
             self.spin_heading_corrections = 0
+            self.spin_previous_heading_error = None
             self.spin_failure_reason = None
+            self.spin_pending_failure_reason = None
             self.spin_sequence = [self.full_spin_angle]
             self.get_logger().warning("開始碰撞檢查的 360 度低速定位自旋")
             self._send_next_spin()
@@ -1066,6 +1092,23 @@ class LocalizationManager(Node):
         goal = Spin.Goal()
         goal.target_yaw = float(self.spin_sequence.pop(0))
         goal.time_allowance = Duration(sec=self.spin_time_allowance)
+        self.spin_goal_target = goal.target_yaw
+        self.spin_goal_started_at = time.monotonic()
+        odom_yaw = (
+            "unknown"
+            if self.last_odom_pose is None
+            else f"{math.degrees(self.last_odom_pose[2]):+.1f} deg"
+        )
+        amcl_yaw = (
+            "unknown"
+            if self.latest_pose is None
+            else f"{math.degrees(self.latest_pose[2]):+.1f} deg"
+        )
+        self.get_logger().info(
+            "送出定位 Spin："
+            f"target={math.degrees(goal.target_yaw):+.1f} deg, "
+            f"odom_yaw={odom_yaw}, amcl_yaw={amcl_yaw}"
+        )
         self.spin_in_progress = True
         future = self.spin_client.send_goal_async(goal)
         future.add_done_callback(self._spin_goal_response)
@@ -1091,10 +1134,26 @@ class LocalizationManager(Node):
         except Exception as exc:  # ROS middleware exception must stop autonomous motion
             self._require_manual(f"Spin 執行失敗：{exc}")
             return
+        elapsed = max(0.0, time.monotonic() - self.spin_goal_started_at)
+        current_error = self._heading_restore_command(tolerance=0.0)
+        error_text = (
+            "unknown"
+            if current_error is None
+            else f"{math.degrees(current_error):+.1f} deg"
+        )
+        self.get_logger().info(
+            "定位 Spin 結果："
+            f"target={math.degrees(self.spin_goal_target):+.1f} deg, "
+            f"status={result.status}, elapsed={elapsed:.1f}s, "
+            f"heading_error={error_text}"
+        )
         if result.status != GoalStatus.STATUS_SUCCEEDED:
-            self._handle_spin_failure(
+            self.spin_pending_failure_reason = (
                 f"Spin 未安全完成（action status={result.status}）"
             )
+            self.spin_waiting_for_stop = True
+            self.spin_settle_started = time.monotonic()
+            self.recovery_step = "spin_failure_settle"
             return
         self.spin_waiting_for_stop = True
         self.spin_settle_started = time.monotonic()
@@ -1114,40 +1173,70 @@ class LocalizationManager(Node):
             and stopped_for >= self.spin_settle
         ):
             self.spin_waiting_for_stop = False
+            if self.spin_pending_failure_reason:
+                reason = self.spin_pending_failure_reason
+                self.spin_pending_failure_reason = None
+                self._handle_spin_failure(reason)
+                return
             self._send_next_spin()
             return
         if elapsed >= self.spin_settle_timeout:
             self._require_manual("Spin 完成後底盤速度未在期限內歸零")
 
-    def _heading_restore_command(self):
+    def _heading_restore_command(self, *, tolerance=None):
         if self.recovery_start_yaw is None or self.last_odom_pose is None:
             return None
         return heading_correction(
             self.recovery_start_yaw,
             self.last_odom_pose[2],
-            self.spin_heading_tolerance,
+            self.spin_heading_tolerance if tolerance is None else tolerance,
         )
+
+    def _queue_heading_correction(self, correction, message_prefix):
+        if not heading_error_is_improving(
+            self.spin_previous_heading_error,
+            correction,
+            self.spin_heading_min_improvement,
+        ):
+            previous = self.spin_previous_heading_error
+            self.get_logger().warning(
+                "停止定位回正以避免反向振盪："
+                f"previous={math.degrees(previous):+.1f} deg, "
+                f"current={math.degrees(correction):+.1f} deg"
+            )
+            return False
+        if self.spin_heading_corrections >= self.spin_heading_max_corrections:
+            self.get_logger().warning(
+                "定位掃描回正已達修正次數上限；"
+                f"仍殘留 {math.degrees(correction):+.1f} deg"
+            )
+            return False
+
+        command = damped_heading_command(
+            correction,
+            self.spin_heading_correction_gain,
+            self.spin_heading_max_correction,
+        )
+        self.spin_previous_heading_error = correction
+        self.spin_heading_corrections += 1
+        self.spin_restoring_heading = True
+        self.recovery_step = "restore_heading"
+        self.spin_sequence = [command]
+        self.get_logger().warning(
+            f"{message_prefix}：residual={math.degrees(correction):+.1f} deg, "
+            f"command={math.degrees(command):+.1f} deg "
+            f"({self.spin_heading_corrections}/"
+            f"{self.spin_heading_max_corrections})"
+        )
+        self._send_next_spin()
+        return True
 
     def _complete_spin_sequence(self):
         correction = self._heading_restore_command()
         if correction is not None and correction != 0.0:
-            if self.spin_heading_corrections >= self.spin_heading_max_corrections:
-                self.get_logger().warning(
-                    "定位掃描回正已達修正次數上限；"
-                    f"仍殘留 {math.degrees(correction):+.1f} deg"
-                )
-            else:
-                self.spin_heading_corrections += 1
-                self.spin_restoring_heading = True
-                self.recovery_step = "restore_heading"
-                self.spin_sequence = [correction]
-                self.get_logger().warning(
-                    "定位掃描完成後回正 "
-                    f"{math.degrees(correction):+.1f} deg "
-                    f"({self.spin_heading_corrections}/"
-                    f"{self.spin_heading_max_corrections})"
-                )
-                self._send_next_spin()
+            if self._queue_heading_correction(
+                correction, "定位掃描完成後衰減回正"
+            ):
                 return
 
         self.spin_restoring_heading = False
@@ -1180,19 +1269,22 @@ class LocalizationManager(Node):
             self._finish_failed_small_spin()
             return
 
-        self.spin_restoring_heading = True
-        self.recovery_step = "restore_heading"
-        self.spin_sequence = [correction]
-        self.get_logger().warning(
-            f"{reason}；先嘗試回到掃描前方向 {math.degrees(correction):+.1f} deg"
-        )
-        self._send_next_spin()
+        if self._queue_heading_correction(
+            correction, f"{reason}；先衰減回到掃描前方向"
+        ):
+            return
+        self._finish_failed_small_spin()
 
     def _finish_failed_small_spin(self):
         reason = self.spin_failure_reason or "定位掃描未安全完成"
         self.spin_failure_reason = None
         if self.state == "RECOVERING_GLOBAL":
-            self._require_manual(f"{reason}；全域旋轉失敗但已嘗試回正")
+            self._request_nomotion_update()
+            self.recovery_step = "post_global"
+            self.recovery_step_started = time.monotonic()
+            self.get_logger().warning(
+                f"{reason}；底盤已停止，先用現有雷達與 AMCL 資料驗證定位"
+            )
             return
         self._request_nomotion_update()
         self.recovery_step = "post_failed_small"
@@ -1207,7 +1299,9 @@ class LocalizationManager(Node):
         self.spin_waiting_for_stop = False
         self.spin_restoring_heading = False
         self.spin_heading_corrections = 0
+        self.spin_previous_heading_error = None
         self.spin_failure_reason = None
+        self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
         self.recovery_step = None
         self._cancel_navigation()

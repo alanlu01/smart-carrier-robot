@@ -57,6 +57,12 @@ ros2 launch smart_carrier_api api_bridge.launch.py
 
 The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, `sensor_ok`, and `enabled`. The measured bus voltage is the shared 3S vehicle supply and is diagnostic only; slot presence is determined from current using hysteresis and six-sample confirmation. Canonical states are `empty`, `low` (charging), `full`, `unknown`, and `disabled`. Charging percentage cannot be inferred from input current, so `charge` is `null` while charging, `0` when empty, and `100` when full. Borrow and return tasks are completed only after the assigned slot confirms the physical removal or insertion; the user is warned after 30 seconds and the task fails after 60 seconds.
 
+At startup and after repeated I²C failures, `power_monitor` verifies the TI and
+INA3221 identification registers while probing addresses `0x40`–`0x43`. It keeps
+publishing `unknown` with `sensor_ok: false` while the module is unavailable and
+automatically resumes sampling when the sensor responds again. A module that is
+electrically latched or unpowered still requires its wiring or power to be fixed.
+
 ## Secrets
 
 Runtime credentials are deliberately excluded. Keep `SMART_CARRIER_API_URL`, `SMART_CARRIER_ROBOT_ID`, and `SMART_CARRIER_ROBOT_TOKEN` in `~/.config/smart-carrier/robot.env` with mode `0600`; never commit that file or the GitHub deploy key.

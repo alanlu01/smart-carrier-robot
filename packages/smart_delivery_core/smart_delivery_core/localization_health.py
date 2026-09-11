@@ -85,6 +85,28 @@ def heading_correction(reference_yaw, current_yaw, tolerance=0.0):
     return 0.0 if abs(correction) <= float(tolerance) else correction
 
 
+def damped_heading_command(error, gain=0.65, maximum=math.radians(20.0)):
+    """Scale and bound a heading correction to reduce small-angle overshoot."""
+    if not 0.0 < gain <= 1.0:
+        raise ValueError("heading correction gain must be in (0, 1]")
+    if maximum <= 0.0:
+        raise ValueError("maximum heading correction must be positive")
+    error = normalize_angle(error)
+    command = error * gain
+    return math.copysign(min(abs(command), maximum), command)
+
+
+def heading_error_is_improving(previous_error, current_error, minimum_improvement=0.0):
+    """Reject a correction loop that reverses direction or stops converging."""
+    if previous_error is None:
+        return True
+    if minimum_improvement < 0.0:
+        raise ValueError("minimum heading improvement must not be negative")
+    if previous_error * current_error < 0.0:
+        return False
+    return abs(current_error) <= abs(previous_error) - minimum_improvement
+
+
 def map_match_status(score, age, minimum_score, critical_score, maximum_age):
     """Classify a scan-to-map score using freshness and hysteresis thresholds."""
     if score is None or age < 0.0 or age > maximum_age:

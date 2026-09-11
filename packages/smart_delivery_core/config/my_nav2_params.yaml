@@ -83,12 +83,16 @@ localization_manager:
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
     spin_time_allowance_sec: 35
-    spin_heading_tolerance: 0.052360
+    # 5 度內不追逐小誤差；實車的小角度 Spin 會因靜摩擦與煞停延遲過衝。
+    spin_heading_tolerance: 0.087266
+    spin_heading_correction_gain: 0.65
+    spin_heading_max_correction: 0.349066
+    spin_heading_min_improvement: 0.017453
     # Nav2 Spin may finish before velocity_smoother's deceleration tail reaches
     # zero. Wait for the real chassis command to settle before measuring yaw.
     spin_settle_sec: 1.0
     spin_settle_timeout_sec: 5.0
-    spin_heading_max_corrections: 1
+    spin_heading_max_corrections: 2
     automatic_motion_recovery: true
 
     # Low-cost scan-to-map check. Very close returns are omitted from this score
@@ -426,9 +430,10 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    # Keep localization and BT spins slow enough for the smoothed chassis
-    # command to stop without the 14-18 degree overshoot seen in real tests.
-    max_rotational_vel: 0.35
+    # 0.35 rad/s caused the real chassis to miss a 360-degree goal's 35 s limit.
+    # Restore the previously calibrated sweep speed; fine heading restoration is
+    # damped separately by localization_manager.
+    max_rotational_vel: 1.0
     min_rotational_vel: 0.1 #0.4
     rotational_acc_lim: 3.2
 

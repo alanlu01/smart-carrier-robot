@@ -2,7 +2,9 @@ import math
 from types import SimpleNamespace
 
 from smart_delivery_core.localization_health import (
+    damped_heading_command,
     heading_correction,
+    heading_error_is_improving,
     map_match_status,
     normalize_angle,
     occupancy_match_score,
@@ -54,6 +56,30 @@ def test_heading_correction_returns_to_reference_across_angle_wrap():
     correction = heading_correction(-math.pi + 0.05, math.pi - 0.05)
     assert math.isclose(correction, 0.1)
     assert heading_correction(0.0, math.radians(2.0), math.radians(3.0)) == 0.0
+
+
+def test_damped_heading_command_scales_and_caps_correction():
+    assert math.isclose(
+        damped_heading_command(math.radians(10.0), 0.65, math.radians(20.0)),
+        math.radians(6.5),
+    )
+    assert math.isclose(
+        damped_heading_command(math.radians(-40.0), 0.65, math.radians(20.0)),
+        math.radians(-20.0),
+    )
+
+
+def test_heading_error_improvement_rejects_sign_flip_and_stall():
+    assert heading_error_is_improving(None, math.radians(10.0), math.radians(1.0))
+    assert heading_error_is_improving(
+        math.radians(10.0), math.radians(7.0), math.radians(1.0)
+    )
+    assert not heading_error_is_improving(
+        math.radians(10.0), math.radians(-4.0), math.radians(1.0)
+    )
+    assert not heading_error_is_improving(
+        math.radians(10.0), math.radians(9.5), math.radians(1.0)
+    )
 
 
 def test_stationary_anchor_detects_cumulative_pose_drift():

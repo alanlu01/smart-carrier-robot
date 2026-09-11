@@ -2,6 +2,12 @@ ina3221_node:
   ros__parameters:
     i2c_bus: 1
     i2c_address: 64
+    # A0 接點或上電時序異常時，依晶片識別碼自動探測 INA3221。
+    auto_detect_i2c_address: true
+    i2c_probe_addresses: [64, 65, 66, 67]
+    i2c_reprobe_interval_sec: 2.0
+    i2c_reprobe_after_failures: 2
+    i2c_error_log_period_sec: 5.0
     current_lsb: 0.0004
     bus_voltage_lsb: 0.008
     window_size: 6
