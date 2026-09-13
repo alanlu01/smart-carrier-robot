@@ -6,11 +6,14 @@ scan_to_scan_filter_chain:
       name: self_mask_box
       type: laser_filters/LaserScanBoxFilter
       params:
-        box_frame: "laser"  
+        # 以 base_footprint 表達車體遮罩，避免雷達反裝 180 度造成前後左右顛倒。
+        # 雷達中心位於車體 (0.15, -0.025)；由雷達向車前 5 cm、
+        # 車後 35 cm、左 15 cm、右 10 cm，換算後如下。
+        box_frame: "base_footprint"
         invert: false
-        min_x: -0.35
+        min_x: -0.20
         max_x: 0.20
-        min_y: -0.10
-        max_y: 0.15
+        min_y: -0.125
+        max_y: 0.125
         min_z: -0.50
         max_z: 0.50
