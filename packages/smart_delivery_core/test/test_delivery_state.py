@@ -4,6 +4,7 @@ from smart_delivery_core.delivery_state import (
     SlotActionVerifier,
     interrupted_localization_order,
     localization_ready_for_resume,
+    navigation_was_interrupted_by_localization,
 )
 
 
@@ -41,6 +42,13 @@ def test_localization_resume_requires_continuous_ready_grace():
     assert localization_ready_for_resume(True, 10.0, 13.0, 3.0)
     assert not localization_ready_for_resume(False, 10.0, 20.0, 3.0)
     assert not localization_ready_for_resume(True, None, 20.0, 3.0)
+
+
+def test_cancelled_navigation_detects_localization_callback_race():
+    assert navigation_was_interrupted_by_localization(True, False, 4, 4)
+    assert navigation_was_interrupted_by_localization(True, True, 5, 4)
+    assert not navigation_was_interrupted_by_localization(True, True, 4, 4)
+    assert not navigation_was_interrupted_by_localization(False, False, 5, 4)
 
 
 def test_interrupted_order_is_resumed_before_route_reordering():

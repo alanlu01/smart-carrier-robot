@@ -182,6 +182,8 @@ class LocalizationManager(Node):
         self.state_reason = "node started"
         self.ready = False
         self.latest_scan_at = 0.0
+        self.latest_odom_at = 0.0
+        self.latest_cmd_at = 0.0
         self.latest_pose = None
         self.latest_quality = None
         self.last_amcl_at = 0.0
@@ -224,6 +226,7 @@ class LocalizationManager(Node):
         self.latest_map_near_fraction = 0.0
         self.latest_map_sector_count = 0
         self.latest_scan_stamp_age = None
+        self.latest_scan_stamp_ns = 0
         self.map_match_tf_failures = 0
         self.last_map_match_error = ""
         self.last_diagnostic_log_at = 0.0
@@ -231,6 +234,7 @@ class LocalizationManager(Node):
         self.last_map_match_check_at = 0.0
         self.last_nomotion_request_at = 0.0
         self.global_grace_announced = False
+        self.recovery_diagnostics = {}
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -369,6 +373,7 @@ class LocalizationManager(Node):
     def _publish_state(self):
         now = time.monotonic()
         message = String()
+        freshness = self._freshness_snapshot(now)
         payload = {
             "state": self.state,
             "ready": self.ready,
@@ -376,7 +381,7 @@ class LocalizationManager(Node):
             "scan_age_sec": (
                 None if not self.latest_scan_at else now - self.latest_scan_at
             ),
-            "scan_stamp_age_sec": self.latest_scan_stamp_age,
+            "scan_stamp_age_sec": freshness["scan_stamp_age_sec"],
             "map_match_age_sec": (
                 None if not self.latest_map_score_at else now - self.latest_map_score_at
             ),
@@ -385,6 +390,9 @@ class LocalizationManager(Node):
             "map_match_sector_count": self.latest_map_sector_count,
             "map_match_tf_failures": self.map_match_tf_failures,
             "recovery_step": self.recovery_step,
+            "amcl_pose_age_sec": freshness["amcl_pose_age_sec"],
+            "odom_age_sec": freshness["odom_age_sec"],
+            "cmd_vel_age_sec": freshness["cmd_vel_age_sec"],
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -401,8 +409,90 @@ class LocalizationManager(Node):
             payload["map_match_raw_score"] = round(self.latest_map_score_raw, 4)
         if self.last_map_match_error:
             payload["map_match_error"] = self.last_map_match_error
+        if self.state != "LOCALIZED" and self.recovery_diagnostics:
+            payload["recovery_diagnostics"] = self.recovery_diagnostics
         message.data = json.dumps(payload, ensure_ascii=False)
         self.state_publisher.publish(message)
+
+    @staticmethod
+    def _age_since(timestamp, now):
+        if timestamp <= 0.0:
+            return None
+        return max(0.0, now - timestamp)
+
+    def _freshness_snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+
+        def rounded_age(timestamp):
+            age = self._age_since(timestamp, now)
+            return None if age is None else round(age, 3)
+
+        scan_stamp_age = None
+        if self.latest_scan_stamp_ns > 0:
+            scan_stamp_age = max(
+                0.0,
+                (
+                    self.get_clock().now().nanoseconds
+                    - self.latest_scan_stamp_ns
+                )
+                / 1_000_000_000.0,
+            )
+
+        return {
+            "scan_receive_age_sec": rounded_age(self.latest_scan_at),
+            "scan_stamp_age_sec": (
+                None if scan_stamp_age is None else round(scan_stamp_age, 3)
+            ),
+            "amcl_pose_age_sec": rounded_age(self.last_amcl_at),
+            "odom_age_sec": rounded_age(self.latest_odom_at),
+            "cmd_vel_age_sec": rounded_age(self.latest_cmd_at),
+            "map_match_age_sec": rounded_age(self.latest_map_score_at),
+            "map_match_score": (
+                None
+                if self.latest_map_score is None
+                else round(self.latest_map_score, 3)
+            ),
+            "map_match_raw_score": (
+                None
+                if self.latest_map_score_raw is None
+                else round(self.latest_map_score_raw, 3)
+            ),
+            "xy_std": (
+                None
+                if self.latest_quality is None
+                else round(self.latest_quality.xy_std, 3)
+            ),
+            "yaw_std_deg": (
+                None
+                if self.latest_quality is None
+                else round(math.degrees(self.latest_quality.yaw_std), 2)
+            ),
+            "map_match_tf_failures": self.map_match_tf_failures,
+            "commanded_motion": self.commanded_motion,
+            "odom_motion": self.odom_motion,
+        }
+
+    def _diagnostic_snapshot_text(self, snapshot):
+        def age(name):
+            value = snapshot.get(name)
+            return "unknown" if value is None else f"{value:.3f}s"
+
+        score = snapshot.get("map_match_score")
+        score_text = "unknown" if score is None else f"{score:.3f}"
+        xy_std = snapshot.get("xy_std")
+        xy_text = "unknown" if xy_std is None else f"{xy_std:.3f}m"
+        yaw_std = snapshot.get("yaw_std_deg")
+        yaw_text = "unknown" if yaw_std is None else f"{yaw_std:.2f}deg"
+        return (
+            f"scan_rx={age('scan_receive_age_sec')}, "
+            f"scan_stamp={age('scan_stamp_age_sec')}, "
+            f"amcl={age('amcl_pose_age_sec')}, "
+            f"odom={age('odom_age_sec')}, cmd={age('cmd_vel_age_sec')}, "
+            f"score={score_text}, xy_std={xy_text}, yaw_std={yaw_text}, "
+            f"tf_failures={snapshot['map_match_tf_failures']}, "
+            f"commanded_motion={snapshot['commanded_motion']}, "
+            f"odom_motion={snapshot['odom_motion']}"
+        )
 
     def _scan_callback(self, message):
         self.latest_scan_at = time.monotonic()
@@ -410,6 +500,7 @@ class LocalizationManager(Node):
         stamp_ns = int(message.header.stamp.sec) * 1_000_000_000 + int(
             message.header.stamp.nanosec
         )
+        self.latest_scan_stamp_ns = stamp_ns
         if stamp_ns > 0:
             self.latest_scan_stamp_age = (
                 self.get_clock().now().nanoseconds - stamp_ns
@@ -467,6 +558,7 @@ class LocalizationManager(Node):
 
     def _cmd_vel_callback(self, message):
         now = time.monotonic()
+        self.latest_cmd_at = now
         self.commanded_motion = (
             math.hypot(float(message.linear.x), float(message.linear.y)) > 0.02
             or abs(float(message.angular.z)) > 0.03
@@ -481,6 +573,7 @@ class LocalizationManager(Node):
 
     def _odom_callback(self, message):
         now = time.monotonic()
+        self.latest_odom_at = now
         pose = message.pose.pose
         current = (
             float(pose.position.x),
@@ -600,7 +693,11 @@ class LocalizationManager(Node):
         now = time.monotonic()
         if not self._scan_is_fresh(now):
             if self.state == "LOCALIZED":
-                self._begin_recovery("雷達資料逾時")
+                scan_age = self._age_since(self.latest_scan_at, now)
+                age_text = "unknown" if scan_age is None else f"{scan_age:.2f}s"
+                self._begin_recovery(
+                    f"雷達資料逾時（age={age_text} > {self.scan_timeout:.2f}s）"
+                )
             elif self.state == "UNINITIALIZED":
                 self._set_state("WAITING_FOR_SENSORS", "等待 /scan_filtered")
             self._publish_state()
@@ -656,7 +753,10 @@ class LocalizationManager(Node):
             ):
                 self._request_nomotion_update()
             if amcl_pose_age > self.amcl_pose_timeout:
-                self._begin_recovery("AMCL 位姿資料逾時")
+                self._begin_recovery(
+                    "AMCL 位姿資料逾時"
+                    f"（age={amcl_pose_age:.2f}s > {self.amcl_pose_timeout:.2f}s）"
+                )
                 return
             match_status = self._map_match_status(now)
             if match_status == "unknown":
@@ -931,6 +1031,13 @@ class LocalizationManager(Node):
     def _begin_recovery(self, reason):
         if self.state in {"RECOVERING_LOCAL", "RECOVERING_GLOBAL", "MANUAL_REQUIRED"}:
             return
+        now = time.monotonic()
+        self.recovery_diagnostics = self._freshness_snapshot(now)
+        self.get_logger().warning(
+            "定位觸發快照："
+            f"reason={reason}; "
+            f"{self._diagnostic_snapshot_text(self.recovery_diagnostics)}"
+        )
         self._cancel_navigation()
         self.stable_samples = 0
         self._reset_map_match_history()
@@ -948,7 +1055,7 @@ class LocalizationManager(Node):
         self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
         self.recovery_step = "cancel_wait"
-        self.recovery_step_started = time.monotonic()
+        self.recovery_step_started = now
         self._set_state("RECOVERING_LOCAL", reason)
 
     def _request_nomotion_update(self):

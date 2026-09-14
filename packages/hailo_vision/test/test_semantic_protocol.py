@@ -9,6 +9,7 @@ from hailo_vision.semantic_protocol import (
     semantic_data_age,
     semantic_health_state,
     semantic_safety_multiplier,
+    scan_sync_safety_multiplier,
     stamps_are_synchronized,
 )
 
@@ -50,6 +51,12 @@ def test_semantic_health_hysteresis_prevents_soft_timeout_flapping():
     assert semantic_health_state(0.60, 'stale', 0.8, 0.4, 2.0) == 'stale'
     assert semantic_health_state(0.39, 'stale', 0.8, 0.4, 2.0) == 'healthy'
     assert semantic_health_state(2.01, 'healthy', 0.8, 0.4, 2.0) == 'stopped'
+
+
+def test_scan_sync_miss_requires_continuous_grace_before_slowing():
+    assert scan_sync_safety_multiplier(1.0, 0.59, 0.6, 0.5) == 1.0
+    assert scan_sync_safety_multiplier(1.0, 0.6, 0.6, 0.5) == 0.5
+    assert scan_sync_safety_multiplier(0.0, 2.0, 0.6, 0.5) == 0.0
 
 
 def test_semantic_source_and_scan_stamp_skew():

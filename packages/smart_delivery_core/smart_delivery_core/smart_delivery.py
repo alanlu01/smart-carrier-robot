@@ -21,6 +21,7 @@ from smart_delivery_core.delivery_state import (
     SlotActionVerifier,
     interrupted_localization_order,
     localization_ready_for_resume,
+    navigation_was_interrupted_by_localization,
 )
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 
@@ -428,6 +429,7 @@ def main():
     localization_state = "UNINITIALIZED"
     localization_state_received = False
     localization_ready_received = False
+    localization_interrupt_generation = 0
     localization_wait_started_at = time.monotonic()
     last_localization_warning_at = 0.0
     is_standby = False
@@ -435,6 +437,7 @@ def main():
     def localization_ready_callback(message):
         nonlocal localization_ready, localization_ready_received
         nonlocal localization_ready_since, is_standby
+        nonlocal localization_interrupt_generation
         was_ready = localization_ready
         localization_ready = bool(message.data)
         localization_ready_received = True
@@ -443,6 +446,7 @@ def main():
         elif not localization_ready:
             localization_ready_since = None
         if was_ready is True and not localization_ready:
+            localization_interrupt_generation += 1
             # A remembered arrival is no longer trustworthy after AMCL loses
             # localization or an external move is detected.
             is_standby = False
@@ -1013,6 +1017,7 @@ def main():
         goal_pose.pose.position.y = float(target["y"])
         goal_pose.pose.orientation = yaw_to_quaternion(target["yaw"])
         set_navigation_active(True)
+        navigation_localization_generation = localization_interrupt_generation
         navigator.goToPose(goal_pose)
         active_task_id = target.get("task_id")
         cancel_sent = False
@@ -1033,8 +1038,42 @@ def main():
 
         set_navigation_active(False)
         nav_result = navigator.getResult()
+        if (
+            nav_result == TaskResult.CANCELED
+            and active_task_id not in cancellation_requests
+            and localization_ready is True
+            and localization_interrupt_generation
+            == navigation_localization_generation
+        ):
+            # Nav2 can receive localization_manager's cancel before this executor
+            # receives /localization/ready=false. Briefly drain callbacks so the
+            # cancel is not misreported as an ordinary terminal navigation failure.
+            observation_deadline = time.monotonic() + 0.5
+            while time.monotonic() < observation_deadline:
+                rclpy.spin_once(navigator, timeout_sec=0.05)
+                if (
+                    localization_ready is False
+                    or localization_interrupt_generation
+                    > navigation_localization_generation
+                ):
+                    break
+        localization_aborted = localization_aborted or (
+            navigation_was_interrupted_by_localization(
+                nav_result == TaskResult.CANCELED,
+                localization_ready,
+                localization_interrupt_generation,
+                navigation_localization_generation,
+            )
+        )
         keep_pending = False
-        if localization_aborted:
+        if active_task_id in cancellation_requests:
+            queue_result(
+                target,
+                fsm,
+                "cancelled",
+                cancellation_requests.pop(active_task_id),
+            )
+        elif localization_aborted:
             fsm.transition("waiting_localization")
             target["_resume_state"] = "waiting_localization"
             persist(target, fsm.state, pending_result)
@@ -1045,13 +1084,6 @@ def main():
                 progress_message="Localization recovery in progress; task retained",
             )
             keep_pending = True
-        elif active_task_id in cancellation_requests:
-            queue_result(
-                target,
-                fsm,
-                "cancelled",
-                cancellation_requests.pop(active_task_id),
-            )
         elif nav_result != TaskResult.SUCCEEDED:
             note = (
                 "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else "Nav2 goal failed"

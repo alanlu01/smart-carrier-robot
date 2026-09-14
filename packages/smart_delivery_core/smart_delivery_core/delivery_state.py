@@ -73,6 +73,21 @@ def localization_ready_for_resume(ready, ready_since, now, delay_seconds):
     return float(now) - float(ready_since) >= max(0.0, float(delay_seconds))
 
 
+def navigation_was_interrupted_by_localization(
+    navigation_cancelled,
+    localization_ready,
+    interruption_generation,
+    navigation_generation,
+):
+    """Recognize a localization-initiated Nav2 cancel despite callback ordering."""
+    if not navigation_cancelled:
+        return False
+    return (
+        localization_ready is False
+        or int(interruption_generation) > int(navigation_generation)
+    )
+
+
 def interrupted_localization_order(orders):
     """Return the exact order interrupted by localization before route reordering."""
     return next(

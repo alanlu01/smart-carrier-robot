@@ -37,7 +37,12 @@ def generate_launch_description():
         Node(
             package='hailo_vision',
             executable='fusion_node',
-            name='fusion_node'
+            name='fusion_node',
+            parameters=[{
+                # Ignore isolated camera/LiDAR timestamp misses. Persistent sync
+                # loss remains fail-safe at half speed.
+                'semantic_scan_miss_grace_sec': 0.60,
+            }]
         ),
 
         # 4. 啟動 INA3221 電源監控節點

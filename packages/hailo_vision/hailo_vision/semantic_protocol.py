@@ -92,6 +92,20 @@ def semantic_health_state(
     return "healthy"
 
 
+def scan_sync_safety_multiplier(
+    current_multiplier,
+    unmatched_age_sec,
+    grace_sec,
+    fallback_multiplier,
+):
+    """Debounce isolated camera/LiDAR sync misses before limiting speed."""
+    current_multiplier = max(0.0, min(1.0, float(current_multiplier)))
+    fallback_multiplier = max(0.0, min(1.0, float(fallback_multiplier)))
+    if max(0.0, float(unmatched_age_sec)) < max(0.0, float(grace_sec)):
+        return current_multiplier
+    return min(current_multiplier, fallback_multiplier)
+
+
 def semantic_data_age(receipt_age_sec, source_stamp_ns=None, now_ns=None):
     """Return the older age from transport receipt and the source image stamp."""
     receipt_age_sec = max(0.0, float(receipt_age_sec))

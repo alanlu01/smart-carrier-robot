@@ -14,6 +14,7 @@ from std_msgs.msg import Float32, Header, String
 from hailo_vision.semantic_protocol import (
     closest_timestamped_item,
     parse_semantic_payload,
+    scan_sync_safety_multiplier,
     semantic_data_age,
     semantic_health_state,
 )
@@ -30,6 +31,7 @@ class SensorFusionNode(Node):
         self.semantic_health_state = 'starting'
         self.last_semantic_error_at = 0.0
         self.last_sync_warning_at = 0.0
+        self.scan_unmatched_since = None
         self.scan_history = deque()
         self.last_person_limit_at = None
         self.held_person_multiplier = 1.0
@@ -42,6 +44,7 @@ class SensorFusionNode(Node):
         self.declare_parameter('semantic_stale_speed_multiplier', 0.50)
         self.declare_parameter('semantic_hard_stop_timeout_sec', 2.00)
         self.declare_parameter('semantic_scan_history_sec', 1.00)
+        self.declare_parameter('semantic_scan_miss_grace_sec', 0.60)
         self.declare_parameter('person_clear_hold_sec', 0.50)
         self.semantic_timeout_sec = float(
             self.get_parameter('semantic_timeout_sec').value
@@ -61,6 +64,9 @@ class SensorFusionNode(Node):
         self.semantic_scan_history_sec = float(
             self.get_parameter('semantic_scan_history_sec').value
         )
+        self.semantic_scan_miss_grace_sec = float(
+            self.get_parameter('semantic_scan_miss_grace_sec').value
+        )
         self.person_clear_hold_sec = float(
             self.get_parameter('person_clear_hold_sec').value
         )
@@ -78,6 +84,8 @@ class SensorFusionNode(Node):
             raise ValueError('語意逾時速度乘數必須介於 0 到 1')
         if self.semantic_scan_history_sec <= self.semantic_max_sync_skew_sec:
             raise ValueError('雷達歷史長度必須大於語意與雷達最大時間差')
+        if self.semantic_scan_miss_grace_sec < 0:
+            raise ValueError('語意與雷達同步缺漏寬限不得小於 0')
         if self.person_clear_hold_sec < 0:
             raise ValueError('人員減速保持時間不得小於 0')
         
@@ -125,16 +133,31 @@ class SensorFusionNode(Node):
             matching_scan = self._matching_scan(packet.stamp_ns)
             if matching_scan is None:
                 now = time.monotonic()
-                if now - self.last_sync_warning_at >= 10.0:
+                if self.scan_unmatched_since is None:
+                    self.scan_unmatched_since = now
+                unmatched_age = now - self.scan_unmatched_since
+                next_multiplier = scan_sync_safety_multiplier(
+                    self.speed_multiplier,
+                    unmatched_age,
+                    self.semantic_scan_miss_grace_sec,
+                    self.semantic_stale_speed_multiplier,
+                )
+                if (
+                    unmatched_age >= self.semantic_scan_miss_grace_sec
+                    and now - self.last_sync_warning_at >= 10.0
+                ):
                     self.get_logger().warning(
-                        '找不到與語意影像同步的歷史雷達，本幀採保守半速'
+                        '語意影像與雷達持續無法同步 '
+                        f'{unmatched_age:.2f}s，採保守半速'
                     )
                     self.last_sync_warning_at = now
-                self._set_speed_multiplier(
-                    min(self.speed_multiplier, self.semantic_stale_speed_multiplier),
-                    reason='scan_unmatched',
-                )
+                if next_multiplier < self.speed_multiplier:
+                    self._set_speed_multiplier(
+                        next_multiplier,
+                        reason='scan_unmatched_persistent',
+                    )
                 return
+            self.scan_unmatched_since = None
             self._process_semantic_data(packet.detections, matching_scan)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             now = time.monotonic()
