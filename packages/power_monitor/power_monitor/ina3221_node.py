@@ -9,7 +9,6 @@ from std_msgs.msg import String
 
 from power_monitor.power_status import SlotStateTracker, build_slot
 
-
 INA3221_MANUFACTURER_ID = 0x5449
 INA3221_DIE_ID = 0x3220
 
@@ -158,6 +157,7 @@ class INA3221Node(Node):
         self.last_i2c_error_log_at = 0.0
         self.last_i2c_probe_at = 0.0
         self.i2c_failure_cycles = 0
+        self.last_i2c_recovery_log_at = 0.0
         self._probe_sensor(force=True)
         self.timer = self.create_timer(sample_period, self.timer_callback)
         self.get_logger().info("INA3221 電源監控與行充狀態節點已啟動")
@@ -256,21 +256,49 @@ class INA3221Node(Node):
             return None
         return decode_bus_voltage(raw_value, self.bus_voltage_lsb)
 
+    def _read_cycle(self):
+        """Read one atomic three-channel sample, discarding partial cycles."""
+        samples = []
+        registers = ((0x01, 0x02), (0x03, 0x04), (0x05, 0x06))
+        for shunt_register, bus_register in registers:
+            current_sample = self.read_raw_current(shunt_register)
+            voltage_sample = self.read_bus_voltage(bus_register)
+            if current_sample is None or voltage_sample is None:
+                return None
+            samples.append((current_sample, voltage_sample))
+        return samples
+
+    def _retry_failed_cycle(self):
+        """Reopen, identify, and retry once before exposing an I2C glitch."""
+        if not self._probe_sensor(force=True):
+            return None
+        samples = self._read_cycle()
+        if samples is not None:
+            now = time.monotonic()
+            if now - self.last_i2c_recovery_log_at >= self.i2c_error_log_period:
+                self.get_logger().warning(
+                    "INA3221 短暫讀取失敗，重新開啟 I2C 後已於同一週期恢復"
+                )
+                self.last_i2c_recovery_log_at = now
+        return samples
+
     def timer_callback(self):
         if self.i2c_address is None:
             self._probe_sensor()
 
+        samples = self._read_cycle()
+        first_error = self.last_i2c_error
+        if samples is None:
+            samples = self._retry_failed_cycle()
+
         channels = {}
-        cycle_failed = False
-        registers = ((0x01, 0x02), (0x03, 0x04), (0x05, 0x06))
-        for index, (shunt_register, bus_register) in enumerate(registers):
+        cycle_failed = samples is None
+        for index in range(3):
             current_history = self.current_histories[index]
             voltage_history = self.voltage_histories[index]
-            current_sample = self.read_raw_current(shunt_register)
-            voltage_sample = self.read_bus_voltage(bus_register)
-            sensor_ok = current_sample is not None and voltage_sample is not None
-            cycle_failed = cycle_failed or not sensor_ok
+            sensor_ok = samples is not None
             if sensor_ok:
+                current_sample, voltage_sample = samples[index]
                 current_history.append(current_sample)
                 voltage_history.append(voltage_sample)
 
@@ -314,11 +342,10 @@ class INA3221Node(Node):
             self._log_i2c_error(
                 "INA3221 I2C 讀取失敗："
                 f"bus={self.i2c_bus}, address={address}, "
-                f"error={self.last_i2c_error or 'unknown'}"
+                f"error={self.last_i2c_error or first_error or 'unknown'}"
             )
             if self.i2c_failure_cycles >= self.i2c_reprobe_after_failures:
                 self.i2c_address = None
-                self._probe_sensor()
         else:
             self.i2c_failure_cycles = 0
 

@@ -43,6 +43,21 @@ def test_claim_task_accepts_no_content():
     assert json.loads(request.data) == {"slots": slots}
 
 
+def test_claim_task_sends_idempotency_key():
+    response = MagicMock()
+    response.status = 204
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    client = SmartCarrierApi("https://api.example.test", "R1", "secret-token")
+
+    with patch("smart_carrier_api.api_client.urlopen", return_value=response) as mocked:
+        client.claim_task([], "85af9ce7-6b7d-4a3d-8afb-155334a0aa4f")
+
+    assert json.loads(mocked.call_args.args[0].data)["claim_request_id"] == (
+        "85af9ce7-6b7d-4a3d-8afb-155334a0aa4f"
+    )
+
+
 def test_release_task_sends_note_to_owned_task_endpoint():
     response = MagicMock()
     response.status = 200

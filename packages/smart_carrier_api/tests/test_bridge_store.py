@@ -42,12 +42,17 @@ def test_outbox_is_idempotent_and_uses_bounded_backoff(tmp_path):
     store.close()
 
 
-def test_pending_progress_keeps_only_latest_value(tmp_path):
+def test_pending_progress_preserves_each_event_in_order(tmp_path):
     store = BridgeStore(tmp_path / "bridge.sqlite3")
-    store.set_pending_progress({"task_id": "task-1", "progress_state": "navigating"})
-    store.set_pending_progress({"task_id": "task-1", "progress_state": "arrived"})
-    assert store.get_pending_progress()["progress_state"] == "arrived"
-    assert store.get_pending_progress("task-1")["progress_state"] == "arrived"
+    store.enqueue_progress(
+        {"event_id": "p-1", "task_id": "task-1", "progress_state": "wrong_slot"}
+    )
+    store.enqueue_progress(
+        {"event_id": "p-2", "task_id": "task-1", "progress_state": "verifying_action"}
+    )
+    assert store.get_pending_progress()["progress_state"] == "wrong_slot"
+    store.mark_progress_delivered("p-1")
+    assert store.get_pending_progress("task-1")["progress_state"] == "verifying_action"
     assert store.get_pending_progress("missing") is None
     store.set_pending_progress(None)
     assert store.get_pending_progress() is None
@@ -58,8 +63,12 @@ def test_claimed_queue_and_progress_for_multiple_tasks_survive_restart(tmp_path)
     path = tmp_path / "bridge.sqlite3"
     store = BridgeStore(path)
     store.set_claimed_tasks([{"id": "task-1"}, {"id": "task-2"}])
-    store.set_pending_progress({"task_id": "task-1", "progress_state": "navigating"})
-    store.set_pending_progress({"task_id": "task-2", "progress_state": "queued_on_robot"})
+    store.enqueue_progress(
+        {"event_id": "p-1", "task_id": "task-1", "progress_state": "navigating"}
+    )
+    store.enqueue_progress(
+        {"event_id": "p-2", "task_id": "task-2", "progress_state": "queued_on_robot"}
+    )
     store.close()
 
     recovered = BridgeStore(path)
@@ -69,4 +78,17 @@ def test_claimed_queue_and_progress_for_multiple_tasks_survive_restart(tmp_path)
     assert recovered.get_pending_progress()["task_id"] == "task-2"
     recovered.remove_claimed_task("task-1")
     assert [task["id"] for task in recovered.get_claimed_tasks()] == ["task-2"]
+    recovered.close()
+
+
+def test_pending_claim_survives_restart(tmp_path):
+    path = tmp_path / "bridge.sqlite3"
+    store = BridgeStore(path)
+    store.set_pending_claim({"claim_request_id": "request-1", "slots": []})
+    store.close()
+
+    recovered = BridgeStore(path)
+    assert recovered.get_pending_claim()["claim_request_id"] == "request-1"
+    recovered.set_pending_claim(None)
+    assert recovered.get_pending_claim() is None
     recovered.close()

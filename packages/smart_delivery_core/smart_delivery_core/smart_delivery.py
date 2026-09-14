@@ -410,30 +410,39 @@ def main():
     navigator.declare_parameter(
         "localization_resume_delay_sec", LOCALIZATION_RESUME_DELAY_SECONDS
     )
+    navigator.declare_parameter("localization_startup_grace_sec", 2.0)
     warning_seconds = float(navigator.get_parameter("slot_confirmation_warning_sec").value)
     timeout_seconds = float(navigator.get_parameter("slot_confirmation_timeout_sec").value)
     confirmation_samples = int(navigator.get_parameter("slot_confirmation_samples").value)
     localization_resume_delay = float(
         navigator.get_parameter("localization_resume_delay_sec").value
     )
+    localization_startup_grace = max(
+        0.0, float(navigator.get_parameter("localization_startup_grace_sec").value)
+    )
     if not 0 < warning_seconds < timeout_seconds or confirmation_samples < 1:
         raise ValueError("槽位確認須符合 0 < warning < timeout，且樣本數大於 0")
 
-    localization_ready = False
+    localization_ready = None
     localization_ready_since = None
     localization_state = "UNINITIALIZED"
+    localization_state_received = False
+    localization_ready_received = False
+    localization_wait_started_at = time.monotonic()
     last_localization_warning_at = 0.0
     is_standby = False
 
     def localization_ready_callback(message):
-        nonlocal localization_ready, localization_ready_since, is_standby
+        nonlocal localization_ready, localization_ready_received
+        nonlocal localization_ready_since, is_standby
         was_ready = localization_ready
         localization_ready = bool(message.data)
-        if localization_ready and not was_ready:
+        localization_ready_received = True
+        if localization_ready and was_ready is not True:
             localization_ready_since = time.monotonic()
         elif not localization_ready:
             localization_ready_since = None
-        if was_ready and not localization_ready:
+        if was_ready is True and not localization_ready:
             # A remembered arrival is no longer trustworthy after AMCL loses
             # localization or an external move is detected.
             is_standby = False
@@ -443,18 +452,20 @@ def main():
 
     def localization_can_resume():
         return localization_ready_for_resume(
-            localization_ready,
+            localization_ready is True,
             localization_ready_since,
             time.monotonic(),
             localization_resume_delay,
         )
 
     def localization_state_callback(message):
-        nonlocal localization_state
+        nonlocal localization_state, localization_state_received
         try:
             localization_state = json.loads(message.data).get("state", "UNKNOWN")
+            localization_state_received = True
         except (AttributeError, TypeError, json.JSONDecodeError):
             localization_state = "UNKNOWN"
+            localization_state_received = True
 
     navigator.create_subscription(
         Bool, "/localization/ready", localization_ready_callback, STATE_QOS
@@ -863,7 +874,7 @@ def main():
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
-                    lambda: localization_ready,
+                    lambda: localization_ready is True,
                     set_navigation_active,
                 )
                 if standby_pos is not None:
@@ -890,9 +901,17 @@ def main():
 
         if not localization_can_resume():
             now = time.monotonic()
+            if (
+                (not localization_state_received or not localization_ready_received)
+                and now - localization_wait_started_at < localization_startup_grace
+            ):
+                continue
             if now - last_localization_warning_at >= 10.0:
-                wait_reason = localization_state
-                if localization_ready:
+                if not localization_state_received or not localization_ready_received:
+                    wait_reason = "尚未收到定位狀態"
+                else:
+                    wait_reason = localization_state
+                if localization_ready is True:
                     wait_reason = "STABILIZING_BEFORE_RESUME"
                 navigator.get_logger().warning(
                     f"定位暫停（{wait_reason}），保留訂單並等待恢復"
@@ -907,7 +926,7 @@ def main():
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
-                    lambda: localization_ready,
+                    lambda: localization_ready is True,
                     set_navigation_active,
                 )
                 if standby_pos is not None:
@@ -1004,7 +1023,7 @@ def main():
             if active_task_id in cancellation_requests and not cancel_sent:
                 navigator.cancelTask()
                 cancel_sent = True
-            elif not localization_ready and not cancel_sent:
+            elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
                     f"定位進入 {localization_state}，取消導航並保留任務等待重送"
                 )

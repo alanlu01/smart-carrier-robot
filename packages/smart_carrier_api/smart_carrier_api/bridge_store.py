@@ -47,7 +47,18 @@ class BridgeStore:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS progress_outbox (
+                event_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
         self.connection.commit()
+        self._migrate_legacy_progress()
 
     def close(self) -> None:
         self.connection.close()
@@ -96,6 +107,13 @@ class BridgeStore:
             [task for task in self.get_claimed_tasks() if str(task.get("id")) != str(task_id)]
         )
 
+    def set_pending_claim(self, claim: dict[str, Any] | None) -> None:
+        self._set_json("pending_claim", claim)
+
+    def get_pending_claim(self) -> dict[str, Any] | None:
+        claim = self._get_json("pending_claim")
+        return claim if isinstance(claim, dict) else None
+
     def _get_pending_progresses(self) -> dict[str, dict[str, Any]]:
         progresses = self._get_json("pending_progresses")
         if isinstance(progresses, dict):
@@ -115,24 +133,73 @@ class BridgeStore:
 
     def set_pending_progress(self, progress: dict[str, Any] | None) -> None:
         if progress is None:
-            self._set_json("pending_progresses", None)
-            self._set_json("pending_progress", None)
+            self.connection.execute("DELETE FROM progress_outbox")
+            self.connection.commit()
             return
-        task_id = str(progress["task_id"])
-        progresses = self._get_pending_progresses()
-        progresses[task_id] = progress
-        self._set_json("pending_progresses", progresses)
+        self.enqueue_progress(progress)
 
     def get_pending_progress(self, task_id: str | None = None) -> dict[str, Any] | None:
-        progresses = self._get_pending_progresses()
-        if task_id is not None:
-            return progresses.get(str(task_id))
-        return next(iter(progresses.values()), None)
+        return self.next_progress(task_id)
 
     def clear_pending_progress(self, task_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM progress_outbox WHERE task_id = ?", (str(task_id),)
+        )
+        self.connection.commit()
+
+    def _migrate_legacy_progress(self) -> None:
         progresses = self._get_pending_progresses()
-        progresses.pop(str(task_id), None)
-        self._set_json("pending_progresses", progresses if progresses else None)
+        for progress in progresses.values():
+            if progress.get("event_id") and progress.get("task_id"):
+                self.enqueue_progress(progress)
+        self._set_json("pending_progresses", None)
+        self._set_json("pending_progress", None)
+
+    def enqueue_progress(self, progress: dict[str, Any]) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO progress_outbox(event_id, task_id, payload, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(progress["event_id"]),
+                str(progress["task_id"]),
+                json.dumps(progress, ensure_ascii=False),
+                time.time(),
+            ),
+        )
+        self.connection.commit()
+
+    def next_progress(self, task_id: str | None = None) -> dict[str, Any] | None:
+        if task_id is None:
+            row = self.connection.execute(
+                "SELECT payload FROM progress_outbox ORDER BY created_at, rowid LIMIT 1"
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                """
+                SELECT payload FROM progress_outbox
+                WHERE task_id = ? ORDER BY created_at, rowid LIMIT 1
+                """,
+                (str(task_id),),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def mark_progress_delivered(self, event_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM progress_outbox WHERE event_id = ?", (str(event_id),)
+        )
+        self.connection.commit()
+
+    def has_pending_progress(self, task_id: str | None = None) -> bool:
+        if task_id is None:
+            row = self.connection.execute("SELECT 1 FROM progress_outbox LIMIT 1").fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT 1 FROM progress_outbox WHERE task_id = ? LIMIT 1",
+                (str(task_id),),
+            ).fetchone()
+        return row is not None
 
     def enqueue_result(self, result: dict[str, Any]) -> None:
         self.connection.execute(
