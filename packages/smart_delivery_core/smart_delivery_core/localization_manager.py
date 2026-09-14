@@ -26,6 +26,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.localization_health import (
+    amcl_timeout_requires_recovery,
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
@@ -36,6 +37,7 @@ from smart_delivery_core.localization_health import (
     pose_quality,
     quaternion_to_yaw,
     select_scan_samples,
+    sensor_timeout_requires_recovery,
     smoothed_map_score,
     should_extend_global_recovery,
     suspect_requires_recovery,
@@ -68,8 +70,14 @@ class LocalizationManager(Node):
         self.auto_initialize = bool(self.get_parameter("auto_initialize").value)
         self.motion_cmd_topic = str(self.get_parameter("motion_cmd_topic").value)
         self.scan_timeout = float(self.get_parameter("scan_timeout_sec").value)
+        self.scan_timeout_grace = float(
+            self.get_parameter("scan_timeout_grace_sec").value
+        )
         self.amcl_pose_timeout = float(
             self.get_parameter("amcl_pose_timeout_sec").value
+        )
+        self.amcl_stationary_grace = float(
+            self.get_parameter("amcl_stationary_grace_sec").value
         )
         self.amcl_nomotion_refresh = float(
             self.get_parameter("amcl_nomotion_refresh_sec").value
@@ -299,8 +307,10 @@ class LocalizationManager(Node):
             "auto_initialize": True,
             "motion_cmd_topic": "/chassis_cmd_vel",
             "scan_timeout_sec": 2.0,
+            "scan_timeout_grace_sec": 1.0,
             "amcl_pose_timeout_sec": 8.0,
-            "amcl_nomotion_refresh_sec": 1.0,
+            "amcl_stationary_grace_sec": 2.0,
+            "amcl_nomotion_refresh_sec": 3.0,
             "verify_timeout_sec": 15.0,
             "stable_samples": 6,
             "healthy_xy_std": 0.20,
@@ -694,10 +704,14 @@ class LocalizationManager(Node):
         if not self._scan_is_fresh(now):
             if self.state == "LOCALIZED":
                 scan_age = self._age_since(self.latest_scan_at, now)
-                age_text = "unknown" if scan_age is None else f"{scan_age:.2f}s"
-                self._begin_recovery(
-                    f"雷達資料逾時（age={age_text} > {self.scan_timeout:.2f}s）"
-                )
+                if sensor_timeout_requires_recovery(
+                    scan_age, self.scan_timeout, self.scan_timeout_grace
+                ):
+                    age_text = "unknown" if scan_age is None else f"{scan_age:.2f}s"
+                    recovery_limit = self.scan_timeout + self.scan_timeout_grace
+                    self._begin_recovery(
+                        f"雷達資料逾時（age={age_text} > {recovery_limit:.2f}s）"
+                    )
             elif self.state == "UNINITIALIZED":
                 self._set_state("WAITING_FOR_SENSORS", "等待 /scan_filtered")
             self._publish_state()
@@ -746,16 +760,26 @@ class LocalizationManager(Node):
                 self._begin_recovery("AMCL 位姿資料逾時")
                 return
             amcl_pose_age = now - self.last_amcl_at
+            odom_is_fresh = (
+                self.latest_odom_at > 0.0 and now - self.latest_odom_at <= 1.0
+            )
+            odom_is_moving = not odom_is_fresh or self.odom_motion
             if (
-                not self.commanded_motion
+                not odom_is_moving
                 and amcl_pose_age >= self.amcl_nomotion_refresh
                 and now - self.last_nomotion_request_at >= self.amcl_nomotion_refresh
             ):
                 self._request_nomotion_update()
-            if amcl_pose_age > self.amcl_pose_timeout:
+            if amcl_timeout_requires_recovery(
+                amcl_pose_age,
+                self.amcl_pose_timeout,
+                odom_is_moving,
+                self.amcl_stationary_grace,
+            ):
                 self._begin_recovery(
                     "AMCL 位姿資料逾時"
-                    f"（age={amcl_pose_age:.2f}s > {self.amcl_pose_timeout:.2f}s）"
+                    f"（age={amcl_pose_age:.2f}s > "
+                    f"{self.amcl_pose_timeout:.2f}s）"
                 )
                 return
             match_status = self._map_match_status(now)

@@ -366,6 +366,7 @@ def go_to_standby(
     current_pos,
     localization_is_ready=lambda: True,
     set_navigation_active=lambda _active: None,
+    new_task_waiting=lambda: False,
 ):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
@@ -387,6 +388,13 @@ def go_to_standby(
     while not navigator.isTaskComplete():
         time.sleep(0.1)  # 釋放 CPU
         rclpy.spin_once(navigator, timeout_sec=0.05)
+        if new_task_waiting():
+            navigator.cancelTask()
+            navigator.get_logger().info("收到新任務，已中斷待機點導航")
+            while not navigator.isTaskComplete():
+                rclpy.spin_once(navigator, timeout_sec=0.05)
+            set_navigation_active(False)
+            return None
         if not localization_is_ready():
             navigator.cancelTask()
             navigator.get_logger().warning("定位可信度不足，已取消前往待機點")
@@ -873,13 +881,14 @@ def main():
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
-            if localization_can_resume() and not is_standby:
+            if localization_can_resume() and not is_standby and not pending_orders:
                 current_pos = refresh_current_position(current_pos)
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
                     lambda: localization_ready is True,
                     set_navigation_active,
+                    lambda: bool(pending_orders),
                 )
                 if standby_pos is not None:
                     current_pos = standby_pos
@@ -932,6 +941,7 @@ def main():
                     current_pos,
                     lambda: localization_ready is True,
                     set_navigation_active,
+                    lambda: bool(pending_orders),
                 )
                 if standby_pos is not None:
                     current_pos = standby_pos

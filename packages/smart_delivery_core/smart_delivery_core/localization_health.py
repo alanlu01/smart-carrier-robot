@@ -118,6 +118,26 @@ def map_match_status(score, age, minimum_score, critical_score, maximum_age):
     return "healthy"
 
 
+def sensor_timeout_requires_recovery(age, timeout, grace=0.0):
+    """Return whether a receive gap exceeded both its limit and debounce grace."""
+    if age is None:
+        return True
+    return float(age) > float(timeout) + max(0.0, float(grace))
+
+
+def amcl_timeout_requires_recovery(age, timeout, odom_moving, stationary_grace=0.0):
+    """Allow one no-motion refresh window when odometry says the robot is still."""
+    if age is None:
+        return True
+    age = float(age)
+    timeout = float(timeout)
+    if age <= timeout:
+        return False
+    if odom_moving:
+        return True
+    return age > timeout + max(0.0, float(stationary_grace))
+
+
 def update_stability_samples(qualified, sample_at, last_sample_at, sample_count):
     """Count each fresh qualified sample once and reset on an unhealthy sample."""
     sample_at = float(sample_at)

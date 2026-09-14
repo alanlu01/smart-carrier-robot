@@ -55,8 +55,13 @@ localization_manager:
 
     # Conservative first-pass thresholds; tune from logs at the real start pose.
     scan_timeout_sec: 2.0
+    # Ignore a single short scheduling/network-style scan gap before recovery.
+    scan_timeout_grace_sec: 1.0
     amcl_pose_timeout_sec: 8.0
-    amcl_nomotion_refresh_sec: 1.0
+    # When odometry confirms the base is still, ask AMCL to publish once more
+    # before escalating a stale pose into a full localization recovery.
+    amcl_stationary_grace_sec: 2.0
+    amcl_nomotion_refresh_sec: 3.0
     verify_timeout_sec: 25.0
     stable_samples: 6
     healthy_xy_std: 0.25

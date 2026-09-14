@@ -23,6 +23,20 @@ def _borrow_candidate_key(slot: dict[str, Any]) -> tuple[int, float, int]:
     return priority, effective_charge, int(slot["slot"])
 
 
+def _canonical_slot_for_bank(bank_id: Any) -> int | None:
+    """Map the robot's slot-backed PB-01..PB-03 identifiers to a slot number."""
+    if bank_id is None:
+        return None
+    normalized = str(bank_id).strip().upper()
+    if not normalized.startswith("PB-"):
+        return None
+    try:
+        slot_number = int(normalized.removeprefix("PB-"))
+    except ValueError:
+        return None
+    return slot_number if slot_number in {1, 2, 3} else None
+
+
 def apply_claim_to_slots(slots: list[dict[str, Any]], task: dict[str, Any]) -> list[dict[str, Any]]:
     """Reserve the inventory change a claimed task will eventually make."""
 
@@ -58,6 +72,18 @@ def apply_claim_to_slots(slots: list[dict[str, Any]], task: dict[str, Any]) -> l
                 continue
             candidates.append(slot)
         if not candidates:
+            # PB-01..PB-03 are slot identities on this robot, not RFID-backed
+            # physical-bank identities.  If that exact healthy slot is already
+            # empty, the claimed borrow has reached the physical state being
+            # projected; applying the same reservation again would be a false
+            # conflict while its result is still being acknowledged.
+            requested_slot = _canonical_slot_for_bank(requested_bank)
+            if requested_slot is not None and any(
+                int(slot["slot"]) == requested_slot
+                and str(slot.get("status") or "").lower() == "empty"
+                for slot in healthy
+            ):
+                return projected
             raise ClaimProjectionError("claimed borrow task has no reservable power bank")
         selected = min(candidates, key=_borrow_candidate_key)
         selected.update(status="empty", bank_id=None, charge=0)

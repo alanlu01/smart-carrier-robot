@@ -57,6 +57,26 @@ def test_third_borrow_cannot_reuse_an_already_reserved_power_bank():
         )
 
 
+def test_completed_slot_backed_borrow_is_not_reserved_twice():
+    current = slots()
+    current[0].update(status="empty", bank_id=None, charge=0)
+
+    projected = project_claimed_slots(
+        current,
+        [{"id": "task-1", "task_type": "borrow", "power_bank_id": "PB-01"}],
+    )
+
+    assert projected == current
+
+
+def test_missing_non_slot_bank_remains_a_projection_error():
+    with pytest.raises(ClaimProjectionError, match="no reservable power bank"):
+        project_claimed_slots(
+            slots(),
+            [{"id": "task-1", "task_type": "borrow", "power_bank_id": "RFID-9"}],
+        )
+
+
 def test_borrow_can_create_capacity_for_a_later_return():
     occupied = slots()
     occupied[2].update(bank_id="PB-03", status="low", charge=None, sensor_ok=True, enabled=True)

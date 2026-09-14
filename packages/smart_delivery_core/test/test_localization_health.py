@@ -2,6 +2,7 @@ import math
 from types import SimpleNamespace
 
 from smart_delivery_core.localization_health import (
+    amcl_timeout_requires_recovery,
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
@@ -13,6 +14,7 @@ from smart_delivery_core.localization_health import (
     pose_quality,
     quaternion_to_yaw,
     select_scan_samples,
+    sensor_timeout_requires_recovery,
     should_extend_global_recovery,
     smoothed_map_score,
     suspect_requires_recovery,
@@ -104,6 +106,17 @@ def test_map_match_status_keeps_degraded_scores_out_of_healthy_state():
 def test_map_match_status_rejects_missing_or_stale_scores():
     assert map_match_status(None, 0.0, 0.35, 0.20, 2.0) == "unknown"
     assert map_match_status(0.95, 2.1, 0.35, 0.20, 2.0) == "unknown"
+
+
+def test_scan_timeout_debounces_one_short_receive_gap():
+    assert not sensor_timeout_requires_recovery(2.1, 2.0, 1.0)
+    assert sensor_timeout_requires_recovery(3.01, 2.0, 1.0)
+
+
+def test_amcl_timeout_allows_stationary_nomotion_refresh_grace():
+    assert not amcl_timeout_requires_recovery(8.1, 8.0, False, 2.0)
+    assert amcl_timeout_requires_recovery(10.01, 8.0, False, 2.0)
+    assert amcl_timeout_requires_recovery(8.1, 8.0, True, 2.0)
 
 
 def test_stability_samples_only_count_each_timestamp_once():
