@@ -10,6 +10,11 @@ from typing import Any
 RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 30.0)
 
 
+def is_terminal_result_error(result_status: str, status_code: int | None) -> bool:
+    """Return whether retrying a terminal result can no longer change cloud state."""
+    return status_code == 404 or (result_status == "released" and status_code == 409)
+
+
 class BridgeStore:
     """Durable claimed-task queue, progress buffer, and terminal-result outbox."""
 
@@ -54,6 +59,15 @@ class BridgeStore:
                 task_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 created_at REAL NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settled_results (
+                event_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                settled_at REAL NOT NULL
             )
             """
         )
@@ -201,12 +215,16 @@ class BridgeStore:
             ).fetchone()
         return row is not None
 
-    def enqueue_result(self, result: dict[str, Any]) -> None:
-        self.connection.execute(
+    def enqueue_result(self, result: dict[str, Any]) -> bool:
+        cursor = self.connection.execute(
             """
             INSERT OR IGNORE INTO result_outbox(
                 event_id, task_id, status, note, attempts, next_attempt_at, created_at
-            ) VALUES (?, ?, ?, ?, 0, 0, ?)
+            )
+            SELECT ?, ?, ?, ?, 0, 0, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM settled_results WHERE event_id = ?
+            )
             """,
             (
                 str(result["event_id"]),
@@ -214,9 +232,11 @@ class BridgeStore:
                 str(result["status"]),
                 result.get("note"),
                 time.time(),
+                str(result["event_id"]),
             ),
         )
         self.connection.commit()
+        return cursor.rowcount > 0
 
     def next_result(self, now: float | None = None) -> dict[str, Any] | None:
         now = time.time() if now is None else now
@@ -250,6 +270,67 @@ class BridgeStore:
     def mark_delivered(self, event_id: str) -> None:
         self.connection.execute("DELETE FROM result_outbox WHERE event_id = ?", (event_id,))
         self.connection.commit()
+
+    def settle_result(self, event_id: str, task_id: str) -> None:
+        """Atomically retire a result and all local state owned by its task."""
+        event_id = str(event_id)
+        task_id = str(task_id)
+        claimed_tasks = [
+            task
+            for task in self.get_claimed_tasks()
+            if str(task.get("id")) != task_id
+        ]
+        active_task = self.get_active_task()
+
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO settled_results(event_id, task_id, settled_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    settled_at = excluded.settled_at
+                """,
+                (event_id, task_id, time.time()),
+            )
+            self.connection.execute(
+                "DELETE FROM result_outbox WHERE event_id = ?", (event_id,)
+            )
+            self.connection.execute(
+                "DELETE FROM progress_outbox WHERE task_id = ?", (task_id,)
+            )
+            if claimed_tasks:
+                self.connection.execute(
+                    """
+                    INSERT INTO state(key, value) VALUES('claimed_tasks', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (json.dumps(claimed_tasks, ensure_ascii=False),),
+                )
+            else:
+                self.connection.execute("DELETE FROM state WHERE key = 'claimed_tasks'")
+            if isinstance(active_task, dict) and str(
+                active_task.get("id") or active_task.get("task_id")
+            ) == task_id:
+                self.connection.execute("DELETE FROM state WHERE key = 'active_task'")
+
+            # Keep the idempotency ledger bounded while retaining ample restart history.
+            self.connection.execute(
+                """
+                DELETE FROM settled_results
+                WHERE event_id NOT IN (
+                    SELECT event_id FROM settled_results
+                    ORDER BY settled_at DESC LIMIT 256
+                )
+                """
+            )
+
+    def is_result_settled(self, event_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM settled_results WHERE event_id = ? LIMIT 1",
+            (str(event_id),),
+        ).fetchone()
+        return row is not None
 
     def has_pending_results(self) -> bool:
         row = self.connection.execute("SELECT 1 FROM result_outbox LIMIT 1").fetchone()

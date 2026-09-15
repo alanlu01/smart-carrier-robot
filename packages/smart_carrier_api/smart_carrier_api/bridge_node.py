@@ -11,7 +11,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from smart_carrier_api.api_client import ApiError, SmartCarrierApi
-from smart_carrier_api.bridge_store import BridgeStore
+from smart_carrier_api.bridge_store import BridgeStore, is_terminal_result_error
 from smart_carrier_api.claim_queue import ClaimProjectionError, project_claimed_slots
 
 STATE_QOS = QoSProfile(
@@ -315,6 +315,21 @@ class ApiBridgeNode(Node):
                 },
             )
             return
+        if kind == "result":
+            item = context["result"]
+            if is_terminal_result_error(item["status"], error.status_code):
+                # A result response may be lost after the backend commits it, or
+                # an administrator may force-finalize the task while the robot is
+                # offline. In both cases the task is no longer assigned and
+                # retrying can never succeed. Settle the durable local copy and
+                # ACK the delivery journal so new claims are not blocked forever.
+                self.network_online = True
+                self._ack_result(item, terminally_reconciled=True)
+                self.get_logger().warning(
+                    "雲端任務已非執行中，安全結清本機結果："
+                    f"{item['task_id']} ({item['event_id']})"
+                )
+                return
         self.network_online = False
         self.heartbeat_confirmed = False
         if kind == "result":
@@ -334,15 +349,29 @@ class ApiBridgeNode(Node):
             raise ApiError("API task reconciliation returned a non-list response")
         added = 0
         known = self.task_ids()
+        remote_ids = set()
         for task in remote_tasks:
             if not isinstance(task, dict) or not task.get("id"):
                 raise ApiError("API task reconciliation returned an invalid task")
             task_id = str(task["id"])
+            remote_ids.add(task_id)
             if task_id not in known:
                 self.claimed_tasks.append(task)
                 known.add(task_id)
                 self.publish_order(task)
                 added += 1
+        for task_id in sorted(known - remote_ids):
+            # Successful reconciliation is authoritative: a locally retained
+            # task missing from this active-task list has already become terminal
+            # in the backend. Keep it until the delivery node acknowledges the
+            # cancellation, but stop treating it as silently active.
+            self._handle_task_status(
+                task_id,
+                {
+                    "status": "cancelled",
+                    "cancel_reason": "Task is no longer active in backend reconciliation",
+                },
+            )
         if added:
             self.store.set_claimed_tasks(self.claimed_tasks)
             self.get_logger().warning(f"雲端對帳復原 {added} 筆本機遺失任務")
@@ -413,25 +442,30 @@ class ApiBridgeNode(Node):
                 raise ValueError(f"不支援的任務結果狀態：{status}")
             if task_id not in self.task_ids():
                 self.get_logger().warning(f"保存非目前 claimed queue 任務結果：{task_id}")
-            self.store.enqueue_result(result)
-            self.get_logger().info(
-                f"任務結果已保存至本機 outbox，等待雲端確認：{task_id} ({event_id})"
-            )
+            if self.store.enqueue_result(result):
+                self.get_logger().info(
+                    f"任務結果已保存至本機 outbox，等待雲端確認：{task_id} ({event_id})"
+                )
+            elif self.store.is_result_settled(event_id):
+                # TRANSIENT_LOCAL can replay several copies after bridge restart.
+                # Re-ACK them without recreating an already settled outbox row.
+                ack = String()
+                ack.data = json.dumps({"event_id": event_id, "task_id": task_id})
+                self.result_ack_publisher.publish(ack)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"忽略無效任務結果：{exc}")
 
-    def _ack_result(self, item):
+    def _ack_result(self, item, *, terminally_reconciled=False):
+        self.store.settle_result(item["event_id"], item["task_id"])
+        self.claimed_tasks = self.store.get_claimed_tasks()
         ack = String()
         ack.data = json.dumps({"event_id": item["event_id"], "task_id": item["task_id"]})
         self.result_ack_publisher.publish(ack)
-        self.store.mark_delivered(item["event_id"])
-        self.store.remove_claimed_task(item["task_id"])
-        self.claimed_tasks = self.store.get_claimed_tasks()
-        self.store.clear_pending_progress(item["task_id"])
         self.last_order_publish_at.pop(item["task_id"], None)
         self.last_cancel_publish_at.pop(item["task_id"], None)
         self.next_task_poll_at.pop(item["task_id"], None)
-        self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
+        if not terminally_reconciled:
+            self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
 
     def log_api_error(self, error):
         now = time.monotonic()
