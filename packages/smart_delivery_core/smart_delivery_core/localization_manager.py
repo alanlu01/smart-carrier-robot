@@ -41,7 +41,14 @@ from smart_delivery_core.localization_health import (
     smoothed_map_score,
     should_extend_global_recovery,
     suspect_requires_recovery,
+    transient_sensor_recovery_qualified,
     update_stability_samples,
+)
+from smart_delivery_core.localization_persistence import (
+    load_cache,
+    read_boot_id,
+    select_same_boot_pose,
+    write_cache,
 )
 
 
@@ -68,6 +75,20 @@ class LocalizationManager(Node):
         self.initial_y = float(self.get_parameter("initial_pose.y").value)
         self.initial_yaw = float(self.get_parameter("initial_pose.yaw").value)
         self.auto_initialize = bool(self.get_parameter("auto_initialize").value)
+        self.reuse_same_boot_pose = bool(
+            self.get_parameter("reuse_same_boot_pose").value
+        )
+        self.pose_cache_path = str(self.get_parameter("pose_cache_path").value)
+        self.pose_cache_max_age = float(
+            self.get_parameter("pose_cache_max_age_sec").value
+        )
+        self.pose_cache_write_period = max(
+            1.0, float(self.get_parameter("pose_cache_write_period_sec").value)
+        )
+        self.boot_id = read_boot_id()
+        self.initial_pose_source = "fixed_power_on"
+        self.same_boot_pose_untrusted = False
+        self._configure_startup_pose()
         self.motion_cmd_topic = str(self.get_parameter("motion_cmd_topic").value)
         self.scan_timeout = float(self.get_parameter("scan_timeout_sec").value)
         self.scan_timeout_grace = float(
@@ -82,8 +103,15 @@ class LocalizationManager(Node):
         self.amcl_nomotion_refresh = float(
             self.get_parameter("amcl_nomotion_refresh_sec").value
         )
+        self.odom_timeout = float(self.get_parameter("odom_timeout_sec").value)
         self.verify_timeout = float(self.get_parameter("verify_timeout_sec").value)
         self.stable_samples_required = int(self.get_parameter("stable_samples").value)
+        self.transient_recovery_samples_required = max(
+            1, int(self.get_parameter("transient_recovery_samples").value)
+        )
+        self.transient_recovery_max = max(
+            1.0, float(self.get_parameter("transient_recovery_max_sec").value)
+        )
         self.healthy_xy_std = float(self.get_parameter("healthy_xy_std").value)
         self.healthy_yaw_std = float(self.get_parameter("healthy_yaw_std").value)
         self.critical_xy_std = float(self.get_parameter("critical_xy_std").value)
@@ -243,6 +271,9 @@ class LocalizationManager(Node):
         self.last_nomotion_request_at = 0.0
         self.global_grace_announced = False
         self.recovery_diagnostics = {}
+        self.transient_recovery_eligible = False
+        self.transient_recovery_started_at = 0.0
+        self.last_pose_cache_write_at = 0.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -292,10 +323,20 @@ class LocalizationManager(Node):
         self.timer = self.create_timer(0.2, self._tick)
         self._publish_state()
         self.get_logger().info(
-            "定位管理器已啟動；固定初始位置為 "
+            "定位管理器已啟動；初始位置為 "
             f"({self.initial_x:.2f}, {self.initial_y:.2f}, {self.initial_yaw:.2f})；"
+            f"來源={self.initial_pose_source}；"
             f"實際底盤命令監看 {self.motion_cmd_topic}"
         )
+        if self.startup_cache_error:
+            self.get_logger().warning(
+                f"無法建立定位開機標記，重啟保護可能無法生效：{self.startup_cache_error}"
+            )
+        if self.same_boot_pose_untrusted:
+            self.get_logger().warning(
+                "偵測到同次開機內的 Nav2 重啟，但沒有近期可信位置；"
+                "不套用固定 (0,0,0)，等待人工 2D Pose Estimate"
+            )
 
     def _declare_parameters(self):
         defaults = {
@@ -305,14 +346,21 @@ class LocalizationManager(Node):
             "initial_pose.xy_std": 0.25,
             "initial_pose.yaw_std": 0.26,
             "auto_initialize": True,
+            "reuse_same_boot_pose": True,
+            "pose_cache_path": "~/.local/state/smart-carrier/localization_pose.json",
+            "pose_cache_max_age_sec": 3600.0,
+            "pose_cache_write_period_sec": 2.0,
             "motion_cmd_topic": "/chassis_cmd_vel",
             "scan_timeout_sec": 2.0,
             "scan_timeout_grace_sec": 1.0,
+            "odom_timeout_sec": 1.0,
             "amcl_pose_timeout_sec": 8.0,
             "amcl_stationary_grace_sec": 2.0,
             "amcl_nomotion_refresh_sec": 3.0,
             "verify_timeout_sec": 15.0,
             "stable_samples": 6,
+            "transient_recovery_samples": 2,
+            "transient_recovery_max_sec": 8.0,
             "healthy_xy_std": 0.20,
             "healthy_yaw_std": 0.17,
             "critical_xy_std": 0.50,
@@ -360,6 +408,56 @@ class LocalizationManager(Node):
         }
         for name, default in defaults.items():
             self.declare_parameter(name, default)
+
+    def _configure_startup_pose(self):
+        """Reuse a trusted pose only when this is a same-boot Nav2 restart."""
+        self.startup_cache_error = None
+        if not self.reuse_same_boot_pose or self.boot_id is None:
+            return
+
+        cache = load_cache(self.pose_cache_path)
+        status, pose = select_same_boot_pose(
+            cache,
+            self.boot_id,
+            max_age_sec=self.pose_cache_max_age,
+        )
+        if status == "same_boot_cached":
+            self.initial_x, self.initial_y, self.initial_yaw = pose
+            self.initial_pose_source = "same_boot_trusted_cache"
+            return
+        if status == "same_boot_untrusted":
+            self.same_boot_pose_untrusted = True
+            self.auto_initialize = False
+            self.initial_pose_source = "same_boot_manual_required"
+            return
+
+        # The first localization-manager process of a Linux boot may use the
+        # known physical power-on pose.  Writing the boot marker immediately
+        # prevents a second process in the same boot from making that assumption
+        # before any pose has become trustworthy.
+        try:
+            write_cache(self.pose_cache_path, self.boot_id)
+        except OSError as exc:
+            self.startup_cache_error = str(exc)
+
+    def _persist_trusted_pose(self, *, force=False):
+        if (
+            not self.reuse_same_boot_pose
+            or self.boot_id is None
+            or self.latest_pose is None
+        ):
+            return
+        now = time.monotonic()
+        if not force and now - self.last_pose_cache_write_at < self.pose_cache_write_period:
+            return
+        try:
+            write_cache(self.pose_cache_path, self.boot_id, self.latest_pose)
+        except (OSError, ValueError) as exc:
+            if now - self.last_pose_cache_write_at >= self.diagnostic_log_period:
+                self.get_logger().warning(f"無法保存同次開機可信位置：{exc}")
+            self.last_pose_cache_write_at = now
+            return
+        self.last_pose_cache_write_at = now
 
     def _set_state(self, state, reason):
         changed = state != self.state or reason != self.state_reason
@@ -630,6 +728,13 @@ class LocalizationManager(Node):
         self.latest_quality = quality
         self.last_amcl_at = now
 
+        if (
+            self.state == "LOCALIZED"
+            and quality.healthy
+            and self._map_match_has_recovered(now)
+        ):
+            self._persist_trusted_pose()
+
         if self.state == "LOCALIZED" and not self.commanded_motion:
             if self.stationary_amcl_anchor is None:
                 self.stationary_amcl_anchor = current
@@ -682,6 +787,16 @@ class LocalizationManager(Node):
                     self.stable_samples,
                 )
             )
+            if self.transient_recovery_eligible:
+                if now - self.transient_recovery_started_at > self.transient_recovery_max:
+                    self.transient_recovery_eligible = False
+                elif self._transient_recovery_is_qualified(now) and (
+                    self.stable_samples >= self.transient_recovery_samples_required
+                ):
+                    self._mark_localized(
+                        "短暫感測逾時後資料與定位品質已連續恢復"
+                    )
+                    return
             if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
 
@@ -699,6 +814,20 @@ class LocalizationManager(Node):
         now = time.monotonic() if now is None else now
         return self.latest_scan_at > 0.0 and now - self.latest_scan_at <= self.scan_timeout
 
+    def _transient_recovery_is_qualified(self, now):
+        return transient_sensor_recovery_qualified(
+            self.latest_quality is not None and self.latest_quality.healthy,
+            self._map_match_has_recovered(now),
+            self._age_since(self.latest_scan_at, now),
+            self.scan_timeout,
+            self._age_since(self.latest_odom_at, now),
+            self.odom_timeout,
+            self._age_since(self.last_amcl_at, now),
+            self.amcl_pose_timeout,
+            self.commanded_motion,
+            self.odom_motion,
+        )
+
     def _tick(self):
         now = time.monotonic()
         if not self._scan_is_fresh(now):
@@ -710,7 +839,8 @@ class LocalizationManager(Node):
                     age_text = "unknown" if scan_age is None else f"{scan_age:.2f}s"
                     recovery_limit = self.scan_timeout + self.scan_timeout_grace
                     self._begin_recovery(
-                        f"雷達資料逾時（age={age_text} > {recovery_limit:.2f}s）"
+                        f"雷達資料逾時（age={age_text} > {recovery_limit:.2f}s）",
+                        transient_sensor_timeout=True,
                     )
             elif self.state == "UNINITIALIZED":
                 self._set_state("WAITING_FOR_SENSORS", "等待 /scan_filtered")
@@ -728,7 +858,10 @@ class LocalizationManager(Node):
 
         if self.state in {"UNINITIALIZED", "WAITING_FOR_SENSORS"}:
             if not self.auto_initialize:
-                self._require_manual("自動初始位置已停用")
+                reason = "自動初始位置已停用"
+                if self.same_boot_pose_untrusted:
+                    reason = "同次開機重啟但沒有近期可信位置"
+                self._require_manual(reason)
                 return
             if self.map_message is None:
                 self._set_state("WAITING_FOR_SENSORS", "等待靜態地圖")
@@ -761,7 +894,8 @@ class LocalizationManager(Node):
                 return
             amcl_pose_age = now - self.last_amcl_at
             odom_is_fresh = (
-                self.latest_odom_at > 0.0 and now - self.latest_odom_at <= 1.0
+                self.latest_odom_at > 0.0
+                and now - self.latest_odom_at <= self.odom_timeout
             )
             odom_is_moving = not odom_is_fresh or self.odom_motion
             if (
@@ -779,7 +913,8 @@ class LocalizationManager(Node):
                 self._begin_recovery(
                     "AMCL 位姿資料逾時"
                     f"（age={amcl_pose_age:.2f}s > "
-                    f"{self.amcl_pose_timeout:.2f}s）"
+                    f"{self.amcl_pose_timeout:.2f}s）",
+                    transient_sensor_timeout=True,
                 )
                 return
             match_status = self._map_match_status(now)
@@ -1007,15 +1142,24 @@ class LocalizationManager(Node):
             self.last_stable_map_score_at = self.latest_map_score_at
         self.verify_reference_required = True
         if not retry:
-            self._set_state("SEEDING", "發布固定開機位置 (0,0,0)")
+            source_text = (
+                "同次開機最近可信位置"
+                if self.initial_pose_source == "same_boot_trusted_cache"
+                else "固定開機位置"
+            )
+            self._set_state(
+                "SEEDING",
+                f"發布{source_text} "
+                f"({self.initial_x:.2f},{self.initial_y:.2f},{self.initial_yaw:.2f})",
+            )
         self.initial_pose_publisher.publish(message)
         self.initial_pose_last_published = time.monotonic()
         if retry:
-            self.get_logger().warning("尚未收到 AMCL 位姿，重新發布固定初始位置")
+            self.get_logger().warning("尚未收到 AMCL 位姿，重新發布本次初始位置")
         else:
             self._set_state("VERIFYING", "等待 AMCL 收斂")
 
-    def _mark_localized(self):
+    def _mark_localized(self, reason_override=None):
         if (
             self.spin_in_progress
             or self.spin_sequence
@@ -1035,16 +1179,19 @@ class LocalizationManager(Node):
         self.spin_failure_reason = None
         self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
+        self.transient_recovery_eligible = False
+        self.transient_recovery_started_at = 0.0
         self.stationary_odom_anchor = self.last_odom_pose
         self.stationary_amcl_anchor = self.latest_pose
         quality = self.latest_quality
-        reason = "AMCL 已穩定"
+        reason = reason_override or "AMCL 已穩定"
         if quality is not None:
             reason += (
                 f"，xy_std={quality.xy_std:.3f} m，"
                 f"yaw_std={math.degrees(quality.yaw_std):.1f} deg"
             )
         self._set_state("LOCALIZED", reason)
+        self._persist_trusted_pose(force=True)
 
     def _cancel_navigation(self):
         request = CancelGoal.Request()
@@ -1052,10 +1199,21 @@ class LocalizationManager(Node):
             if client.service_is_ready():
                 client.call_async(request)
 
-    def _begin_recovery(self, reason):
+    def _begin_recovery(self, reason, *, transient_sensor_timeout=False):
         if self.state in {"RECOVERING_LOCAL", "RECOVERING_GLOBAL", "MANUAL_REQUIRED"}:
             return
         now = time.monotonic()
+        self.transient_recovery_eligible = bool(
+            transient_sensor_timeout
+            and self.latest_quality is not None
+            and self.latest_quality.healthy
+            and self._map_match_has_recovered(now)
+            and not self.commanded_motion
+            and not self.odom_motion
+        )
+        self.transient_recovery_started_at = (
+            now if self.transient_recovery_eligible else 0.0
+        )
         self.recovery_diagnostics = self._freshness_snapshot(now)
         self.get_logger().warning(
             "定位觸發快照："
@@ -1081,6 +1239,11 @@ class LocalizationManager(Node):
         self.recovery_step = "cancel_wait"
         self.recovery_step_started = now
         self._set_state("RECOVERING_LOCAL", reason)
+        if self.transient_recovery_eligible:
+            self.get_logger().warning(
+                "逾時前 AMCL 與雷達地圖品質健康；等待新的 scan/odom/AMCL "
+                "及地圖樣本一致，符合時將略過定位自旋"
+            )
 
     def _request_nomotion_update(self):
         now = time.monotonic()
@@ -1161,6 +1324,7 @@ class LocalizationManager(Node):
         self._send_next_spin()
 
     def _start_global_recovery(self):
+        self.transient_recovery_eligible = False
         if not self.global_localization_client.service_is_ready():
             self._require_manual("AMCL 全域重新定位服務未就緒")
             return
@@ -1434,6 +1598,8 @@ class LocalizationManager(Node):
         self.spin_failure_reason = None
         self.spin_pending_failure_reason = None
         self.recovery_start_yaw = None
+        self.transient_recovery_eligible = False
+        self.transient_recovery_started_at = 0.0
         self.recovery_step = None
         self._cancel_navigation()
         self._set_state("MANUAL_REQUIRED", reason)

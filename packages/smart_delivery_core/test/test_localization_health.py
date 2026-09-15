@@ -18,6 +18,7 @@ from smart_delivery_core.localization_health import (
     should_extend_global_recovery,
     smoothed_map_score,
     suspect_requires_recovery,
+    transient_sensor_recovery_qualified,
     update_stability_samples,
 )
 
@@ -111,6 +112,31 @@ def test_map_match_status_rejects_missing_or_stale_scores():
 def test_scan_timeout_debounces_one_short_receive_gap():
     assert not sensor_timeout_requires_recovery(2.1, 2.0, 1.0)
     assert sensor_timeout_requires_recovery(3.01, 2.0, 1.0)
+
+
+def test_transient_sensor_recovery_requires_all_fresh_stationary_evidence():
+    arguments = {
+        "quality_healthy": True,
+        "map_match_recovered": True,
+        "scan_age": 0.1,
+        "scan_timeout": 2.0,
+        "odom_age": 0.1,
+        "odom_timeout": 1.0,
+        "amcl_age": 0.1,
+        "amcl_timeout": 8.0,
+        "commanded_motion": False,
+        "odom_motion": False,
+    }
+    assert transient_sensor_recovery_qualified(**arguments)
+    assert not transient_sensor_recovery_qualified(
+        **{**arguments, "odom_age": 1.01}
+    )
+    assert not transient_sensor_recovery_qualified(
+        **{**arguments, "map_match_recovered": False}
+    )
+    assert not transient_sensor_recovery_qualified(
+        **{**arguments, "commanded_motion": True}
+    )
 
 
 def test_amcl_timeout_allows_stationary_nomotion_refresh_grace():

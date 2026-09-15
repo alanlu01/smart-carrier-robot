@@ -125,6 +125,33 @@ def sensor_timeout_requires_recovery(age, timeout, grace=0.0):
     return float(age) > float(timeout) + max(0.0, float(grace))
 
 
+def transient_sensor_recovery_qualified(
+    quality_healthy,
+    map_match_recovered,
+    scan_age,
+    scan_timeout,
+    odom_age,
+    odom_timeout,
+    amcl_age,
+    amcl_timeout,
+    commanded_motion,
+    odom_motion,
+):
+    """Require fresh independent evidence before clearing a transient timeout."""
+    ages = (scan_age, odom_age, amcl_age)
+    if any(age is None or float(age) < 0.0 for age in ages):
+        return False
+    return (
+        bool(quality_healthy)
+        and bool(map_match_recovered)
+        and float(scan_age) <= float(scan_timeout)
+        and float(odom_age) <= float(odom_timeout)
+        and float(amcl_age) <= float(amcl_timeout)
+        and not bool(commanded_motion)
+        and not bool(odom_motion)
+    )
+
+
 def amcl_timeout_requires_recovery(age, timeout, odom_moving, stationary_grace=0.0):
     """Allow one no-motion refresh window when odometry says the robot is still."""
     if age is None:

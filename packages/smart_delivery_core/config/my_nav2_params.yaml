@@ -49,6 +49,13 @@ localization_manager:
     initial_pose.xy_std: 0.25
     initial_pose.yaw_std: 0.26
     auto_initialize: true
+    # On a real Raspberry Pi reboot the fixed power-on pose remains authoritative.
+    # If only Nav2/localization_manager restarts in the same Linux boot, reuse the
+    # latest verified AMCL pose instead of incorrectly seeding (0,0,0) again.
+    reuse_same_boot_pose: true
+    pose_cache_path: ~/.local/state/smart-carrier/localization_pose.json
+    pose_cache_max_age_sec: 3600.0
+    pose_cache_write_period_sec: 2.0
     # Observe the command that actually reaches the serial bridge after all
     # semantic/failsafe limits, not Nav2's raw /cmd_vel request.
     motion_cmd_topic: /chassis_cmd_vel
@@ -57,6 +64,7 @@ localization_manager:
     scan_timeout_sec: 2.0
     # Ignore a single short scheduling/network-style scan gap before recovery.
     scan_timeout_grace_sec: 1.0
+    odom_timeout_sec: 1.0
     amcl_pose_timeout_sec: 8.0
     # When odometry confirms the base is still, ask AMCL to publish once more
     # before escalating a stale pose into a full localization recovery.
@@ -64,6 +72,10 @@ localization_manager:
     amcl_nomotion_refresh_sec: 3.0
     verify_timeout_sec: 25.0
     stable_samples: 6
+    # A sensor scheduling gap may recover without any spin, but only after a
+    # fresh map-match window plus two independent qualified timestamps.
+    transient_recovery_samples: 2
+    transient_recovery_max_sec: 8.0
     healthy_xy_std: 0.25
     healthy_yaw_std: 0.17
     critical_xy_std: 0.50
