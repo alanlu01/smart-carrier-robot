@@ -18,8 +18,11 @@ ina3221_node:
     empty_current_max_a: 0.008
     # 0.008–0.020 A 是遲滯區，維持上一個可信狀態。
     present_current_min_a: 0.020
-    # 滿電穩態約 0.038–0.039 A；較高電流視為仍在充電。
-    full_current_max_a: 0.080
+    # Type-C 快充輸入功率模型：<=5 W 為 full、5–10 W 為 ready、>10 W 為 low/charging。
+    full_power_max_w: 5.0
+    ready_power_max_w: 10.0
+    # 避免功率在門檻附近波動時反覆切換狀態。
+    power_hysteresis_w: 0.5
     # 0.5 秒取樣，連續 6 筆（約 3 秒）才確認狀態切換。
     state_confirm_samples: 6
     # 三個快充槽皆已接上可用模組。

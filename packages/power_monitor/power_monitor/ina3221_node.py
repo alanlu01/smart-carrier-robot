@@ -7,7 +7,7 @@ import smbus2
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from power_monitor.power_status import SlotStateTracker, build_slot
+from power_monitor.power_status import SlotStateTracker, build_slot, input_power_w
 
 INA3221_MANUFACTURER_ID = 0x5449
 INA3221_DIE_ID = 0x3220
@@ -72,7 +72,9 @@ class INA3221Node(Node):
         self.declare_parameter("empty_current_max_a", 0.008)
         self.declare_parameter("empty_voltage_max_v", 1.0)
         self.declare_parameter("present_current_min_a", 0.020)
-        self.declare_parameter("full_current_max_a", 0.080)
+        self.declare_parameter("full_power_max_w", 5.0)
+        self.declare_parameter("ready_power_max_w", 10.0)
+        self.declare_parameter("power_hysteresis_w", 0.5)
         self.declare_parameter("state_confirm_samples", 6)
         self.declare_parameter("slot_enabled", [True, True, True])
 
@@ -110,8 +112,14 @@ class INA3221Node(Node):
         self.present_current_min_a = float(
             self.get_parameter("present_current_min_a").value
         )
-        self.full_current_max_a = float(
-            self.get_parameter("full_current_max_a").value
+        self.full_power_max_w = float(
+            self.get_parameter("full_power_max_w").value
+        )
+        self.ready_power_max_w = float(
+            self.get_parameter("ready_power_max_w").value
+        )
+        self.power_hysteresis_w = float(
+            self.get_parameter("power_hysteresis_w").value
         )
         state_confirm_samples = int(
             self.get_parameter("state_confirm_samples").value
@@ -128,8 +136,12 @@ class INA3221Node(Node):
             raise ValueError("空槽門檻不得小於 0")
         if not self.empty_current_max_a < self.present_current_min_a:
             raise ValueError("空槽門檻必須小於行充存在門檻")
-        if not self.present_current_min_a < self.full_current_max_a:
-            raise ValueError("行充存在門檻必須小於滿電門檻")
+        if self.full_power_max_w <= 0:
+            raise ValueError("滿電功率門檻必須大於 0")
+        if not self.full_power_max_w < self.ready_power_max_w:
+            raise ValueError("滿電功率門檻必須小於就緒功率門檻")
+        if self.power_hysteresis_w < 0:
+            raise ValueError("功率遲滯不得小於 0")
         if state_confirm_samples < 1:
             raise ValueError("狀態確認樣本數必須大於 0")
         if len(self.slot_enabled) != 3:
@@ -146,7 +158,9 @@ class INA3221Node(Node):
             SlotStateTracker(
                 empty_current_max_a=self.empty_current_max_a,
                 present_current_min_a=self.present_current_min_a,
-                full_current_max_a=self.full_current_max_a,
+                full_power_max_w=self.full_power_max_w,
+                ready_power_max_w=self.ready_power_max_w,
+                power_hysteresis_w=self.power_hysteresis_w,
                 confirm_samples=state_confirm_samples,
             )
             for _ in range(3)
@@ -314,6 +328,7 @@ class INA3221Node(Node):
             status = (
                 self.state_trackers[index].update(
                     current_average if sensor_ok else None,
+                    voltage_average if sensor_ok else None,
                     sensor_ok=sensor_ok,
                 )
                 if enabled
@@ -329,7 +344,8 @@ class INA3221Node(Node):
                 empty_current_max_a=self.empty_current_max_a,
                 empty_voltage_max_v=self.empty_voltage_max_v,
                 present_current_min_a=self.present_current_min_a,
-                full_current_max_a=self.full_current_max_a,
+                full_power_max_w=self.full_power_max_w,
+                ready_power_max_w=self.ready_power_max_w,
             )
 
         if cycle_failed:
@@ -349,11 +365,15 @@ class INA3221Node(Node):
         else:
             self.i2c_failure_cycles = 0
 
-        summary = " | ".join(
-            f"CH{number}: {channel['voltage']} V, "
-            f"{channel['current']} A, {channel['status']}"
-            for number, channel in enumerate(channels.values(), start=1)
-        )
+        summary_parts = []
+        for number, channel in enumerate(channels.values(), start=1):
+            power_w = input_power_w(channel["current"], channel["voltage"])
+            power_text = "unknown" if power_w is None else f"{power_w:.2f} W"
+            summary_parts.append(
+                f"CH{number}: {channel['voltage']} V, "
+                f"{channel['current']} A, {power_text}, {channel['status']}"
+            )
+        summary = " | ".join(summary_parts)
         self.get_logger().info(summary)
 
         message = String()

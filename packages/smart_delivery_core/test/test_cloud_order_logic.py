@@ -9,12 +9,12 @@ from smart_delivery_core.smart_delivery import (
 )
 
 
-def test_cloud_borrow_task_uses_backend_coordinates_and_ready_slot():
+def test_cloud_borrow_task_uses_backend_coordinates_and_full_slot():
     slots = payload_to_slots(
         {
-            "ch1": build_slot(1, 1.0),
-            "ch2": build_slot(2, 0.039),
-            "ch3": build_slot(3, 0.004),
+            "ch1": build_slot(1, 1.1, voltage_v=10.0),
+            "ch2": build_slot(2, 0.4, voltage_v=10.0),
+            "ch3": build_slot(3, 0.004, voltage_v=10.0),
         },
         require_healthy=True,
     )

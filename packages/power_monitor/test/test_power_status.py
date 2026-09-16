@@ -21,39 +21,64 @@ def test_current_classification():
 
 def test_vehicle_bus_voltage_does_not_indicate_slot_presence():
     assert classify_power_status(0.004, 10.5) == "empty"
-    assert classify_power_status(0.039, 10.2) == "full"
+    assert classify_power_status(0.4, 10.0) == "full"
+    assert classify_power_status(0.7, 10.0) == "ready"
     assert classify_power_status(1.0, 10.1) == "low"
+    assert classify_power_status(0.4, None) == "unknown"
+
+
+def test_type_c_power_threshold_boundaries():
+    assert classify_power_status(0.5, 10.0) == "full"
+    assert classify_power_status(0.501, 10.0) == "ready"
+    assert classify_power_status(1.0, 10.0) == "ready"
+    assert classify_power_status(1.001, 10.0) == "low"
 
 
 def test_tracker_debounces_measured_empty_full_and_charging_states():
     tracker = SlotStateTracker(confirm_samples=3)
 
-    assert tracker.update(0.004) == "unknown"
-    assert tracker.update(0.004) == "unknown"
-    assert tracker.update(0.004) == "empty"
-    assert tracker.update(0.039) == "empty"
-    assert tracker.update(0.039) == "empty"
-    assert tracker.update(0.039) == "full"
-    assert tracker.update(1.0) == "full"
-    assert tracker.update(1.0) == "full"
-    assert tracker.update(1.0) == "low"
+    assert tracker.update(0.004, 10.0) == "unknown"
+    assert tracker.update(0.004, 10.0) == "unknown"
+    assert tracker.update(0.004, 10.0) == "empty"
+    assert tracker.update(0.4, 10.0) == "empty"
+    assert tracker.update(0.4, 10.0) == "empty"
+    assert tracker.update(0.4, 10.0) == "full"
+    assert tracker.update(0.7, 10.0) == "full"
+    assert tracker.update(0.7, 10.0) == "full"
+    assert tracker.update(0.7, 10.0) == "ready"
+    assert tracker.update(1.1, 10.0) == "ready"
+    assert tracker.update(1.1, 10.0) == "ready"
+    assert tracker.update(1.1, 10.0) == "low"
 
 
 def test_tracker_holds_previous_state_inside_hysteresis_gap():
     tracker = SlotStateTracker(confirm_samples=1)
-    assert tracker.update(0.004) == "empty"
-    assert tracker.update(0.012) == "empty"
-    assert tracker.update(0.039) == "full"
-    assert tracker.update(0.012) == "full"
+    assert tracker.update(0.004, 10.0) == "empty"
+    assert tracker.update(0.012, 10.0) == "empty"
+    assert tracker.update(0.4, 10.0) == "full"
+    assert tracker.update(0.012, 10.0) == "full"
+
+
+def test_tracker_applies_power_hysteresis_around_ready_boundaries():
+    tracker = SlotStateTracker(confirm_samples=1, power_hysteresis_w=0.5)
+    assert tracker.update(0.4, 10.0) == "full"
+    assert tracker.update(0.53, 10.0) == "full"
+    assert tracker.update(0.56, 10.0) == "ready"
+    assert tracker.update(1.03, 10.0) == "ready"
+    assert tracker.update(1.06, 10.0) == "low"
+    assert tracker.update(0.97, 10.0) == "low"
+    assert tracker.update(0.94, 10.0) == "ready"
+    assert tracker.update(0.47, 10.0) == "ready"
+    assert tracker.update(0.44, 10.0) == "full"
 
 
 def test_tracker_fails_safe_on_sensor_error_and_reconfirms_recovery():
     tracker = SlotStateTracker(confirm_samples=2)
-    tracker.update(0.039)
-    assert tracker.update(0.039) == "full"
-    assert tracker.update(None, sensor_ok=False) == "unknown"
-    assert tracker.update(0.039) == "unknown"
-    assert tracker.update(0.039) == "full"
+    tracker.update(0.4, 10.0)
+    assert tracker.update(0.4, 10.0) == "full"
+    assert tracker.update(None, None, sensor_ok=False) == "unknown"
+    assert tracker.update(0.4, 10.0) == "unknown"
+    assert tracker.update(0.4, 10.0) == "full"
 
 
 def test_payload_converts_three_channels():
@@ -73,7 +98,8 @@ def test_payload_converts_three_channels():
 
 def test_charge_is_not_invented_from_charging_current():
     assert build_slot(1, 1.0, voltage_v=10.1)["charge"] is None
-    assert build_slot(1, 0.039, voltage_v=10.2)["charge"] == 100
+    assert build_slot(1, 0.7, voltage_v=10.0)["charge"] is None
+    assert build_slot(1, 0.4, voltage_v=10.0)["charge"] == 100
     assert build_slot(1, 0.004, voltage_v=10.5)["charge"] == 0
 
 
@@ -87,9 +113,9 @@ def test_disabled_slot_is_not_reported_as_returnable_empty_slot():
 
 def test_disabled_slot_does_not_make_payload_unhealthy():
     payload = {
-        "ch1": build_slot(1, 0.039),
-        "ch2": build_slot(2, 1.0),
-        "ch3": build_slot(3, 0.002, enabled=False),
+        "ch1": build_slot(1, 0.4, voltage_v=10.0),
+        "ch2": build_slot(2, 1.1, voltage_v=10.0),
+        "ch3": build_slot(3, 0.002, voltage_v=10.0, enabled=False),
     }
     slots = payload_to_slots(payload, require_healthy=True)
     assert [slot["status"] for slot in slots] == ["full", "low", "disabled"]

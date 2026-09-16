@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +7,9 @@ EMPTY_CURRENT_MAX_A = 0.008
 EMPTY_VOLTAGE_MAX_V = 1.0
 PRESENT_CURRENT_MIN_A = 0.020
 FULL_CURRENT_MAX_A = 0.080
+FULL_POWER_MAX_W = 5.0
+READY_POWER_MAX_W = 10.0
+POWER_HYSTERESIS_W = 0.5
 STATE_CONFIRM_SAMPLES = 6
 
 CANONICAL_STATUSES = {"empty", "low", "ready", "full", "unknown", "disabled"}
@@ -64,30 +68,56 @@ def classify_power_status(
     empty_voltage_max_v: float = EMPTY_VOLTAGE_MAX_V,
     present_current_min_a: float = PRESENT_CURRENT_MIN_A,
     full_current_max_a: float = FULL_CURRENT_MAX_A,
+    full_power_max_w: float = FULL_POWER_MAX_W,
+    ready_power_max_w: float = READY_POWER_MAX_W,
 ) -> str:
-    """Classify a slot from current; bus voltage now represents the robot pack.
+    """Classify a slot from presence current and quick-charge input power.
 
     The quick-charge modules remain connected to the 3S vehicle battery when a
     slot is empty, so bus voltage cannot indicate power-bank presence.
-    ``voltage_v`` and ``empty_voltage_max_v`` remain accepted for payload/API
-    compatibility and diagnostics only.
+    Current therefore remains responsible for empty/present detection.  Once a
+    bank is present, input power determines whether it is charging, ready, or
+    full.  ``empty_voltage_max_v`` and ``full_current_max_a`` remain accepted
+    for payload/API compatibility with older callers.
     """
-    del voltage_v, empty_voltage_max_v
-    return classify_current_status(
-        current_a,
-        empty_current_max_a=empty_current_max_a,
-        present_current_min_a=present_current_min_a,
-        full_current_max_a=full_current_max_a,
-    )
+    del empty_voltage_max_v, full_current_max_a
+    current = abs(float(current_a))
+    if current <= empty_current_max_a:
+        return "empty"
+    if current < present_current_min_a:
+        return "unknown"
+    power_w = input_power_w(current, voltage_v)
+    if power_w is None:
+        return "unknown"
+    if power_w <= full_power_max_w:
+        return "full"
+    if power_w <= ready_power_max_w:
+        return "ready"
+    return "low"
+
+
+def input_power_w(
+    current_a: float | None, voltage_v: float | None
+) -> float | None:
+    """Return non-negative INA3221 input power, or ``None`` if unavailable."""
+    if current_a is None or voltage_v is None:
+        return None
+    current = float(current_a)
+    voltage = float(voltage_v)
+    if not math.isfinite(current) or not math.isfinite(voltage):
+        return None
+    return abs(current * voltage)
 
 
 @dataclass
 class SlotStateTracker:
-    """Debounced slot-state tracker with an empty/present hysteresis gap."""
+    """Debounced slot-state tracker with current and power hysteresis."""
 
     empty_current_max_a: float = EMPTY_CURRENT_MAX_A
     present_current_min_a: float = PRESENT_CURRENT_MIN_A
-    full_current_max_a: float = FULL_CURRENT_MAX_A
+    full_power_max_w: float = FULL_POWER_MAX_W
+    ready_power_max_w: float = READY_POWER_MAX_W
+    power_hysteresis_w: float = POWER_HYSTERESIS_W
     confirm_samples: int = STATE_CONFIRM_SAMPLES
     state: str = "unknown"
     _candidate: str | None = None
@@ -98,28 +128,64 @@ class SlotStateTracker:
             raise ValueError("empty current threshold must not be negative")
         if not self.empty_current_max_a < self.present_current_min_a:
             raise ValueError("empty threshold must be below present threshold")
-        if not self.present_current_min_a < self.full_current_max_a:
-            raise ValueError("present threshold must be below full threshold")
+        if self.full_power_max_w <= 0:
+            raise ValueError("full power threshold must be positive")
+        if not self.full_power_max_w < self.ready_power_max_w:
+            raise ValueError("full power threshold must be below ready threshold")
+        if self.power_hysteresis_w < 0:
+            raise ValueError("power hysteresis must not be negative")
+        if self.power_hysteresis_w >= self.full_power_max_w:
+            raise ValueError("power hysteresis must be below full threshold")
+        if 2.0 * self.power_hysteresis_w >= (
+            self.ready_power_max_w - self.full_power_max_w
+        ):
+            raise ValueError("power hysteresis is too large for configured thresholds")
         if self.confirm_samples < 1:
             raise ValueError("confirm_samples must be at least one")
 
-    def update(self, current_a: float | None, *, sensor_ok: bool = True) -> str:
-        if not sensor_ok or current_a is None:
+    def update(
+        self,
+        current_a: float | None,
+        voltage_v: float | None = None,
+        *,
+        sensor_ok: bool = True,
+    ) -> str:
+        if not sensor_ok or current_a is None or voltage_v is None:
             self.state = "unknown"
             self._candidate = None
             self._candidate_samples = 0
             return self.state
 
-        measured = classify_current_status(
+        measured = classify_power_status(
             current_a,
+            voltage_v,
             empty_current_max_a=self.empty_current_max_a,
             present_current_min_a=self.present_current_min_a,
-            full_current_max_a=self.full_current_max_a,
+            full_power_max_w=self.full_power_max_w,
+            ready_power_max_w=self.ready_power_max_w,
         )
         if measured == "unknown":
             self._candidate = None
             self._candidate_samples = 0
             return self.state
+
+        power_w = input_power_w(current_a, voltage_v)
+        if power_w is not None and measured not in {"empty", "unknown"}:
+            if self.state == "full" and power_w <= (
+                self.full_power_max_w + self.power_hysteresis_w
+            ):
+                measured = "full"
+            elif self.state == "ready":
+                if power_w <= self.full_power_max_w - self.power_hysteresis_w:
+                    measured = "full"
+                elif power_w <= self.ready_power_max_w + self.power_hysteresis_w:
+                    measured = "ready"
+                else:
+                    measured = "low"
+            elif self.state == "low" and power_w > (
+                self.ready_power_max_w - self.power_hysteresis_w
+            ):
+                measured = "low"
         if measured == self.state:
             self._candidate = None
             self._candidate_samples = 0
@@ -173,6 +239,8 @@ def build_slot(
     empty_voltage_max_v: float = EMPTY_VOLTAGE_MAX_V,
     present_current_min_a: float = PRESENT_CURRENT_MIN_A,
     full_current_max_a: float = FULL_CURRENT_MAX_A,
+    full_power_max_w: float = FULL_POWER_MAX_W,
+    ready_power_max_w: float = READY_POWER_MAX_W,
 ) -> dict[str, Any]:
     if channel_number not in (1, 2, 3):
         raise ValueError("channel_number 必須介於 1 到 3")
@@ -191,6 +259,8 @@ def build_slot(
             empty_voltage_max_v=empty_voltage_max_v,
             present_current_min_a=present_current_min_a,
             full_current_max_a=full_current_max_a,
+            full_power_max_w=full_power_max_w,
+            ready_power_max_w=ready_power_max_w,
         )
     else:
         canonical_status = normalize_power_bank_status(status)
