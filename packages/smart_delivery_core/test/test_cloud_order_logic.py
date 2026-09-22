@@ -1,12 +1,71 @@
 import pytest
+from nav2_simple_commander.robot_navigator import TaskResult
 from power_monitor.power_status import build_slot, payload_to_slots
 from smart_delivery_core.smart_delivery import (
     SlotConfirmationTracker,
+    go_to_standby,
     infeasible_order_note,
     order_payload_to_order,
     recovered_slot_baseline,
     schedule_orders,
 )
+
+
+class _FakeLogger:
+    def info(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+
+class _FakeClock:
+    def now(self):
+        return self
+
+    def to_msg(self):
+        return None
+
+
+class _CompletedNavigator:
+    def __init__(self, result):
+        self.result = result
+        self.goal = None
+
+    def get_clock(self):
+        return _FakeClock()
+
+    def get_logger(self):
+        return _FakeLogger()
+
+    def goToPose(self, goal):
+        self.goal = goal
+
+    def isTaskComplete(self):
+        return True
+
+    def getResult(self):
+        return self.result
+
+
+def test_standby_only_reports_arrival_after_nav2_success():
+    lease = []
+    failed = go_to_standby(
+        _CompletedNavigator(TaskResult.FAILED),
+        {"x": 0.0, "y": 0.0},
+        set_navigation_active=lease.append,
+    )
+    assert failed is None
+    assert lease == [True, False]
+
+    lease = []
+    arrived = go_to_standby(
+        _CompletedNavigator(TaskResult.SUCCEEDED),
+        {"x": 0.0, "y": 0.0},
+        set_navigation_active=lease.append,
+    )
+    assert arrived is not None
+    assert lease == [True, False]
 
 
 def test_cloud_borrow_task_uses_backend_coordinates_and_full_slot():

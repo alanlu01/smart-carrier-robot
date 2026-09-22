@@ -6,6 +6,7 @@ from smart_delivery_core.localization_health import (
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
+    localization_suspicion_required,
     map_match_status,
     normalize_angle,
     occupancy_match_score,
@@ -13,6 +14,7 @@ from smart_delivery_core.localization_health import (
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    scan_pipeline_status,
     select_scan_samples,
     sensor_timeout_requires_recovery,
     should_extend_global_recovery,
@@ -112,6 +114,27 @@ def test_map_match_status_rejects_missing_or_stale_scores():
 def test_scan_timeout_debounces_one_short_receive_gap():
     assert not sensor_timeout_requires_recovery(2.1, 2.0, 1.0)
     assert sensor_timeout_requires_recovery(3.01, 2.0, 1.0)
+
+
+def test_scan_pipeline_distinguishes_filter_gap_from_lidar_loss():
+    assert scan_pipeline_status(0.1, 0.2, 2.0, 1.0) == "healthy"
+    assert scan_pipeline_status(0.1, 3.1, 2.0, 1.0) == "filtered_timeout"
+    assert scan_pipeline_status(3.2, 3.1, 2.0, 1.0) == "raw_timeout"
+
+
+def test_stationary_map_score_drop_needs_independent_evidence():
+    assert not localization_suspicion_required(
+        "critical", True, False, False, False
+    )
+    assert localization_suspicion_required(
+        "critical", True, False, True, True
+    )
+    assert localization_suspicion_required(
+        "degraded", False, False, False, False
+    )
+    assert localization_suspicion_required(
+        "healthy", False, True, False, False
+    )
 
 
 def test_transient_sensor_recovery_requires_all_fresh_stationary_evidence():

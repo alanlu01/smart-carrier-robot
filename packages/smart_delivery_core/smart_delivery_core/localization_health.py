@@ -125,6 +125,36 @@ def sensor_timeout_requires_recovery(age, timeout, grace=0.0):
     return float(age) > float(timeout) + max(0.0, float(grace))
 
 
+def scan_pipeline_status(raw_age, filtered_age, timeout, grace=0.0):
+    """Classify a filtered-scan gap without confusing it with lidar loss."""
+    filtered_stale = sensor_timeout_requires_recovery(
+        filtered_age, timeout, grace
+    )
+    if not filtered_stale:
+        return "healthy"
+    raw_stale = sensor_timeout_requires_recovery(raw_age, timeout, grace)
+    return "raw_timeout" if raw_stale else "filtered_timeout"
+
+
+def localization_suspicion_required(
+    match_status,
+    quality_healthy,
+    quality_critical,
+    commanded_motion,
+    odom_motion,
+):
+    """Require corroboration before a map-score drop pauses localization."""
+    if bool(quality_critical):
+        return True
+    if match_status not in {"critical", "degraded", "unknown"}:
+        return False
+    return (
+        not bool(quality_healthy)
+        or bool(commanded_motion)
+        or bool(odom_motion)
+    )
+
+
 def transient_sensor_recovery_qualified(
     quality_healthy,
     map_match_recovered,

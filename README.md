@@ -55,7 +55,9 @@ source ~/.config/smart-carrier/robot.env
 ros2 launch smart_carrier_api api_bridge.launch.py
 ```
 
-The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, `sensor_ok`, and `enabled`. The measured bus voltage is the shared 3S vehicle supply and is diagnostic only; slot presence is determined from current using hysteresis and six-sample confirmation. Canonical states are `empty`, `low` (charging), `full`, `unknown`, and `disabled`. Charging percentage cannot be inferred from input current, so `charge` is `null` while charging, `0` when empty, and `100` when full. Borrow and return tasks are completed only after the assigned slot confirms the physical removal or insertion; the user is warned after 30 seconds and the task fails after 60 seconds.
+The power monitor publishes three `ch1`–`ch3` objects on `power_status`. Each object contains `slot`, `bank_id`, `status`, `voltage`, `current`, `charge`, `sensor_ok`, and `enabled`. Slot presence is determined from current using hysteresis, a three-sample moving average, and three-sample state confirmation. Canonical states are `empty`, `low` (charging), `ready`, `full`, `unknown`, and `disabled`. Charging percentage cannot be inferred from input current, so `charge` is `null` while charging, `0` when empty, and `100` when full. Borrow and return tasks add a separate three-message physical confirmation; the user is warned after 30 seconds and the task fails after 60 seconds.
+
+The same payload also contains `vehicle_battery`, and the object is published independently on `vehicle_battery_status`. It uses the median shared-bus voltage from the healthy INA3221 channels. The measured just-charged reference is `12.368 V`; `9.5 V` is the conservative cutoff threshold. This first version is telemetry and warning metadata only—it does not interrupt chassis motion before loaded-voltage behavior is validated.
 
 At startup and after repeated I²C failures, `power_monitor` verifies the TI and
 INA3221 identification registers while probing addresses `0x40`–`0x43`. It keeps

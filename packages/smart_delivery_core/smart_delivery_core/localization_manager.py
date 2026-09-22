@@ -30,14 +30,15 @@ from smart_delivery_core.localization_health import (
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
+    localization_suspicion_required,
     map_match_status,
     occupancy_match_score,
     pose_is_near,
     pose_jump,
     pose_quality,
     quaternion_to_yaw,
+    scan_pipeline_status,
     select_scan_samples,
-    sensor_timeout_requires_recovery,
     smoothed_map_score,
     should_extend_global_recovery,
     suspect_requires_recovery,
@@ -90,6 +91,10 @@ class LocalizationManager(Node):
         self.same_boot_pose_untrusted = False
         self._configure_startup_pose()
         self.motion_cmd_topic = str(self.get_parameter("motion_cmd_topic").value)
+        self.raw_scan_topic = str(self.get_parameter("raw_scan_topic").value)
+        self.filtered_scan_topic = str(
+            self.get_parameter("filtered_scan_topic").value
+        )
         self.scan_timeout = float(self.get_parameter("scan_timeout_sec").value)
         self.scan_timeout_grace = float(
             self.get_parameter("scan_timeout_grace_sec").value
@@ -218,6 +223,7 @@ class LocalizationManager(Node):
         self.state_reason = "node started"
         self.ready = False
         self.latest_scan_at = 0.0
+        self.latest_raw_scan_at = 0.0
         self.latest_odom_at = 0.0
         self.latest_cmd_at = 0.0
         self.latest_pose = None
@@ -273,7 +279,9 @@ class LocalizationManager(Node):
         self.recovery_diagnostics = {}
         self.transient_recovery_eligible = False
         self.transient_recovery_started_at = 0.0
+        self.sensor_waiting_for_pipeline = False
         self.last_pose_cache_write_at = 0.0
+        self.last_map_only_warning_at = 0.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -286,7 +294,16 @@ class LocalizationManager(Node):
             PoseWithCovarianceStamped, "/initialpose", STATE_QOS
         )
         self.create_subscription(
-            LaserScan, "/scan_filtered", self._scan_callback, qos_profile_sensor_data
+            LaserScan,
+            self.filtered_scan_topic,
+            self._scan_callback,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            LaserScan,
+            self.raw_scan_topic,
+            self._raw_scan_callback,
+            qos_profile_sensor_data,
         )
         self.create_subscription(OccupancyGrid, "/map", self._map_callback, STATE_QOS)
         self.create_subscription(
@@ -351,6 +368,8 @@ class LocalizationManager(Node):
             "pose_cache_max_age_sec": 3600.0,
             "pose_cache_write_period_sec": 2.0,
             "motion_cmd_topic": "/chassis_cmd_vel",
+            "raw_scan_topic": "/scan",
+            "filtered_scan_topic": "/scan_filtered",
             "scan_timeout_sec": 2.0,
             "scan_timeout_grace_sec": 1.0,
             "odom_timeout_sec": 1.0,
@@ -489,6 +508,7 @@ class LocalizationManager(Node):
             "scan_age_sec": (
                 None if not self.latest_scan_at else now - self.latest_scan_at
             ),
+            "raw_scan_age_sec": freshness["raw_scan_receive_age_sec"],
             "scan_stamp_age_sec": freshness["scan_stamp_age_sec"],
             "map_match_age_sec": (
                 None if not self.latest_map_score_at else now - self.latest_map_score_at
@@ -547,6 +567,7 @@ class LocalizationManager(Node):
             )
 
         return {
+            "raw_scan_receive_age_sec": rounded_age(self.latest_raw_scan_at),
             "scan_receive_age_sec": rounded_age(self.latest_scan_at),
             "scan_stamp_age_sec": (
                 None if scan_stamp_age is None else round(scan_stamp_age, 3)
@@ -592,7 +613,8 @@ class LocalizationManager(Node):
         yaw_std = snapshot.get("yaw_std_deg")
         yaw_text = "unknown" if yaw_std is None else f"{yaw_std:.2f}deg"
         return (
-            f"scan_rx={age('scan_receive_age_sec')}, "
+            f"raw_scan_rx={age('raw_scan_receive_age_sec')}, "
+            f"filtered_scan_rx={age('scan_receive_age_sec')}, "
             f"scan_stamp={age('scan_stamp_age_sec')}, "
             f"amcl={age('amcl_pose_age_sec')}, "
             f"odom={age('odom_age_sec')}, cmd={age('cmd_vel_age_sec')}, "
@@ -615,6 +637,9 @@ class LocalizationManager(Node):
             ) / 1_000_000_000.0
         else:
             self.latest_scan_stamp_age = None
+
+    def _raw_scan_callback(self, _message):
+        self.latest_raw_scan_at = time.monotonic()
 
     def _map_callback(self, message):
         self.map_message = message
@@ -814,8 +839,15 @@ class LocalizationManager(Node):
         now = time.monotonic() if now is None else now
         return self.latest_scan_at > 0.0 and now - self.latest_scan_at <= self.scan_timeout
 
+    def _raw_scan_is_fresh(self, now=None):
+        now = time.monotonic() if now is None else now
+        return (
+            self.latest_raw_scan_at > 0.0
+            and now - self.latest_raw_scan_at <= self.scan_timeout
+        )
+
     def _transient_recovery_is_qualified(self, now):
-        return transient_sensor_recovery_qualified(
+        return self._raw_scan_is_fresh(now) and transient_sensor_recovery_qualified(
             self.latest_quality is not None and self.latest_quality.healthy,
             self._map_match_has_recovered(now),
             self._age_since(self.latest_scan_at, now),
@@ -832,18 +864,43 @@ class LocalizationManager(Node):
         now = time.monotonic()
         if not self._scan_is_fresh(now):
             if self.state == "LOCALIZED":
+                raw_scan_age = self._age_since(self.latest_raw_scan_at, now)
                 scan_age = self._age_since(self.latest_scan_at, now)
-                if sensor_timeout_requires_recovery(
-                    scan_age, self.scan_timeout, self.scan_timeout_grace
-                ):
-                    age_text = "unknown" if scan_age is None else f"{scan_age:.2f}s"
+                pipeline_status = scan_pipeline_status(
+                    raw_scan_age,
+                    scan_age,
+                    self.scan_timeout,
+                    self.scan_timeout_grace,
+                )
+                if pipeline_status != "healthy":
+                    raw_age_text = (
+                        "unknown" if raw_scan_age is None else f"{raw_scan_age:.2f}s"
+                    )
+                    filtered_age_text = (
+                        "unknown" if scan_age is None else f"{scan_age:.2f}s"
+                    )
                     recovery_limit = self.scan_timeout + self.scan_timeout_grace
+                    if pipeline_status == "filtered_timeout":
+                        reason = (
+                            "scan_filtered 管線逾時，但原始雷達正常"
+                            f"（raw={raw_age_text}, filtered={filtered_age_text}, "
+                            f"limit={recovery_limit:.2f}s）"
+                        )
+                    else:
+                        reason = (
+                            "原始雷達與 scan_filtered 均逾時"
+                            f"（raw={raw_age_text}, filtered={filtered_age_text}, "
+                            f"limit={recovery_limit:.2f}s）"
+                        )
                     self._begin_recovery(
-                        f"雷達資料逾時（age={age_text} > {recovery_limit:.2f}s）",
+                        reason,
                         transient_sensor_timeout=True,
+                        sensor_pipeline_timeout=True,
                     )
             elif self.state == "UNINITIALIZED":
-                self._set_state("WAITING_FOR_SENSORS", "等待 /scan_filtered")
+                self._set_state(
+                    "WAITING_FOR_SENSORS", f"等待 {self.filtered_scan_topic}"
+                )
             self._publish_state()
             return
 
@@ -928,7 +985,14 @@ class LocalizationManager(Node):
                 and now - self.map_match_unknown_since >= self.map_match_stale_grace
             )
             map_match_bad = match_status in {"critical", "degraded"} or map_match_stale
-            if self.latest_quality.critical or map_match_bad:
+            suspicion_required = localization_suspicion_required(
+                "unknown" if map_match_stale else match_status,
+                self.latest_quality.healthy,
+                self.latest_quality.critical,
+                self.commanded_motion,
+                self.odom_motion,
+            )
+            if self.latest_quality.critical or (map_match_bad and suspicion_required):
                 if self.suspect_since is None:
                     self.suspect_since = now
                     self.stable_samples = 0
@@ -948,13 +1012,42 @@ class LocalizationManager(Node):
                     self._set_state("SUSPECT", reason)
             else:
                 self.suspect_since = None
+                if (
+                    map_match_bad
+                    and now - self.last_map_only_warning_at
+                    >= self.diagnostic_log_period
+                ):
+                    score_text = (
+                        "unknown"
+                        if self.latest_map_score is None
+                        else f"{self.latest_map_score:.2f}"
+                    )
+                    self.get_logger().warning(
+                        "車輛靜止且 AMCL covariance 健康；"
+                        f"單一地圖吻合低分（{score_text}）僅記錄，"
+                        "不觸發定位自旋"
+                    )
+                    self.last_map_only_warning_at = now
             return
 
         if self.state == "SUSPECT":
             match_status = self._map_match_status(now)
-            qualified = (
+            quality_critical = (
+                self.latest_quality is not None and self.latest_quality.critical
+            )
+            quality_acceptable = (
                 self.latest_quality is not None
-                and self.latest_quality.healthy
+                and (
+                    self.latest_quality.healthy
+                    or (
+                        not quality_critical
+                        and not self.commanded_motion
+                        and not self.odom_motion
+                    )
+                )
+            )
+            qualified = (
+                quality_acceptable
                 and self._map_match_has_recovered(now)
                 and self._verification_pose_is_consistent()
                 and now - self.last_amcl_at <= self.amcl_pose_timeout
@@ -972,9 +1065,6 @@ class LocalizationManager(Node):
                 self._mark_localized()
             elif self.suspect_since is not None:
                 suspect_age = now - self.suspect_since
-                quality_critical = (
-                    self.latest_quality is not None and self.latest_quality.critical
-                )
                 convergence_promising = (
                     self._map_match_has_recovered(now)
                     and self.latest_quality is not None
@@ -1181,6 +1271,7 @@ class LocalizationManager(Node):
         self.recovery_start_yaw = None
         self.transient_recovery_eligible = False
         self.transient_recovery_started_at = 0.0
+        self.sensor_waiting_for_pipeline = False
         self.stationary_odom_anchor = self.last_odom_pose
         self.stationary_amcl_anchor = self.latest_pose
         quality = self.latest_quality
@@ -1199,7 +1290,13 @@ class LocalizationManager(Node):
             if client.service_is_ready():
                 client.call_async(request)
 
-    def _begin_recovery(self, reason, *, transient_sensor_timeout=False):
+    def _begin_recovery(
+        self,
+        reason,
+        *,
+        transient_sensor_timeout=False,
+        sensor_pipeline_timeout=False,
+    ):
         if self.state in {"RECOVERING_LOCAL", "RECOVERING_GLOBAL", "MANUAL_REQUIRED"}:
             return
         now = time.monotonic()
@@ -1207,10 +1304,10 @@ class LocalizationManager(Node):
             transient_sensor_timeout
             and self.latest_quality is not None
             and self.latest_quality.healthy
-            and self._map_match_has_recovered(now)
             and not self.commanded_motion
             and not self.odom_motion
         )
+        self.sensor_waiting_for_pipeline = bool(sensor_pipeline_timeout)
         self.transient_recovery_started_at = (
             now if self.transient_recovery_eligible else 0.0
         )
@@ -1269,6 +1366,31 @@ class LocalizationManager(Node):
         return False
 
     def _tick_local_recovery(self, now):
+        if self.sensor_waiting_for_pipeline:
+            raw_fresh = self._raw_scan_is_fresh(now)
+            filtered_fresh = self._scan_is_fresh(now)
+            if not raw_fresh or not filtered_fresh:
+                self._request_nomotion_if_due(now)
+                if now - self.last_diagnostic_log_at >= self.diagnostic_log_period:
+                    snapshot = self._freshness_snapshot(now)
+                    self.get_logger().warning(
+                        "感測管線尚未恢復，維持停車且不執行定位自旋："
+                        f"{self._diagnostic_snapshot_text(snapshot)}"
+                    )
+                    self.last_diagnostic_log_at = now
+                return
+            self.sensor_waiting_for_pipeline = False
+            self.recovery_step = "nomotion_wait"
+            self.recovery_step_started = now
+            self.stable_samples = 0
+            self.last_stable_map_score_at = self.latest_map_score_at
+            self._request_nomotion_update()
+            self.get_logger().warning(
+                "原始雷達與 scan_filtered 已恢復；"
+                "先驗證新鮮 scan/odom/AMCL，不立即自旋"
+            )
+            return
+
         elapsed = now - self.recovery_step_started
         if self.recovery_step == "cancel_wait" and elapsed >= self.cancel_grace:
             self._request_nomotion_update()

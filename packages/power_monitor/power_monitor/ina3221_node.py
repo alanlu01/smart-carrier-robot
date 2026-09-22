@@ -3,11 +3,16 @@ import json
 import time
 
 import rclpy
-import smbus2
 from rclpy.node import Node
-from std_msgs.msg import String
+import smbus2
 
-from power_monitor.power_status import SlotStateTracker, build_slot, input_power_w
+from power_monitor.power_status import (
+    build_slot,
+    build_vehicle_battery,
+    input_power_w,
+    SlotStateTracker,
+)
+from std_msgs.msg import String
 
 INA3221_MANUFACTURER_ID = 0x5449
 INA3221_DIE_ID = 0x3220
@@ -76,6 +81,12 @@ class INA3221Node(Node):
         self.declare_parameter("ready_power_max_w", 10.0)
         self.declare_parameter("power_hysteresis_w", 0.5)
         self.declare_parameter("state_confirm_samples", 6)
+        self.declare_parameter("summary_log_period_sec", 10.0)
+        self.declare_parameter("vehicle_full_voltage_v", 12.368)
+        self.declare_parameter("vehicle_low_voltage_v", 10.5)
+        self.declare_parameter("vehicle_reserve_voltage_v", 10.2)
+        self.declare_parameter("vehicle_critical_voltage_v", 9.8)
+        self.declare_parameter("vehicle_cutoff_voltage_v", 9.5)
         self.declare_parameter("slot_enabled", [True, True, True])
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)
@@ -124,6 +135,24 @@ class INA3221Node(Node):
         state_confirm_samples = int(
             self.get_parameter("state_confirm_samples").value
         )
+        self.summary_log_period = max(
+            1.0, float(self.get_parameter("summary_log_period_sec").value)
+        )
+        self.vehicle_full_voltage = float(
+            self.get_parameter("vehicle_full_voltage_v").value
+        )
+        self.vehicle_low_voltage = float(
+            self.get_parameter("vehicle_low_voltage_v").value
+        )
+        self.vehicle_reserve_voltage = float(
+            self.get_parameter("vehicle_reserve_voltage_v").value
+        )
+        self.vehicle_critical_voltage = float(
+            self.get_parameter("vehicle_critical_voltage_v").value
+        )
+        self.vehicle_cutoff_voltage = float(
+            self.get_parameter("vehicle_cutoff_voltage_v").value
+        )
         self.slot_enabled = [
             bool(value) for value in self.get_parameter("slot_enabled").value
         ]
@@ -148,6 +177,9 @@ class INA3221Node(Node):
             raise ValueError("slot_enabled 必須包含三個布林值")
 
         self.publisher = self.create_publisher(String, "power_status", 10)
+        self.vehicle_battery_publisher = self.create_publisher(
+            String, "vehicle_battery_status", 10
+        )
         self.current_histories = [
             collections.deque(maxlen=window_size) for _ in range(3)
         ]
@@ -172,6 +204,8 @@ class INA3221Node(Node):
         self.last_i2c_probe_at = 0.0
         self.i2c_failure_cycles = 0
         self.last_i2c_recovery_log_at = 0.0
+        self.last_summary_log_at = 0.0
+        self.last_summary_signature = None
         self._probe_sensor(force=True)
         self.timer = self.create_timer(sample_period, self.timer_callback)
         self.get_logger().info("INA3221 電源監控與行充狀態節點已啟動")
@@ -373,12 +407,47 @@ class INA3221Node(Node):
                 f"CH{number}: {channel['voltage']} V, "
                 f"{channel['current']} A, {power_text}, {channel['status']}"
             )
+        vehicle_battery = build_vehicle_battery(
+            [channel["voltage"] for channel in channels.values()],
+            full_voltage_v=self.vehicle_full_voltage,
+            low_voltage_v=self.vehicle_low_voltage,
+            reserve_voltage_v=self.vehicle_reserve_voltage,
+            critical_voltage_v=self.vehicle_critical_voltage,
+            cutoff_voltage_v=self.vehicle_cutoff_voltage,
+        )
+        summary_parts.append(
+            "Vehicle: "
+            f"{vehicle_battery['voltage']} V, {vehicle_battery['status']}"
+        )
         summary = " | ".join(summary_parts)
-        self.get_logger().info(summary)
+        summary_signature = (
+            tuple(channel["status"] for channel in channels.values()),
+            vehicle_battery["status"],
+            cycle_failed,
+        )
+        now = time.monotonic()
+        if (
+            summary_signature != self.last_summary_signature
+            or now - self.last_summary_log_at >= self.summary_log_period
+        ):
+            if vehicle_battery["status"] in {"critical", "cutoff"}:
+                self.get_logger().error(summary)
+            elif vehicle_battery["status"] in {"low", "reserve"}:
+                self.get_logger().warning(summary)
+            else:
+                self.get_logger().info(summary)
+            self.last_summary_signature = summary_signature
+            self.last_summary_log_at = now
 
         message = String()
-        message.data = json.dumps(channels, ensure_ascii=False)
+        payload = dict(channels)
+        payload["vehicle_battery"] = vehicle_battery
+        message.data = json.dumps(payload, ensure_ascii=False)
         self.publisher.publish(message)
+
+        battery_message = String()
+        battery_message.data = json.dumps(vehicle_battery, ensure_ascii=False)
+        self.vehicle_battery_publisher.publish(battery_message)
 
     def destroy_node(self):
         if self.bus is not None:

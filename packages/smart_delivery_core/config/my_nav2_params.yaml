@@ -59,6 +59,9 @@ localization_manager:
     # Observe the command that actually reaches the serial bridge after all
     # semantic/failsafe limits, not Nav2's raw /cmd_vel request.
     motion_cmd_topic: /chassis_cmd_vel
+    # Distinguish a real lidar outage from a scan filter / TF / DDS pipeline gap.
+    raw_scan_topic: /scan
+    filtered_scan_topic: /scan_filtered
 
     # Conservative first-pass thresholds; tune from logs at the real start pose.
     scan_timeout_sec: 2.0

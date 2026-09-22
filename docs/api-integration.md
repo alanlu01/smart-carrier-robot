@@ -32,19 +32,26 @@ The payload is a JSON object with `ch1`, `ch2`, and `ch3`. Each channel contains
 Canonical states are:
 
 - `empty`: current is `<= 0.008 A`.
-- `full`: a present bank has settled current from `0.020 A` through `0.080 A`.
-- `low`: the bank is charging above `0.080 A`; its true percentage is unknown.
-- `ready`: retained for compatibility with externally supplied status, but is not generated from INA3221 current.
+- `full`: a present bank draws `<= 5 W` from the vehicle bus.
+- `ready`: a present bank draws `> 5 W` and `<= 10 W`.
+- `low`: a present bank draws `> 10 W`; its true percentage is unknown.
 - `unknown`: no valid INA3221 sample is available.
 - `disabled`: intentionally unavailable for maintenance; it is not borrowable
   or returnable and does not make the remaining monitor unhealthy.
 
+The payload additionally carries a `vehicle_battery` object derived from the
+median shared 3S bus voltage. The same object is available locally on
+`vehicle_battery_status`. Its initial calibrated full/cutoff references are
+`12.368 V` and `9.5 V`; this telemetry is not yet forwarded in cloud heartbeat
+payloads, so adding it to the web UI requires a separate API schema migration.
+
 The quick-charge modules share the vehicle's 3S supply, so the approximately
 `10–12.6 V` bus measurement cannot indicate whether a power bank is inserted.
 The `0.008–0.020 A` gap is a hysteresis band that retains the last trusted
-state. A transition needs six consecutive 0.5-second samples. Startup remains
+state. A transition needs three consecutive 0.5-second samples after a
+three-sample moving average. Startup remains
 `unknown` until one state has been confirmed. `charge` is `0` for `empty`, `100`
-for `full`, and JSON `null` for `low` or `unknown`; current is not used to invent
+for `full`, and JSON `null` for `low`, `ready`, or `unknown`; current is not used to invent
 a percentage. Thresholds are ROS parameters in `power_monitor.yaml`.
 
 An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the last healthy inventory and pauses new dispatches after ten seconds without a healthy update; it does not interpret an I²C failure as an empty slot.

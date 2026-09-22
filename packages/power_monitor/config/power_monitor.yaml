@@ -10,7 +10,8 @@ ina3221_node:
     i2c_error_log_period_sec: 5.0
     current_lsb: 0.0004
     bus_voltage_lsb: 0.008
-    window_size: 6
+    # 3 samples keep useful noise rejection while cutting physical-action latency.
+    window_size: 3
     sample_period: 0.5
     # bus voltage 是 3S 車輛母線，不能用來判斷槽位是否有行充。
     empty_voltage_max_v: 1.0
@@ -23,7 +24,15 @@ ina3221_node:
     ready_power_max_w: 10.0
     # 避免功率在門檻附近波動時反覆切換狀態。
     power_hysteresis_w: 0.5
-    # 0.5 秒取樣，連續 6 筆（約 3 秒）才確認狀態切換。
-    state_confirm_samples: 6
+    # 0.5 秒取樣，連續 3 筆（約 1.5 秒）才確認狀態切換。
+    state_confirm_samples: 3
+    # Keep state changes and a low-rate summary; raw values remain on ROS topics.
+    summary_log_period_sec: 10.0
+    # 2026-09-22 measured immediately after charging: 12.360–12.368 V.
+    vehicle_full_voltage_v: 12.368
+    vehicle_low_voltage_v: 10.5
+    vehicle_reserve_voltage_v: 10.2
+    vehicle_critical_voltage_v: 9.8
+    vehicle_cutoff_voltage_v: 9.5
     # 三個快充槽皆已接上可用模組。
     slot_enabled: [true, true, true]

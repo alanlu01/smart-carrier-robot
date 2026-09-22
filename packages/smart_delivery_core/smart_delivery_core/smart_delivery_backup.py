@@ -176,12 +176,22 @@ def go_to_standby(navigator, current_pos, set_navigation_active=lambda _active: 
     goal_pose.pose.orientation = yaw_to_quaternion(closest_standby['yaw'])
 
     set_navigation_active(True)
-    navigator.goToPose(goal_pose)
-    while not navigator.isTaskComplete():
-        time.sleep(0.1) # 釋放 CPU
-        rclpy.spin_once(navigator, timeout_sec=0.05)
-        
-    set_navigation_active(False)
+    try:
+        navigator.goToPose(goal_pose)
+        while not navigator.isTaskComplete():
+            time.sleep(0.1) # 釋放 CPU
+            rclpy.spin_once(navigator, timeout_sec=0.05)
+        result = navigator.getResult()
+    finally:
+        set_navigation_active(False)
+
+    if result != TaskResult.SUCCEEDED:
+        navigator.get_logger().warning(
+            f"前往待機點 {closest_standby['name']} 未成功（result={result}）；"
+            "保留實際位置並稍後重試"
+        )
+        return None
+
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
     return {"x": closest_standby['x'], "y": closest_standby['y']}
 

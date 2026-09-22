@@ -3,11 +3,30 @@ import json
 import pytest
 from power_monitor.power_status import (
     SlotStateTracker,
+    build_vehicle_battery,
     build_slot,
     classify_current_status,
     classify_power_status,
+    classify_vehicle_battery,
     payload_to_slots,
 )
+
+
+def test_vehicle_battery_uses_measured_full_and_conservative_cutoff():
+    assert classify_vehicle_battery(12.368) == "full"
+    assert classify_vehicle_battery(12.20) == "normal"
+    assert classify_vehicle_battery(10.5) == "low"
+    assert classify_vehicle_battery(10.2) == "reserve"
+    assert classify_vehicle_battery(9.8) == "critical"
+    assert classify_vehicle_battery(9.5) == "cutoff"
+
+
+def test_vehicle_battery_uses_median_shared_bus_voltage():
+    battery = build_vehicle_battery([12.368, 12.360, 8.0])
+    assert battery["voltage"] == 12.36
+    assert battery["status"] == "full"
+    assert battery["allow_new_tasks"]
+    assert not battery["cutoff"]
 
 
 def test_current_classification():

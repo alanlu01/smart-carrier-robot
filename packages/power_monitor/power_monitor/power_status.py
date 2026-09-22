@@ -1,5 +1,6 @@
 import json
 import math
+import statistics
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,8 +12,22 @@ FULL_POWER_MAX_W = 5.0
 READY_POWER_MAX_W = 10.0
 POWER_HYSTERESIS_W = 0.5
 STATE_CONFIRM_SAMPLES = 6
+VEHICLE_FULL_VOLTAGE_V = 12.368
+VEHICLE_LOW_VOLTAGE_V = 10.5
+VEHICLE_RESERVE_VOLTAGE_V = 10.2
+VEHICLE_CRITICAL_VOLTAGE_V = 9.8
+VEHICLE_CUTOFF_VOLTAGE_V = 9.5
 
 CANONICAL_STATUSES = {"empty", "low", "ready", "full", "unknown", "disabled"}
+VEHICLE_BATTERY_STATUSES = {
+    "full",
+    "normal",
+    "low",
+    "reserve",
+    "critical",
+    "cutoff",
+    "unknown",
+}
 STATUS_ALIASES = {
     "0": "empty",
     "1": "low",
@@ -107,6 +122,85 @@ def input_power_w(
     if not math.isfinite(current) or not math.isfinite(voltage):
         return None
     return abs(current * voltage)
+
+
+def classify_vehicle_battery(
+    voltage_v: float | None,
+    *,
+    full_voltage_v: float = VEHICLE_FULL_VOLTAGE_V,
+    low_voltage_v: float = VEHICLE_LOW_VOLTAGE_V,
+    reserve_voltage_v: float = VEHICLE_RESERVE_VOLTAGE_V,
+    critical_voltage_v: float = VEHICLE_CRITICAL_VOLTAGE_V,
+    cutoff_voltage_v: float = VEHICLE_CUTOFF_VOLTAGE_V,
+) -> str:
+    """Classify the shared 3S vehicle bus without pretending it is linear SOC."""
+    thresholds = (
+        float(cutoff_voltage_v),
+        float(critical_voltage_v),
+        float(reserve_voltage_v),
+        float(low_voltage_v),
+        float(full_voltage_v),
+    )
+    if thresholds != tuple(sorted(thresholds)) or len(set(thresholds)) != 5:
+        raise ValueError("vehicle battery thresholds must be strictly increasing")
+    if voltage_v is None or not math.isfinite(float(voltage_v)):
+        return "unknown"
+    voltage = float(voltage_v)
+    if voltage <= cutoff_voltage_v:
+        return "cutoff"
+    if voltage <= critical_voltage_v:
+        return "critical"
+    if voltage <= reserve_voltage_v:
+        return "reserve"
+    if voltage <= low_voltage_v:
+        return "low"
+    # The measured just-charged reference is 12.368 V.  A small margin avoids
+    # dropping out of "full" from ADC quantization alone.
+    if voltage >= full_voltage_v - 0.10:
+        return "full"
+    return "normal"
+
+
+def build_vehicle_battery(
+    channel_voltages,
+    *,
+    full_voltage_v: float = VEHICLE_FULL_VOLTAGE_V,
+    low_voltage_v: float = VEHICLE_LOW_VOLTAGE_V,
+    reserve_voltage_v: float = VEHICLE_RESERVE_VOLTAGE_V,
+    critical_voltage_v: float = VEHICLE_CRITICAL_VOLTAGE_V,
+    cutoff_voltage_v: float = VEHICLE_CUTOFF_VOLTAGE_V,
+) -> dict[str, Any]:
+    """Build robust vehicle-battery telemetry from the shared channel bus."""
+    valid = [
+        float(value)
+        for value in channel_voltages
+        if value is not None
+        and math.isfinite(float(value))
+        and float(value) > 0.0
+    ]
+    voltage = None if not valid else float(statistics.median(valid))
+    status = classify_vehicle_battery(
+        voltage,
+        full_voltage_v=full_voltage_v,
+        low_voltage_v=low_voltage_v,
+        reserve_voltage_v=reserve_voltage_v,
+        critical_voltage_v=critical_voltage_v,
+        cutoff_voltage_v=cutoff_voltage_v,
+    )
+    return {
+        "voltage": None if voltage is None else round(voltage, 3),
+        "status": status,
+        "sensor_ok": bool(valid),
+        "allow_new_tasks": status not in {
+            "reserve",
+            "critical",
+            "cutoff",
+            "unknown",
+        },
+        "cutoff": status == "cutoff",
+        "full_voltage": round(float(full_voltage_v), 3),
+        "cutoff_voltage": round(float(cutoff_voltage_v), 3),
+    }
 
 
 @dataclass
