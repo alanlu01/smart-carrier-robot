@@ -12,7 +12,11 @@ from std_msgs.msg import String
 
 from smart_carrier_api.api_client import ApiError, SmartCarrierApi
 from smart_carrier_api.bridge_store import BridgeStore, is_terminal_result_error
-from smart_carrier_api.claim_queue import ClaimProjectionError, project_claimed_slots
+from smart_carrier_api.claim_queue import (
+    ClaimProjectionError,
+    dispatchable_claimed_tasks,
+    project_claimed_slots,
+)
 
 STATE_QOS = QoSProfile(
     depth=10,
@@ -135,10 +139,13 @@ class ApiBridgeNode(Node):
     def publish_claimed_orders(self):
         interval = float(self.get_parameter("order_republish_interval").value)
         now = time.monotonic()
-        for task in self.claimed_tasks:
-            task_id = str(task["id"])
-            if now - self.last_order_publish_at.get(task_id, 0.0) >= interval:
-                self.publish_order(task)
+        for task in dispatchable_claimed_tasks(
+            self.claimed_tasks,
+            self.last_order_publish_at,
+            now=now,
+            interval=interval,
+        ):
+            self.publish_order(task)
 
     def _submit(self, kind, callback, **context):
         self.network_action = (kind, context)
@@ -358,7 +365,6 @@ class ApiBridgeNode(Node):
             if task_id not in known:
                 self.claimed_tasks.append(task)
                 known.add(task_id)
-                self.publish_order(task)
                 added += 1
         for task_id in sorted(known - remote_ids):
             # Successful reconciliation is authoritative: a locally retained
@@ -374,7 +380,10 @@ class ApiBridgeNode(Node):
             )
         if added:
             self.store.set_claimed_tasks(self.claimed_tasks)
-            self.get_logger().warning(f"雲端對帳復原 {added} 筆本機遺失任務")
+            self.publish_claimed_orders()
+            self.get_logger().warning(
+                f"雲端對帳復原 {added} 筆本機遺失任務；依 FIFO 等待執行"
+            )
 
     def _accept_claim(self, task):
         poll_interval = float(self.get_parameter("poll_interval").value)
@@ -387,10 +396,10 @@ class ApiBridgeNode(Node):
         if task_id not in self.task_ids():
             self.claimed_tasks.append(task)
             self.store.set_claimed_tasks(self.claimed_tasks)
-            self.publish_order(task)
+            self.publish_claimed_orders()
             self.get_logger().info(
                 f"已領取並保存雲端任務 {task_id} "
-                f"({len(self.claimed_tasks)}/{self.max_claimed_tasks})"
+                f"(FIFO {len(self.claimed_tasks)}/{self.max_claimed_tasks})"
             )
         self.next_claim_at = time.monotonic()
 
@@ -464,6 +473,9 @@ class ApiBridgeNode(Node):
         self.last_order_publish_at.pop(item["task_id"], None)
         self.last_cancel_publish_at.pop(item["task_id"], None)
         self.next_task_poll_at.pop(item["task_id"], None)
+        # The next durable queue entry becomes dispatchable only after the
+        # backend has acknowledged and retired the previous head.
+        self.publish_claimed_orders()
         if not terminally_reconciled:
             self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
 

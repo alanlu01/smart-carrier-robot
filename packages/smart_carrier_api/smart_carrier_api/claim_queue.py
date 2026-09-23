@@ -11,6 +11,33 @@ class ClaimProjectionError(ValueError):
     """A claimed task cannot be reserved against the projected inventory."""
 
 
+def dispatchable_claimed_tasks(
+    tasks: list[dict[str, Any]],
+    last_publish_at: dict[str, float],
+    *,
+    now: float,
+    interval: float,
+) -> list[dict[str, Any]]:
+    """Return the FIFO head when it is due for publication.
+
+    Claimed tasks are a durable reservation queue, not independent commands.
+    Publishing every task on its own timer lets a later task reach a newly
+    started delivery node before the queue head.  Holding every non-head task
+    until its predecessors settle makes restart and DDS timing irrelevant.
+    """
+
+    if not tasks:
+        return []
+    head = tasks[0]
+    task_id = str(head.get("id") or "")
+    if not task_id:
+        return []
+    last_published = last_publish_at.get(task_id)
+    if last_published is not None and now - last_published < interval:
+        return []
+    return [head]
+
+
 def _task_type(task: dict[str, Any]) -> str:
     return str(task.get("task_type") or task.get("type") or "").lower()
 

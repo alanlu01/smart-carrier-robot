@@ -1,5 +1,9 @@
 import pytest
-from smart_carrier_api.claim_queue import ClaimProjectionError, project_claimed_slots
+from smart_carrier_api.claim_queue import (
+    ClaimProjectionError,
+    dispatchable_claimed_tasks,
+    project_claimed_slots,
+)
 
 
 def slots():
@@ -98,3 +102,31 @@ def test_navigation_claim_does_not_change_projected_inventory():
 
     assert projected == original
     assert projected is not original
+
+
+def test_only_fifo_head_is_dispatchable_even_when_later_task_has_never_published():
+    tasks = [{"id": "older"}, {"id": "newer"}, {"id": "newest"}]
+
+    assert dispatchable_claimed_tasks(
+        tasks,
+        {"older": 98.0},
+        now=100.0,
+        interval=5.0,
+    ) == []
+    assert dispatchable_claimed_tasks(
+        tasks,
+        {"older": 90.0},
+        now=100.0,
+        interval=5.0,
+    ) == [{"id": "older"}]
+
+
+def test_next_fifo_task_is_immediately_dispatchable_after_head_is_removed():
+    remaining = [{"id": "second"}, {"id": "third"}]
+
+    assert dispatchable_claimed_tasks(
+        remaining,
+        {"first": 100.0},
+        now=100.0,
+        interval=5.0,
+    ) == [{"id": "second"}]
