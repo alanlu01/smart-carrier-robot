@@ -131,3 +131,27 @@ def test_pending_claim_survives_restart(tmp_path):
     recovered.set_pending_claim(None)
     assert recovered.get_pending_claim() is None
     recovered.close()
+
+
+def test_active_batch_and_result_lookup_survive_restart(tmp_path):
+    path = tmp_path / "bridge.sqlite3"
+    store = BridgeStore(path)
+    store.set_active_batch({"id": "batch-1", "task_ids": ["task-1", "task-2"]})
+    result = {
+        "event_id": "event-1",
+        "task_id": "task-1",
+        "status": "done",
+        "note": "stored locally",
+    }
+    assert store.enqueue_result(result)
+    assert store.has_pending_result("task-1")
+    assert store.has_result_event("event-1")
+    store.close()
+
+    recovered = BridgeStore(path)
+    assert recovered.get_active_batch()["task_ids"] == ["task-1", "task-2"]
+    assert recovered.has_pending_result("task-1")
+    assert recovered.has_result_event("event-1")
+    recovered.set_active_batch(None)
+    assert recovered.get_active_batch() is None
+    recovered.close()

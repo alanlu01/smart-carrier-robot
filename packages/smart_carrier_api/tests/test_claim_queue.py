@@ -1,8 +1,9 @@
 import pytest
 from smart_carrier_api.claim_queue import (
     ClaimProjectionError,
-    dispatchable_claimed_tasks,
     project_claimed_slots,
+    should_close_claim_batch,
+    tasks_for_batch,
 )
 
 
@@ -104,29 +105,53 @@ def test_navigation_claim_does_not_change_projected_inventory():
     assert projected is not original
 
 
-def test_only_fifo_head_is_dispatchable_even_when_later_task_has_never_published():
-    tasks = [{"id": "older"}, {"id": "newer"}, {"id": "newest"}]
-
-    assert dispatchable_claimed_tasks(
-        tasks,
-        {"older": 98.0},
-        now=100.0,
-        interval=5.0,
-    ) == []
-    assert dispatchable_claimed_tasks(
-        tasks,
-        {"older": 90.0},
-        now=100.0,
-        interval=5.0,
-    ) == [{"id": "older"}]
+def test_batch_closes_at_capacity_without_waiting_for_timeout():
+    assert should_close_claim_batch(
+        3,
+        now=100.1,
+        started_at=100.0,
+        empty_since=None,
+        max_tasks=3,
+        quiet_period=1.0,
+        max_wait=5.0,
+    )
 
 
-def test_next_fifo_task_is_immediately_dispatchable_after_head_is_removed():
-    remaining = [{"id": "second"}, {"id": "third"}]
+def test_single_task_batch_closes_after_quiet_period_not_after_three_tasks():
+    assert not should_close_claim_batch(
+        1,
+        now=100.9,
+        started_at=100.0,
+        empty_since=100.0,
+        max_tasks=3,
+        quiet_period=1.0,
+        max_wait=5.0,
+    )
+    assert should_close_claim_batch(
+        1,
+        now=101.0,
+        started_at=100.0,
+        empty_since=100.0,
+        max_tasks=3,
+        quiet_period=1.0,
+        max_wait=5.0,
+    )
 
-    assert dispatchable_claimed_tasks(
-        remaining,
-        {"first": 100.0},
-        now=100.0,
-        interval=5.0,
-    ) == [{"id": "second"}]
+
+def test_nonempty_batch_closes_at_bounded_maximum_wait_after_api_timeout():
+    assert should_close_claim_batch(
+        2,
+        now=105.0,
+        started_at=100.0,
+        empty_since=None,
+        max_tasks=3,
+        quiet_period=1.0,
+        max_wait=5.0,
+    )
+
+
+def test_persisted_batch_order_resolves_only_still_claimed_tasks():
+    tasks = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+    batch = {"id": "batch", "task_ids": ["c", "missing", "a"]}
+
+    assert tasks_for_batch(tasks, batch) == [{"id": "c"}, {"id": "a"}]

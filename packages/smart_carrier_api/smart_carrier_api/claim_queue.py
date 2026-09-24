@@ -11,31 +11,36 @@ class ClaimProjectionError(ValueError):
     """A claimed task cannot be reserved against the projected inventory."""
 
 
-def dispatchable_claimed_tasks(
-    tasks: list[dict[str, Any]],
-    last_publish_at: dict[str, float],
+def should_close_claim_batch(
+    task_count: int,
     *,
     now: float,
-    interval: float,
+    started_at: float | None,
+    empty_since: float | None,
+    max_tasks: int,
+    quiet_period: float,
+    max_wait: float,
+) -> bool:
+    """Return whether a non-empty claim collection should become dispatchable."""
+
+    if task_count <= 0 or started_at is None:
+        return False
+    if task_count >= max_tasks:
+        return True
+    if now - started_at >= max_wait:
+        return True
+    return empty_since is not None and now - empty_since >= quiet_period
+
+
+def tasks_for_batch(
+    tasks: list[dict[str, Any]], batch: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
-    """Return the FIFO head when it is due for publication.
+    """Resolve a persisted batch id list against the durable claimed tasks."""
 
-    Claimed tasks are a durable reservation queue, not independent commands.
-    Publishing every task on its own timer lets a later task reach a newly
-    started delivery node before the queue head.  Holding every non-head task
-    until its predecessors settle makes restart and DDS timing irrelevant.
-    """
-
-    if not tasks:
+    if not batch or not isinstance(batch.get("task_ids"), list):
         return []
-    head = tasks[0]
-    task_id = str(head.get("id") or "")
-    if not task_id:
-        return []
-    last_published = last_publish_at.get(task_id)
-    if last_published is not None and now - last_published < interval:
-        return []
-    return [head]
+    by_id = {str(task.get("id")): task for task in tasks if task.get("id")}
+    return [by_id[task_id] for task_id in map(str, batch["task_ids"]) if task_id in by_id]
 
 
 def _task_type(task: dict[str, Any]) -> str:

@@ -121,6 +121,13 @@ class BridgeStore:
             [task for task in self.get_claimed_tasks() if str(task.get("id")) != str(task_id)]
         )
 
+    def set_active_batch(self, batch: dict[str, Any] | None) -> None:
+        self._set_json("active_batch", batch)
+
+    def get_active_batch(self) -> dict[str, Any] | None:
+        batch = self._get_json("active_batch")
+        return batch if isinstance(batch, dict) else None
+
     def set_pending_claim(self, claim: dict[str, Any] | None) -> None:
         self._set_json("pending_claim", claim)
 
@@ -334,4 +341,18 @@ class BridgeStore:
 
     def has_pending_results(self) -> bool:
         row = self.connection.execute("SELECT 1 FROM result_outbox LIMIT 1").fetchone()
+        return row is not None
+
+    def has_pending_result(self, task_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM result_outbox WHERE task_id = ? LIMIT 1",
+            (str(task_id),),
+        ).fetchone()
+        return row is not None
+
+    def has_result_event(self, event_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM result_outbox WHERE event_id = ? LIMIT 1",
+            (str(event_id),),
+        ).fetchone()
         return row is not None

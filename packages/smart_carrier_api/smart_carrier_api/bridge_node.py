@@ -14,8 +14,9 @@ from smart_carrier_api.api_client import ApiError, SmartCarrierApi
 from smart_carrier_api.bridge_store import BridgeStore, is_terminal_result_error
 from smart_carrier_api.claim_queue import (
     ClaimProjectionError,
-    dispatchable_claimed_tasks,
     project_claimed_slots,
+    should_close_claim_batch,
+    tasks_for_batch,
 )
 
 STATE_QOS = QoSProfile(
@@ -47,6 +48,9 @@ class ApiBridgeNode(Node):
         self.declare_parameter("cancel_republish_interval", 2.0)
         self.declare_parameter("reconcile_interval", 10.0)
         self.declare_parameter("max_claimed_tasks", 3)
+        self.declare_parameter("batch_quiet_period", 1.0)
+        self.declare_parameter("batch_max_wait", 5.0)
+        self.declare_parameter("batch_claim_retry_interval", 0.25)
 
         api_url = str(self.get_parameter("api_url").value)
         robot_id = str(self.get_parameter("robot_id").value)
@@ -58,9 +62,21 @@ class ApiBridgeNode(Node):
         self.max_claimed_tasks = int(self.get_parameter("max_claimed_tasks").value)
         if self.max_claimed_tasks < 1:
             raise ValueError("max_claimed_tasks 必須至少為 1")
+        self.batch_quiet_period = float(self.get_parameter("batch_quiet_period").value)
+        self.batch_max_wait = float(self.get_parameter("batch_max_wait").value)
+        self.batch_claim_retry_interval = float(
+            self.get_parameter("batch_claim_retry_interval").value
+        )
+        if self.batch_quiet_period < 0 or self.batch_max_wait <= 0:
+            raise ValueError("批次收集時間參數必須為正值")
+        if self.batch_claim_retry_interval <= 0:
+            raise ValueError("批次 claim 重試間隔必須大於 0")
 
         self.claimed_tasks = self.store.get_claimed_tasks()
-        self.last_order_publish_at = {}
+        self.active_batch = self.store.get_active_batch()
+        self.last_batch_publish_at = 0.0
+        self.collection_started_at: float | None = None
+        self.collection_empty_since: float | None = None
         self.last_cancel_publish_at = {}
         self.last_error_at = 0.0
         self.slots = []
@@ -129,27 +145,144 @@ class ApiBridgeNode(Node):
     def task_ids(self):
         return {str(task.get("id")) for task in self.claimed_tasks if task.get("id")}
 
-    def publish_order(self, task):
-        task_id = str(task["id"])
-        message = String()
-        message.data = json.dumps(task, ensure_ascii=False)
-        self.order_publisher.publish(message)
-        self.last_order_publish_at[task_id] = time.monotonic()
-
     def publish_claimed_orders(self):
-        interval = float(self.get_parameter("order_republish_interval").value)
+        if not self.active_batch:
+            return
         now = time.monotonic()
-        for task in dispatchable_claimed_tasks(
-            self.claimed_tasks,
-            self.last_order_publish_at,
+        interval = float(self.get_parameter("order_republish_interval").value)
+        if now - self.last_batch_publish_at < interval:
+            return
+        tasks = tasks_for_batch(self.claimed_tasks, self.active_batch)
+        tasks = [
+            task
+            for task in tasks
+            if not self.store.has_pending_result(str(task.get("id")))
+        ]
+        if not tasks:
+            self._set_active_batch(None)
+            return
+        message = String()
+        message.data = json.dumps(
+            {
+                "batch_id": self.active_batch["id"],
+                "orders": tasks,
+                "created_at": self.active_batch.get("created_at"),
+            },
+            ensure_ascii=False,
+        )
+        self.order_publisher.publish(message)
+        self.last_batch_publish_at = now
+
+    def _set_active_batch(self, batch):
+        self.active_batch = batch
+        self.store.set_active_batch(batch)
+        self.last_batch_publish_at = 0.0
+
+    def _collectable_tasks(self):
+        return [
+            task
+            for task in self.claimed_tasks
+            if task.get("id")
+            and not self.store.has_pending_result(str(task["id"]))
+        ]
+
+    def _ensure_collection(self, now):
+        if self.active_batch or not self._collectable_tasks():
+            return
+        if self.collection_started_at is None:
+            self.collection_started_at = now
+            self.collection_empty_since = None
+
+    def _maybe_close_collection(self, now):
+        if self.active_batch:
+            return False
+        tasks = self._collectable_tasks()
+        self._ensure_collection(now)
+        if not should_close_claim_batch(
+            len(tasks),
             now=now,
-            interval=interval,
+            started_at=self.collection_started_at,
+            empty_since=self.collection_empty_since,
+            max_tasks=self.max_claimed_tasks,
+            quiet_period=self.batch_quiet_period,
+            max_wait=self.batch_max_wait,
         ):
-            self.publish_order(task)
+            return False
+        batch = {
+            "id": str(uuid.uuid4()),
+            "task_ids": [str(task["id"]) for task in tasks],
+            "created_at": time.time(),
+        }
+        self._set_active_batch(batch)
+        if self.store.get_pending_claim() is not None:
+            # A timed-out claim may have committed remotely.  Do not let its
+            # stale slot snapshot leak into the next batch; reconciliation will
+            # recover the idempotently claimed task before another claim begins.
+            self.store.set_pending_claim(None)
+            self.reconciled = False
+            self.next_reconcile_at = now
+        self.collection_started_at = None
+        self.collection_empty_since = None
+        self.publish_claimed_orders()
+        self.get_logger().info(
+            f"批次 {batch['id']} 已封存，共 {len(tasks)} 筆；交由車端一次排程"
+        )
+        return True
+
+    def _complete_batch_task_locally(self, task_id):
+        if not self.active_batch:
+            return
+        remaining = [
+            item
+            for item in self.active_batch.get("task_ids", [])
+            if str(item) != str(task_id)
+        ]
+        if remaining:
+            batch = dict(self.active_batch)
+            batch["task_ids"] = remaining
+            self._set_active_batch(batch)
+        else:
+            self._set_active_batch(None)
 
     def _submit(self, kind, callback, **context):
         self.network_action = (kind, context)
         self.network_future = self.network.submit(callback)
+
+    def _try_submit_claim(self, now, poll_interval):
+        if (
+            self.active_batch
+            or not self.reconciled
+            or self.store.has_pending_results()
+            or self.order_publisher.get_subscription_count() == 0
+        ):
+            return False
+        pending_claim = self.store.get_pending_claim()
+        if pending_claim is None:
+            if not self.power_healthy or len(self.claimed_tasks) >= self.max_claimed_tasks:
+                return False
+            if now < self.next_claim_at:
+                return False
+            try:
+                projected_slots = project_claimed_slots(self.slots, self.claimed_tasks)
+            except ClaimProjectionError as exc:
+                self.get_logger().error(f"多筆任務槽位預約失敗：{exc}")
+                self.next_claim_at = now + poll_interval
+                return False
+            pending_claim = {
+                "claim_request_id": str(uuid.uuid4()),
+                "slots": projected_slots,
+            }
+            # Persist before POST so a lost response retries the same claim.
+            self.store.set_pending_claim(pending_claim)
+
+        self._submit(
+            "claim",
+            lambda claim=pending_claim: self.api.claim_task(
+                claim["slots"], claim["claim_request_id"]
+            ),
+            claim=pending_claim,
+        )
+        return True
 
     def network_cycle(self):
         if not self.configured:
@@ -177,6 +310,9 @@ class ApiBridgeNode(Node):
                 return
 
         now = time.monotonic()
+        if self.reconciled:
+            self._ensure_collection(now)
+            self._maybe_close_collection(now)
         progress = self.store.next_progress()
         if progress and now >= self.next_progress_at:
             self._submit(
@@ -211,6 +347,11 @@ class ApiBridgeNode(Node):
             return
 
         poll_interval = float(self.get_parameter("poll_interval").value)
+        if self.collection_started_at is not None and self._try_submit_claim(
+            now, poll_interval
+        ):
+            return
+
         for task in self.claimed_tasks:
             task_id = str(task["id"])
             if now >= self.next_task_poll_at.get(task_id, 0.0):
@@ -235,37 +376,7 @@ class ApiBridgeNode(Node):
             self._submit("heartbeat", lambda p=payload: self.api.heartbeat(p))
             return
 
-        if not self.reconciled or self.store.has_pending_results():
-            return
-        if self.order_publisher.get_subscription_count() == 0:
-            return
-
-        pending_claim = self.store.get_pending_claim()
-        if pending_claim is None:
-            if not self.power_healthy or len(self.claimed_tasks) >= self.max_claimed_tasks:
-                return
-            if now < self.next_claim_at:
-                return
-            try:
-                projected_slots = project_claimed_slots(self.slots, self.claimed_tasks)
-            except ClaimProjectionError as exc:
-                self.get_logger().error(f"多筆任務槽位預約失敗：{exc}")
-                self.next_claim_at = now + poll_interval
-                return
-            pending_claim = {
-                "claim_request_id": str(uuid.uuid4()),
-                "slots": projected_slots,
-            }
-            # Persist before POST so a lost response retries the same claim.
-            self.store.set_pending_claim(pending_claim)
-
-        self._submit(
-            "claim",
-            lambda claim=pending_claim: self.api.claim_task(
-                claim["slots"], claim["claim_request_id"]
-            ),
-            claim=pending_claim,
-        )
+        self._try_submit_claim(now, poll_interval)
 
     def _handle_network_success(self, kind, context, result):
         was_offline = self.network_online is False
@@ -380,15 +491,20 @@ class ApiBridgeNode(Node):
             )
         if added:
             self.store.set_claimed_tasks(self.claimed_tasks)
-            self.publish_claimed_orders()
             self.get_logger().warning(
-                f"雲端對帳復原 {added} 筆本機遺失任務；依 FIFO 等待執行"
+                f"雲端對帳復原 {added} 筆本機遺失任務；等待批次排程"
             )
 
     def _accept_claim(self, task):
         poll_interval = float(self.get_parameter("poll_interval").value)
+        now = time.monotonic()
         if not task:
-            self.next_claim_at = time.monotonic() + poll_interval
+            if self._collectable_tasks():
+                if self.collection_empty_since is None:
+                    self.collection_empty_since = now
+                self.next_claim_at = now + self.batch_claim_retry_interval
+            else:
+                self.next_claim_at = now + poll_interval
             return
         if not isinstance(task, dict) or not task.get("id"):
             raise ApiError("API claimed task without an id")
@@ -396,12 +512,14 @@ class ApiBridgeNode(Node):
         if task_id not in self.task_ids():
             self.claimed_tasks.append(task)
             self.store.set_claimed_tasks(self.claimed_tasks)
-            self.publish_claimed_orders()
+            if self.collection_started_at is None:
+                self.collection_started_at = now
+            self.collection_empty_since = None
             self.get_logger().info(
                 f"已領取並保存雲端任務 {task_id} "
-                f"(FIFO {len(self.claimed_tasks)}/{self.max_claimed_tasks})"
+                f"(批次收集 {len(self._collectable_tasks())}/{self.max_claimed_tasks})"
             )
-        self.next_claim_at = time.monotonic()
+        self.next_claim_at = now
 
     def _handle_task_status(self, task_id, task):
         if not isinstance(task, dict):
@@ -451,13 +569,19 @@ class ApiBridgeNode(Node):
                 raise ValueError(f"不支援的任務結果狀態：{status}")
             if task_id not in self.task_ids():
                 self.get_logger().warning(f"保存非目前 claimed queue 任務結果：{task_id}")
-            if self.store.enqueue_result(result):
+            stored = self.store.enqueue_result(result)
+            if stored:
                 self.get_logger().info(
                     f"任務結果已保存至本機 outbox，等待雲端確認：{task_id} ({event_id})"
                 )
-            elif self.store.is_result_settled(event_id):
-                # TRANSIENT_LOCAL can replay several copies after bridge restart.
-                # Re-ACK them without recreating an already settled outbox row.
+            if stored or self.store.has_result_event(event_id) or self.store.is_result_settled(
+                event_id
+            ):
+                # This ACK means the terminal result is durably owned by the
+                # bridge, not that the cloud has already replied.  It lets the
+                # delivery node continue the frozen route while the outbox
+                # retries independently across network outages and restarts.
+                self._complete_batch_task_locally(task_id)
                 ack = String()
                 ack.data = json.dumps({"event_id": event_id, "task_id": task_id})
                 self.result_ack_publisher.publish(ack)
@@ -470,12 +594,8 @@ class ApiBridgeNode(Node):
         ack = String()
         ack.data = json.dumps({"event_id": item["event_id"], "task_id": item["task_id"]})
         self.result_ack_publisher.publish(ack)
-        self.last_order_publish_at.pop(item["task_id"], None)
         self.last_cancel_publish_at.pop(item["task_id"], None)
         self.next_task_poll_at.pop(item["task_id"], None)
-        # The next durable queue entry becomes dispatchable only after the
-        # backend has acknowledged and retired the previous head.
-        self.publish_claimed_orders()
         if not terminally_reconciled:
             self.get_logger().info(f"雲端已確認任務結果 {item['task_id']}: {item['status']}")
 

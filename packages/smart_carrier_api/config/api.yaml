@@ -6,3 +6,6 @@ smart_carrier_api_bridge:
     order_republish_interval: 5.0
     reconcile_interval: 10.0
     max_claimed_tasks: 3
+    batch_quiet_period: 1.0
+    batch_max_wait: 5.0
+    batch_claim_retry_interval: 0.25

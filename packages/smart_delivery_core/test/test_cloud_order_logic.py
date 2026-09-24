@@ -233,7 +233,7 @@ def test_invalid_cloud_order_is_rejected_before_navigation():
         )
 
 
-def test_multiple_orders_apply_borrow_distance_weight_to_route_selection():
+def test_multiple_orders_choose_lowest_total_weighted_route():
     orders = [
         order_payload_to_order(
             {
@@ -261,8 +261,48 @@ def test_multiple_orders_apply_borrow_distance_weight_to_route_selection():
 
     assert not deferred
     assert [order["task_id"] for order in route] == [
-        "farther-borrow",
         "near-navigation",
+        "farther-borrow",
+    ]
+
+
+def test_batch_route_simulates_slot_changes_before_choosing_order():
+    orders = [
+        order_payload_to_order(
+            {
+                "id": "return-after-capacity",
+                "task_type": "return",
+                "location": {"name": "return", "x": 2.0, "y": 0.0, "yaw": 0.0},
+            }
+        ),
+        order_payload_to_order(
+            {
+                "id": "borrow-first",
+                "task_type": "borrow",
+                "power_bank_id": "PB-01",
+                "location": {"name": "borrow", "x": 1.0, "y": 0.0, "yaw": 0.0},
+            }
+        ),
+    ]
+    full_slots = [
+        {
+            "slot": number,
+            "bank_id": f"PB-0{number}",
+            "status": "full",
+            "charge": 100,
+            "sensor_ok": True,
+        }
+        for number in range(1, 4)
+    ]
+
+    route, deferred, _ = schedule_orders(
+        orders, {"x": 0.0, "y": 0.0}, full_slots
+    )
+
+    assert not deferred
+    assert [order["task_id"] for order in route] == [
+        "borrow-first",
+        "return-after-capacity",
     ]
 
 

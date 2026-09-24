@@ -4,6 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import permutations
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
@@ -176,6 +177,96 @@ def schedule_orders(
     borrow_distance_weight=BORROW_DISTANCE_WEIGHT,
 ):
     orders = [dict(order) for order in pending_orders]
+    if not orders:
+        return [], [], _prepare_slots(power_banks, slot_capacity, status_aliases)
+
+    # A batch contains at most three tasks, so evaluating every permutation is
+    # both cheaper and more predictable than greedily choosing one task at a
+    # time.  Each candidate simulates slot inventory after every stop, which
+    # rejects routes that would return into a full carrier or borrow a bank that
+    # a previous stop already removed.
+    if len(orders) <= 6:
+        candidates = []
+        for order_indexes in permutations(range(len(orders))):
+            slots = _prepare_slots(power_banks, slot_capacity, status_aliases)
+            position = {"x": float(current_pos["x"]), "y": float(current_pos["y"])}
+            route = []
+            weighted_distance = 0.0
+            total_distance = 0.0
+            feasible = True
+
+            for order_index in order_indexes:
+                order = orders[order_index]
+                order_type = order.get("type")
+                distance = math.hypot(
+                    float(order["x"]) - position["x"],
+                    float(order["y"]) - position["y"],
+                )
+                scheduled_order = dict(order)
+                scheduled_order["distance"] = distance
+
+                if order_type == "borrow":
+                    selection = select_power_bank(
+                        slots,
+                        float(order.get("required_charge", 0)),
+                        status_aliases,
+                        order.get("power_bank_id"),
+                    )
+                    if selection is None:
+                        feasible = False
+                        break
+                    slot_index, power_bank = selection
+                    scheduled_order["selected_power_bank"] = dict(power_bank)
+                    scheduled_order["slot_number"] = slot_index + 1
+                    slots[slot_index] = None
+                    weighted_distance += distance * borrow_distance_weight
+                elif order_type == "return":
+                    try:
+                        slot_index = slots.index(None)
+                    except ValueError:
+                        feasible = False
+                        break
+                    power_bank = _returned_power_bank(
+                        order, len(route) + 1, status_aliases
+                    )
+                    slots[slot_index] = power_bank
+                    scheduled_order["returned_power_bank"] = dict(power_bank)
+                    scheduled_order["slot_number"] = slot_index + 1
+                    weighted_distance += distance
+                elif order_type in NAVIGATION_ONLY_TASK_TYPES:
+                    weighted_distance += distance
+                else:
+                    feasible = False
+                    break
+
+                total_distance += distance
+                route.append(scheduled_order)
+                position = {
+                    "x": float(scheduled_order["x"]),
+                    "y": float(scheduled_order["y"]),
+                }
+
+            if feasible:
+                # Original claim order is the final deterministic tie-breaker.
+                candidates.append(
+                    (
+                        weighted_distance,
+                        total_distance,
+                        order_indexes,
+                        route,
+                        slots,
+                    )
+                )
+
+        if candidates:
+            _, _, _, route, slots = min(
+                candidates, key=lambda item: (item[0], item[1], item[2])
+            )
+            return route, [], slots
+
+    # Hardware state can change after cloud claim.  Preserve the previous
+    # partial-route behavior so currently feasible work may finish and the
+    # remaining task can be released with an explicit inventory reason.
     slots = _prepare_slots(power_banks, slot_capacity, status_aliases)
     position = {"x": float(current_pos["x"]), "y": float(current_pos["y"])}
     optimized_route = []
@@ -519,11 +610,18 @@ def main():
     latest_power_status_at = 0.0
     latest_power_sequence = 0
     last_power_error_at = 0.0
-    pending_orders = []
     active_task_id = None
     cancellation_requests = {}
     journal = DeliveryJournal()
     recovered = journal.load()
+    recovered_orders = recovered.get("pending_orders")
+    pending_orders = (
+        [dict(order) for order in recovered_orders if isinstance(order, dict)]
+        if isinstance(recovered_orders, list)
+        else []
+    )
+    current_batch_id = recovered.get("batch_id")
+    route_planned = bool(recovered.get("route_planned", False))
     pending_result = recovered.get("pending_result")
     active_task = recovered.get("active_task")
     recovered_state = recovered.get("state")
@@ -569,6 +667,11 @@ def main():
 
     def persist(active=None, state=None, result=None):
         data = {}
+        if current_batch_id is not None:
+            data["batch_id"] = current_batch_id
+        if pending_orders:
+            data["pending_orders"] = pending_orders
+            data["route_planned"] = route_planned
         if active is not None:
             data["active_task"] = active
         if state is not None:
@@ -613,19 +716,28 @@ def main():
         publish_task_state(task_state_publisher, task.get("task_id"), state, **details)
 
     def result_ack_callback(message):
-        nonlocal active_task, pending_result
+        nonlocal active_task, pending_result, current_batch_id, route_planned
         try:
             ack = json.loads(message.data)
             if pending_result and str(ack.get("event_id")) == pending_result["event_id"]:
-                terminal_task_ids.add(str(pending_result["task_id"]))
+                completed_task_id = str(pending_result["task_id"])
+                terminal_task_ids.add(completed_task_id)
                 publish_task_state(
                     task_state_publisher,
-                    pending_result["task_id"],
+                    completed_task_id,
                     "result_acked",
                 )
+                pending_orders[:] = [
+                    order
+                    for order in pending_orders
+                    if str(order.get("task_id")) != completed_task_id
+                ]
                 pending_result = None
                 active_task = None
-                journal.clear()
+                if not pending_orders:
+                    current_batch_id = None
+                    route_planned = False
+                persist()
         except (TypeError, json.JSONDecodeError):
             navigator.get_logger().warning("忽略無效 task_result_ack")
 
@@ -637,7 +749,18 @@ def main():
         task_id = active_task.get("task_id") or active_task.get("id")
         active_task = dict(active_task)
         active_task["_resume_state"] = recovered_state or "task_accepted"
-        pending_orders.insert(0, active_task)
+        recovered_index = next(
+            (
+                index
+                for index, order in enumerate(pending_orders)
+                if str(order.get("task_id")) == str(task_id)
+            ),
+            None,
+        )
+        if recovered_index is None:
+            pending_orders.insert(0, active_task)
+        else:
+            pending_orders[recovered_index] = active_task
         persist(active_task, recovered_state or "task_accepted", None)
         publish_task_state(
             task_state_publisher,
@@ -666,29 +789,64 @@ def main():
     navigator.create_subscription(String, "power_status", power_status_callback, 10)
 
     def order_callback(msg):
+        nonlocal current_batch_id, route_planned
         task_id = None
         try:
             raw = json.loads(msg.data)
-            task_id = raw.get("id")
-            order = order_payload_to_order(raw)
-            task_id = str(task_id)
+            if isinstance(raw, dict) and isinstance(raw.get("orders"), list):
+                batch_id = str(raw.get("batch_id") or "")
+                if not batch_id:
+                    raise ValueError("批次訂單缺少 batch_id")
+                raw_orders = raw["orders"]
+            else:
+                raw_orders = [raw]
+                batch_id = None
+
+            has_current_work = bool(pending_orders or active_task or pending_result)
+            if batch_id and current_batch_id not in {None, batch_id} and has_current_work:
+                navigator.get_logger().warning(
+                    f"目前仍在執行批次 {current_batch_id}，暫不接收新批次 {batch_id}"
+                )
+                return
+            if batch_id and current_batch_id != batch_id:
+                current_batch_id = batch_id
+                route_planned = False
+
             active_id = None
             if active_task:
                 active_id = str(active_task.get("task_id") or active_task.get("id"))
             result_id = str(pending_result["task_id"]) if pending_result else None
-            if task_id in terminal_task_ids or task_id in {active_id, result_id}:
-                return
-            if any(item.get("task_id") == task_id for item in pending_orders):
-                return
-            pending_orders.append(order)
-            publish_task_state(
-                task_state_publisher,
-                task_id,
-                "queued_on_robot",
-                progress_message=f"Queued on robot ({len(pending_orders)} waiting)",
-            )
-            print(f"\n📥 收到雲端任務：{order['name']} ({order['type']})")
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            parsed_orders = []
+            for raw_order in raw_orders:
+                raw_task_id = raw_order.get("id")
+                if raw_task_id is None:
+                    raise ValueError("訂單缺少 id")
+                task_id = str(raw_task_id)
+                order = order_payload_to_order(raw_order)
+                parsed_orders.append((task_id, order))
+
+            added = 0
+            for task_id, order in parsed_orders:
+                if task_id in terminal_task_ids or task_id in {active_id, result_id}:
+                    continue
+                if any(item.get("task_id") == task_id for item in pending_orders):
+                    continue
+                pending_orders.append(order)
+                added += 1
+                publish_task_state(
+                    task_state_publisher,
+                    task_id,
+                    "queued_on_robot",
+                    progress_message=f"Queued on robot ({len(pending_orders)} waiting)",
+                )
+                print(f"\n📥 收到雲端任務：{order['name']} ({order['type']})")
+            if added:
+                persist()
+                if batch_id:
+                    navigator.get_logger().info(
+                        f"已接收批次 {batch_id}，共新增 {added} 筆，等待一次排程"
+                    )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             navigator.get_logger().error(f"訂單解析失敗：{exc}")
             if task_id:
                 invalid_task = {"task_id": str(task_id)}
@@ -981,23 +1139,31 @@ def main():
         target = interrupted_localization_order(pending_orders)
         resumed_after_localization = target is not None
         if target is None:
-            optimized_route, _, _ = schedule_orders(
-                pending_orders, current_pos, latest_power_banks, slot_capacity=3
-            )
-            if not optimized_route:
-                target = pending_orders.pop(0)
-                active_task = target
-                fsm = DeliveryStateMachine("task_accepted")
-                persist(active_task, fsm.state, None)
-                progress(
-                    target,
-                    fsm,
-                    "precheck",
-                    progress_message="Checking slot availability",
+            if not route_planned:
+                optimized_route, deferred_orders, _ = schedule_orders(
+                    pending_orders, current_pos, latest_power_banks, slot_capacity=3
                 )
-                queue_result(target, fsm, "released", infeasible_order_note(target))
-                continue
-            target = optimized_route[0]
+                if not optimized_route:
+                    target = pending_orders.pop(0)
+                    active_task = target
+                    fsm = DeliveryStateMachine("task_accepted")
+                    persist(active_task, fsm.state, None)
+                    progress(
+                        target,
+                        fsm,
+                        "precheck",
+                        progress_message="Checking slot availability",
+                    )
+                    queue_result(target, fsm, "released", infeasible_order_note(target))
+                    continue
+                pending_orders[:] = optimized_route + deferred_orders
+                route_planned = not deferred_orders
+                persist()
+                route_names = " → ".join(order["name"] for order in optimized_route)
+                navigator.get_logger().info(
+                    f"批次 {current_batch_id or 'legacy'} 路線已固定：{route_names}"
+                )
+            target = pending_orders[0]
 
         active_task = target
         initial_state = "waiting_localization" if resumed_after_localization else "task_accepted"
@@ -1119,6 +1285,10 @@ def main():
                 for order in pending_orders
                 if (order.get("task_id") or (order["name"], order["type"])) != target_key
             ]
+            if not pending_orders:
+                current_batch_id = None
+                route_planned = False
+            persist(active_task, fsm.state, pending_result)
         active_task_id = None
 
     if rclpy.ok():
