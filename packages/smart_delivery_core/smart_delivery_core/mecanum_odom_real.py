@@ -6,8 +6,10 @@ from geometry_msgs.msg import TransformStamped, Quaternion
 import tf2_ros
 import math
 import time
+import json
 
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
+from smart_delivery_core.pipeline_health import ReceiptMetrics
 
 class MecanumOdomReal(Node):
     def __init__(self):
@@ -58,6 +60,11 @@ class MecanumOdomReal(Node):
             started_at=time.monotonic(),
         )
         self.feedback_state = 'waiting'
+        self.receipt_metrics = ReceiptMetrics()
+        self.feedback_health_pub = self.create_publisher(
+            String, '/chassis/feedback_health', 1
+        )
+        self.feedback_health_timer = self.create_timer(1.0, self.publish_feedback_health)
         
         # 🌟 5. 修正後的精準車體幾何參數
         self.wheel_radius = 0.08  # 真實輪子半徑 8cm
@@ -89,6 +96,7 @@ class MecanumOdomReal(Node):
         self.get_logger().info('真實硬體里程計解析節點已成功啟動！監聽中...')
 
     def stm32_data_callback(self, msg):
+        self.receipt_metrics.observe('stm32_data', time.monotonic())
         raw_str = msg.data
         try:
             snapshot = self.feedback_assembler.add_line(raw_str, time.monotonic())
@@ -122,6 +130,7 @@ class MecanumOdomReal(Node):
 
     def update_odometry(self):
         current_time = time.monotonic()
+        self.receipt_metrics.observe('odom_timer', current_time)
         dt = min(
             max(0.0, current_time - self.last_time),
             self.max_integration_dt_sec,
@@ -190,6 +199,19 @@ class MecanumOdomReal(Node):
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = vth
         self.odom_pub.publish(odom)
+
+    def publish_feedback_health(self):
+        """Report receipt/group/timer timing without altering odometry control."""
+        now = time.monotonic()
+        payload = {
+            'state': self.feedback_state,
+            'complete_sample_count': self.feedback_assembler.complete_sample_count,
+            'complete_sample_age_sec': round(self.feedback_assembler.sample_age(now), 3),
+            'receipts': self.receipt_metrics.snapshot(now),
+        }
+        message = String()
+        message.data = json.dumps(payload)
+        self.feedback_health_pub.publish(message)
 
 def main(args=None):
     rclpy.init(args=args)

@@ -25,6 +25,7 @@ from smart_delivery_core.delivery_state import (
     navigation_was_interrupted_by_localization,
 )
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
+from smart_delivery_core.standby_retry import StandbyRetryPolicy
 
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
@@ -467,10 +468,12 @@ def go_to_standby(
     localization_is_ready=lambda: True,
     set_navigation_active=lambda _active: None,
     new_task_waiting=lambda: False,
+    on_outcome=lambda _point, _state: None,
+    standby_point=None,
 ):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
-    closest_standby = min(
+    closest_standby = standby_point or min(
         STANDBY_POINTS,
         key=lambda pt: math.hypot(pt["x"] - current_pos["x"], pt["y"] - current_pos["y"]),
     )
@@ -483,6 +486,7 @@ def go_to_standby(
     goal_pose.pose.position.y = closest_standby["y"]
     goal_pose.pose.orientation = yaw_to_quaternion(closest_standby["yaw"])
 
+    on_outcome(closest_standby, "approaching")
     set_navigation_active(True)
     try:
         navigator.goToPose(goal_pose)
@@ -494,18 +498,29 @@ def go_to_standby(
                 navigator.get_logger().info("收到新任務，已中斷待機點導航")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
+                on_outcome(closest_standby, "interrupted_by_order")
                 return None
             if not localization_is_ready():
                 navigator.cancelTask()
                 navigator.get_logger().warning("定位可信度不足，已取消前往待機點")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
+                on_outcome(closest_standby, "interrupted_by_localization")
                 return None
         result = navigator.getResult()
     finally:
         set_navigation_active(False)
 
+    # Cancel/ready callbacks may arrive with the terminal Nav2 result rather
+    # than inside the loop. They are not failed parking attempts or arrivals.
+    if new_task_waiting():
+        on_outcome(closest_standby, "interrupted_by_order")
+        return None
+    if not localization_is_ready():
+        on_outcome(closest_standby, "interrupted_by_localization")
+        return None
     if result != TaskResult.SUCCEEDED:
+        on_outcome(closest_standby, "failed")
         navigator.get_logger().warning(
             f"前往待機點 {closest_standby['name']} 未成功（result={result}）；"
             "保留實際位置並稍後重試"
@@ -513,6 +528,7 @@ def go_to_standby(
         return None
 
     print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
+    on_outcome(closest_standby, "arrived")
     return {"x": closest_standby["x"], "y": closest_standby["y"]}
 
 
@@ -549,6 +565,45 @@ def main():
     localization_wait_started_at = time.monotonic()
     last_localization_warning_at = 0.0
     is_standby = False
+    standby_retry = StandbyRetryPolicy()
+    standby_state_publisher = navigator.create_publisher(
+        String, "/delivery/standby_state", STATE_QOS
+    )
+    last_standby_status_at = 0.0
+    last_standby_status = None
+
+    def report_standby(point, state):
+        nonlocal last_standby_status_at, last_standby_status
+        now = time.monotonic()
+        if state == "failed":
+            standby_retry.failed(now)
+            state = standby_retry.status(now)
+            navigator.get_logger().warning(
+                f"待機導航失敗 {standby_retry.failures}/{standby_retry.max_attempts}；"
+                + ("停止自動重試，新訂單仍可執行"
+                   if state == "blocked" else
+                   f"{standby_retry.retry_at - now:.0f} 秒後才可重試")
+            )
+        elif state == "arrived":
+            standby_retry.reset()
+        payload = {
+            "state": state, "name": point["name"],
+            "x": point["x"], "y": point["y"], "yaw": point["yaw"],
+            "failed_attempts": standby_retry.failures,
+            "max_attempts": standby_retry.max_attempts,
+            "retry_in_sec": (
+                round(max(0.0, standby_retry.retry_at - now), 1)
+                if state == "retry_wait" else None
+            ),
+            "parked": state == "arrived",
+        }
+        key = (point["name"], state, standby_retry.failures)
+        if key == last_standby_status and now - last_standby_status_at < 1.0:
+            return
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=False)
+        standby_state_publisher.publish(message)
+        last_standby_status, last_standby_status_at = key, now
 
     def localization_ready_callback(message):
         nonlocal localization_ready, localization_ready_received
@@ -1100,20 +1155,36 @@ def main():
 
         if not pending_orders:
             if not is_standby:
-                print("\n🏁 無待處理任務，返回待機點")
                 current_pos = refresh_current_position(current_pos)
+                point = min(
+                    STANDBY_POINTS,
+                    key=lambda pt: math.hypot(
+                        pt["x"] - current_pos["x"], pt["y"] - current_pos["y"]
+                    ),
+                )
+                standby_retry.select_goal(point)
+                if not standby_retry.can_attempt(time.monotonic()):
+                    report_standby(point, standby_retry.status(time.monotonic()))
+                    continue
+                print("\n🏁 無待處理任務，返回待機點")
+                print(f"待機嘗試 {standby_retry.failures + 1}/{standby_retry.max_attempts}")
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
                     lambda: localization_ready is True,
                     set_navigation_active,
                     lambda: bool(pending_orders),
+                    report_standby,
+                    point,
                 )
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
             continue
 
+        # A service order always bypasses parking backoff/exhaustion. Rearm the
+        # next parking episode, without changing batch scheduling or inventory.
+        standby_retry.reset()
         now = time.monotonic()
         if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
             if now - last_stale_warning_at >= 10.0:

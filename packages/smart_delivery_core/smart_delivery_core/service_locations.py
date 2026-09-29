@@ -2,7 +2,9 @@
 
 STANDBY_POINTS = [
     {"name": "CYCU EE", "x": 2.4, "y": 5.0, "yaw": 0.0},
-    {"name": "座位燈", "x": 0.7, "y": -5.0, "yaw": 0.0},
+    # 2026-09-29 costmap: x=0.7 overlaps obstacles; x=1.2 also reserves
+    # the existing 0.10 m arrival tolerance away from the rear obstruction.
+    {"name": "座位燈", "x": 1.2, "y": -5.0, "yaw": 0.0},
 ]
 
 LOCATION_DB = {

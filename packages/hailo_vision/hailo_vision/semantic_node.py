@@ -13,6 +13,7 @@ from ament_index_python.packages import get_package_share_directory
 from hailo_platform import HEF, VDevice, InferVStreams, InputVStreamParams, OutputVStreamParams, FormatType
 
 from hailo_vision.semantic_protocol import build_semantic_payload
+from hailo_vision.pipeline_metrics import PipelineMetrics
 
 
 CAMERA_QOS = QoSProfile(
@@ -116,6 +117,9 @@ class SemanticVisionNode(Node):
         )
         self.image_pub = self.create_publisher(Image, '/hailo_vision/semantic_image', 10)
         self.info_pub = self.create_publisher(String, '/vision/semantic_info', 10)
+        self.pipeline_metrics = PipelineMetrics(time.monotonic())
+        self.pipeline_pub = self.create_publisher(String, '/vision/pipeline_health', 1)
+        self.pipeline_timer = self.create_timer(1.0, self.publish_pipeline_health)
         
         self.get_logger().info('🚀 Hailo 語意導航大腦啟動！開始鎖定目標方位...')
         self.frame_count = 0
@@ -128,6 +132,14 @@ class SemanticVisionNode(Node):
         self.IMAGE_PUB_INTERVAL = 3  # 每 3 幀才發布一次影像
 
     def image_callback(self, msg):
+        started = time.monotonic()
+        self.pipeline_metrics.observe('image', started)
+        source_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if source_stamp_ns > 0:
+            self.pipeline_metrics.measure(
+                'source_age_at_receive_sec',
+                (self.get_clock().now().nanoseconds - source_stamp_ns) / 1e9,
+            )
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         original_shape = frame.shape
         img_w = original_shape[1]
@@ -135,15 +147,23 @@ class SemanticVisionNode(Node):
         input_frame = cv2.resize(frame, (640, 640))
         input_frame = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
         input_data = {self.input_name: np.expand_dims(input_frame, axis=0)}
+        prepared = time.monotonic()
+        self.pipeline_metrics.measure('preprocess_sec', prepared - started)
         
         infer_results = self.infer_pipeline.infer(input_data)
+        inferred = time.monotonic()
+        self.pipeline_metrics.measure('inference_sec', inferred - prepared)
         detections = process_hailo_outputs(infer_results, original_shape)
+        self.pipeline_metrics.measure('postprocess_sec', time.monotonic() - inferred)
         
         semantic_data_list = []
         
         # 決定這一幀是否要繪圖與發布
         self.image_pub_counter += 1
-        should_publish_image = (self.image_pub_counter % self.IMAGE_PUB_INTERVAL == 0)
+        should_publish_image = (
+            self.image_pub_counter % self.IMAGE_PUB_INTERVAL == 0
+            and self.image_pub.get_subscription_count() > 0
+        )
         
         for (x, y, w, h, score, cls_id) in detections:
             class_name = CLASS_NAMES.get(cls_id, f"Unknown_{cls_id}")
@@ -182,7 +202,9 @@ class SemanticVisionNode(Node):
         )
         msg_str = String()
         msg_str.data = json.dumps(semantic_payload)
+        publishing = time.monotonic()
         self.info_pub.publish(msg_str)
+        self.pipeline_metrics.measure('semantic_publish_sec', time.monotonic() - publishing)
         
         # 計算 FPS
         self.frame_count += 1
@@ -193,10 +215,24 @@ class SemanticVisionNode(Node):
         
         # 🌟 只有符合區間，才把影像壓縮並發布出去
         if should_publish_image:
+            rendering = time.monotonic()
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             result_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
             result_msg.header = msg.header
             self.image_pub.publish(result_msg)
+            self.pipeline_metrics.measure('preview_publish_sec', time.monotonic() - rendering)
+        self.pipeline_metrics.measure('callback_total_sec', time.monotonic() - started)
+
+    def publish_pipeline_health(self):
+        """Expose producer timing even when no camera callback arrives."""
+        now = time.monotonic()
+        self.pipeline_metrics.observe('heartbeat', now)
+        payload = self.pipeline_metrics.snapshot(now)
+        payload['sequence'] = self.sequence
+        payload['fps'] = round(self.fps, 2)
+        message = String()
+        message.data = json.dumps(payload)
+        self.pipeline_pub.publish(message)
 
 def main(args=None):
     rclpy.init(args=args)

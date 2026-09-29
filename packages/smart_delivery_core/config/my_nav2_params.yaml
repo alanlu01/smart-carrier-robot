@@ -79,6 +79,7 @@ localization_manager:
     # safely stopped and asks for help rather than spinning on missing data.
     recovery_pipeline_wait_timeout_sec: 30.0
     verify_timeout_sec: 25.0
+    verify_max_wait_sec: 40.0  # Fresh, stationary and improving evidence only
     stable_samples: 6
     # A sensor scheduling gap may recover without any spin, but only after a
     # fresh map-match window plus two independent qualified timestamps.
@@ -101,6 +102,7 @@ localization_manager:
     # +/-20 degree sweep, and finally one collision-checked 360 degree spin.
     cancel_grace_sec: 2.0
     local_recovery_wait_sec: 12.0
+    local_recovery_max_wait_sec: 30.0
     global_recovery_wait_sec: 12.0
     # If scan-to-map is already good, let AMCL eliminate secondary hypotheses
     # without weakening the covariance safety thresholds.

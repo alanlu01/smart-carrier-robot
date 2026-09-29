@@ -76,6 +76,23 @@ def minimum_verification_wait(samples, amcl_period, map_period, map_samples):
     ) * interval
 
 
+def covariance_is_converging(samples, minimum_improvement=0.02):
+    """Require recent independent evidence of improving position uncertainty."""
+    if len(samples) < 3:
+        return False
+    elapsed, current = samples[-1]
+    recent = [(t, std) for t, std in samples if elapsed - t <= 8.0]
+    if len(recent) < 3 or elapsed - recent[0][0] < 3.0:
+        return False
+    previous = recent[0][1]
+    return previous - current >= max(minimum_improvement, previous * 0.05)
+
+
+def convergence_grace_allowed(elapsed, normal_wait, maximum_wait, promising):
+    """Extend observation only within a finite budget, never accept a pose."""
+    return bool(promising and normal_wait <= elapsed < maximum_wait)
+
+
 def pose_quality(
     covariance,
     healthy_xy_std,

@@ -9,6 +9,7 @@ import pytest
 
 from smart_delivery_core import localization_manager as module
 from smart_delivery_core.localization_health import EvidenceWaitClock, pose_quality
+from smart_delivery_core.pipeline_health import ReceiptMetrics
 
 
 @pytest.fixture
@@ -18,7 +19,7 @@ def manager(monkeypatch):
     monkeypatch.setattr(module.time, 'monotonic', lambda: clock.now)
     node = object.__new__(module.LocalizationManager)
     node.__dict__.update(
-        state='RECOVERING_LOCAL', ready=False, recovery_step='nomotion_wait',
+        state='RECOVERING_LOCAL', state_reason='test', ready=False, recovery_step='nomotion_wait',
         state_since=100.0, recovery_step_started=100.0,
         scan_timeout=2.0, scan_timeout_grace=1.0, odom_timeout=1.0,
         amcl_pose_timeout=8.0, map_match_period=1.0,
@@ -41,6 +42,11 @@ def manager(monkeypatch):
         spin_restoring_heading=False, spin_sequence=[],
         commanded_motion=False, odom_motion=False, motion_inhibited=False,
         observation_clock=EvidenceWaitClock(), observation_phase=None,
+        convergence_samples=deque(maxlen=10), last_convergence_map_at=0.0,
+        convergence_grace_announced=False, verify_timeout=25.0, verify_max_wait=40.0,
+        local_max_wait=30.0, receipt_metrics=ReceiptMetrics(),
+        tick_last_at=None, tick_max_gap=0.0, tick_max_duration=0.0,
+        last_tick_metrics_at=100.0,
         pipeline_clock=EvidenceWaitClock(),
         transient_clock=EvidenceWaitClock(), transient_recovery_eligible=False,
         transient_recovery_started_at=100.0, transient_recovery_max=8.0,
@@ -251,3 +257,90 @@ def test_stale_scan_header_blocks_even_when_receive_time_is_fresh(manager):
         now=lambda: SimpleNamespace(nanoseconds=int(clock.now * 1e9))
     )
     assert 'scan_timestamp_invalid' in node._verification_data_blockers(clock.now)
+
+
+def test_suspect_reentry_excludes_normal_navigation_time(manager):
+    """Regress 15:35: an identical second phase cannot inherit 205 seconds."""
+    node, clock = manager
+    node._publish_state = lambda: None
+    node.state = 'SUSPECT'
+    node._observe_wait(100.0)
+    fresh(node, clock, 107.0)
+    node.last_amcl_at = 107.0
+    node._observe_wait(107.0)
+    assert node.observation_clock.elapsed == 7.0
+    node.ready_publisher = SimpleNamespace(publish=lambda *_: None)
+    node._set_state('LOCALIZED', 'recovered')
+    fresh(node, clock, 305.0)
+    node.last_amcl_at = 305.0
+    node._set_state('SUSPECT', 'new episode')
+    node._observe_wait(305.0)
+    assert node.observation_clock.elapsed == 0.0
+    assert node.pipeline_clock.blocked_for(305.0) == 0.0
+    assert not node.convergence_samples or len(node.convergence_samples) == 1
+
+
+def test_verifying_keeps_four_healthy_samples_past_soft_deadline(manager):
+    """A converging manual pose gets bounded time to finish all six samples."""
+    node, clock = manager
+    node.state = 'VERIFYING'
+    node.recovery_step = None
+    node.initial_pose_last_published = 99.0
+    node._observe_wait(100.0)
+    node.observation_clock.elapsed = 25.0
+    node.stable_samples = 4
+    node._tick_state_machine()
+    assert not node.started_spins
+    assert not node.ready
+    fresh(node, clock, 101.0)
+    amcl(node)
+    fresh(node, clock, 102.0)
+    amcl(node)
+    assert node.ready
+
+
+def test_verifying_grace_has_hard_deadline(manager):
+    """Map agreement and a few samples cannot extend verification forever."""
+    node, _clock = manager
+    node.state, node.recovery_step = 'VERIFYING', None
+    node.initial_pose_last_published = 99.0
+    node._observe_wait(100.0)
+    node.observation_clock.elapsed = 40.0
+    node.stable_samples = 4
+    node._tick_state_machine()
+    assert node.started_spins == ['初始位置驗證逾時']
+    assert not node.ready
+
+
+def test_local_convergence_trend_delays_but_never_skips_health_gate(manager):
+    """Stationary improving covariance waits locally rather than resetting globally."""
+    node, clock = manager
+    node.recovery_step = 'post_small'
+    node._observe_wait(100.0)
+    node.observation_clock.elapsed = 12.0
+    node.convergence_samples.extend([(7.0, 0.40), (9.0, 0.36), (11.0, 0.30)])
+    amcl(node, xy_std=0.30)
+    node._tick_state_machine()
+    assert not node.started_spins
+    assert not node.ready
+    node.observation_clock.elapsed = 30.0
+    node._tick_state_machine()
+    assert node.started_spins == ['global']
+
+
+@pytest.mark.parametrize('fault', ['bad_map', 'critical', 'moving', 'stale'])
+def test_convergence_grace_rejects_unsafe_evidence(manager, fault):
+    """A safe-looking picture is not sufficient to defer real failures."""
+    node, clock = manager
+    node.observation_clock.elapsed = 25.0
+    node.stable_samples = 4
+    if fault == 'bad_map':
+        node.map_score_window = deque([0.1] * 5)
+        node.latest_map_score = 0.1
+    elif fault == 'critical':
+        amcl(node, xy_std=0.6)
+    elif fault == 'moving':
+        node.odom_motion = True
+    else:
+        clock.now = 110.0
+    assert not node._convergence_grace(clock.now, 25.0, 40.0)

@@ -1,0 +1,7 @@
+# Record future RViz VOLATILE initial poses and manager TRANSIENT_LOCAL poses.
+# A volatile reader cannot replay an initial pose published before recording.
+/initialpose:
+  history: keep_last
+  depth: 20
+  reliability: reliable
+  durability: volatile

@@ -68,6 +68,20 @@ def test_standby_only_reports_arrival_after_nav2_success():
     assert lease == [True, False]
 
 
+@pytest.mark.parametrize('cause', ['order', 'localization'])
+def test_standby_terminal_cancel_does_not_charge_retry_budget(cause):
+    outcomes = []
+    arrived = go_to_standby(
+        _CompletedNavigator(TaskResult.CANCELED),
+        {'x': 0.0, 'y': 0.0},
+        localization_is_ready=lambda: cause != 'localization',
+        new_task_waiting=lambda: cause == 'order',
+        on_outcome=lambda _point, state: outcomes.append(state),
+    )
+    assert arrived is None
+    assert outcomes == ['approaching', 'interrupted_by_' + cause]
+
+
 def test_cloud_borrow_task_uses_backend_coordinates_and_full_slot():
     slots = payload_to_slots(
         {

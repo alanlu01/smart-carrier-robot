@@ -9,5 +9,5 @@ def test_service_and_standby_locations_match_the_3f_map():
     }
     assert STANDBY_POINTS == [
         {"name": "CYCU EE", "x": 2.4, "y": 5.0, "yaw": 0.0},
-        {"name": "座位燈", "x": 0.7, "y": -5.0, "yaw": 0.0},
+        {"name": "座位燈", "x": 1.2, "y": -5.0, "yaw": 0.0},
     ]

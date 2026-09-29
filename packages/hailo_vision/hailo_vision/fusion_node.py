@@ -18,6 +18,7 @@ from hailo_vision.semantic_protocol import (
     semantic_data_age,
     semantic_health_state,
 )
+from hailo_vision.pipeline_metrics import PipelineMetrics
 
 class SensorFusionNode(Node):
     def __init__(self):
@@ -37,6 +38,9 @@ class SensorFusionNode(Node):
         self.held_person_multiplier = 1.0
         self.person_safety_state = 'clear'
         self.history = {} 
+        self.pipeline_metrics = PipelineMetrics(time.monotonic())
+        self.last_pipeline_report_at = time.monotonic()
+        self.semantic_sequence = None
 
         self.declare_parameter('semantic_timeout_sec', 0.80)
         self.declare_parameter('semantic_recovery_timeout_sec', 0.40)
@@ -110,6 +114,7 @@ class SensorFusionNode(Node):
 
         # 3. 發布虛擬玻璃點雲給 Nav2 代價地圖
         self.pub_virtual_glass = self.create_publisher(PointCloud2, '/visual_glass', 10)
+        self.pipeline_pub = self.create_publisher(String, '/semantic/pipeline_health', 1)
         self.semantic_watchdog_timer = self.create_timer(
             0.1, self.semantic_watchdog_callback
         )
@@ -117,8 +122,15 @@ class SensorFusionNode(Node):
         self.get_logger().info('🧠 融合節點啟動：極速煞車攔截器與虛擬牆壁建造者已上線！')
 
     def vision_callback(self, msg):
+        self.pipeline_metrics.observe('semantic', time.monotonic())
         try:
             packet = parse_semantic_payload(msg.data)
+            self.semantic_sequence = packet.sequence
+            if packet.stamp_ns is not None:
+                self.pipeline_metrics.measure(
+                    'source_age_at_receive_sec',
+                    (self.get_clock().now().nanoseconds - packet.stamp_ns) / 1e9,
+                )
             if (
                 packet.stamp_ns is not None
                 and self.last_semantic_source_stamp_ns is not None
@@ -192,6 +204,19 @@ class SensorFusionNode(Node):
         return 1.0
 
     def semantic_watchdog_callback(self):
+        now = time.monotonic()
+        self.pipeline_metrics.observe('watchdog', now)
+        if now - self.last_pipeline_report_at >= 1.0:
+            payload = self.pipeline_metrics.snapshot(now)
+            payload['sequence'] = self.semantic_sequence
+            payload['source_age_sec'] = round(self.semantic_age(now), 3)
+            payload['effective_speed_multiplier'] = min(
+                self.speed_multiplier, self.semantic_speed_limit(now)
+            )
+            message = String()
+            message.data = json.dumps(payload)
+            self.pipeline_pub.publish(message)
+            self.last_pipeline_report_at = now
         next_state = semantic_health_state(
             self.semantic_age(),
             self.semantic_health_state,
@@ -228,6 +253,7 @@ class SensorFusionNode(Node):
         self.pub_safe_cmd.publish(real_cmd)
 
     def scan_callback(self, scan_msg):
+        self.pipeline_metrics.observe('scan_filtered', time.monotonic())
         scan_stamp_ns = (
             scan_msg.header.stamp.sec * 1_000_000_000
             + scan_msg.header.stamp.nanosec

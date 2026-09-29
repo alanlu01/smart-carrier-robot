@@ -7,9 +7,13 @@ testpaths = [
   "packages/smart_delivery_core/test/test_delivery_state.py",
   "packages/smart_delivery_core/test/test_localization_health.py",
   "packages/smart_delivery_core/test/test_localization_recovery.py",
+  "packages/smart_delivery_core/test/test_standby_retry.py",
+  "packages/smart_delivery_core/test/test_pipeline_health.py",
   "packages/smart_delivery_core/test/test_navigation_behavior_tree.py",
   "packages/smart_delivery_core/test/test_service_locations.py",
   "packages/hailo_vision/test/test_semantic_protocol.py",
+  "packages/hailo_vision/test/test_pipeline_metrics.py",
+  "packages/hailo_vision/test/test_fusion_diagnostics.py",
 ]
 pythonpath = [
   "packages/power_monitor",
