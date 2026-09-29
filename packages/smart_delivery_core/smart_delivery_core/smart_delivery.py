@@ -176,6 +176,8 @@ def schedule_orders(
     status_aliases=None,
     borrow_distance_weight=BORROW_DISTANCE_WEIGHT,
 ):
+    if not math.isfinite(borrow_distance_weight) or borrow_distance_weight <= 0:
+        raise ValueError("borrow_distance_weight 必須為有限正數")
     orders = [dict(order) for order in pending_orders]
     if not orders:
         return [], [], _prepare_slots(power_banks, slot_capacity, status_aliases)
@@ -191,7 +193,7 @@ def schedule_orders(
             slots = _prepare_slots(power_banks, slot_capacity, status_aliases)
             position = {"x": float(current_pos["x"]), "y": float(current_pos["y"])}
             route = []
-            weighted_distance = 0.0
+            first_stop_priority = None
             total_distance = 0.0
             feasible = True
 
@@ -219,7 +221,6 @@ def schedule_orders(
                     scheduled_order["selected_power_bank"] = dict(power_bank)
                     scheduled_order["slot_number"] = slot_index + 1
                     slots[slot_index] = None
-                    weighted_distance += distance * borrow_distance_weight
                 elif order_type == "return":
                     try:
                         slot_index = slots.index(None)
@@ -232,13 +233,16 @@ def schedule_orders(
                     slots[slot_index] = power_bank
                     scheduled_order["returned_power_bank"] = dict(power_bank)
                     scheduled_order["slot_number"] = slot_index + 1
-                    weighted_distance += distance
                 elif order_type in NAVIGATION_ONLY_TASK_TYPES:
-                    weighted_distance += distance
+                    pass
                 else:
                     feasible = False
                     break
 
+                if first_stop_priority is None:
+                    first_stop_priority = distance * (
+                        borrow_distance_weight if order_type == "borrow" else 1.0
+                    )
                 total_distance += distance
                 route.append(scheduled_order)
                 position = {
@@ -250,7 +254,7 @@ def schedule_orders(
                 # Original claim order is the final deterministic tie-breaker.
                 candidates.append(
                     (
-                        weighted_distance,
+                        first_stop_priority,
                         total_distance,
                         order_indexes,
                         route,
@@ -259,6 +263,11 @@ def schedule_orders(
                 )
 
         if candidates:
+            # Preserve the original borrow-first-stop distance preference.
+            # Discounting every borrow-bound leg instead rewards postponing
+            # a borrow until after a long leg (observed in the 2026-09-24 bag).
+            # After choosing the preferred feasible first stop, minimize the
+            # *whole* unweighted route, not repeated greedy next-stop choices.
             _, _, _, route, slots = min(
                 candidates, key=lambda item: (item[0], item[1], item[2])
             )

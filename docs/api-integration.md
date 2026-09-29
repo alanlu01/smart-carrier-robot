@@ -62,7 +62,24 @@ An I²C failure publishes `sensor_ok: false`. `smart_delivery_core` retains the 
 
 The bridge will not claim a task until it has healthy `power_status` data and an active subscriber on `order`. It keeps a durable queue of up to three claimed tasks (`max_claimed_tasks`) and uses the existing single-task claim endpoint repeatedly. Before each additional claim it projects the slot changes reserved by the tasks already in the queue, so one power bank or empty slot cannot be promised to multiple orders. The backend scans pending tasks in creation order and returns the first task compatible with that projected inventory, so an unavailable borrow or return does not block a later navigation task. When a borrow task contains `power_bank_id`, both the backend and delivery scheduler require that exact bank; another available bank is not silently substituted.
 
-The claimed-task list is a strict durable FIFO queue. The bridge may reserve up to three tasks, but it publishes only the queue head to the delivery node. Independent per-task republish clocks are deliberately not used: a bridge or delivery restart therefore cannot let a later task arrive first. After the head reaches a terminal result and the backend ACK removes it from the durable queue, the bridge immediately publishes the next task. Slot projection still includes all claimed tasks, so reservations cannot be reused while waiting. The delivery node executes one Nav2 goal at a time and validates the head against the latest real slot snapshot before departure. Per-task progress, terminal outbox, cancellation state, and restart recovery remain independent by task ID.
+The bridge seals a durable batch of up to three tasks and publishes it atomically
+as `{"batch_id": "...", "orders": [...]}`. A 1-second empty-claim quiet period
+or a 5-second collection limit closes a partially filled batch; a single task
+does not wait for three orders. Republishing the same batch does not add tasks
+again. The delivery node evaluates feasible permutations, fixes the route once,
+and executes one Nav2 goal at a time. Its first-stop priority is distance times
+`0.7` for borrow and distance times `1` for other tasks; it then minimizes the
+complete **unweighted** route among candidates with that first-stop priority.
+Discounting every borrow-bound leg is intentionally avoided because it can
+reward postponing a borrow until after a long trip.
+
+Slot projection still includes every claimed task. Before departure, the
+delivery node validates real inventory. A durable local outbox ACK permits the
+next leg to start without waiting for cloud connectivity; the bridge retries the
+cloud result independently. Per-task progress, cancellation state and restart
+recovery remain independent by task ID, and the fixed batch route survives a
+delivery restart. This scheduling policy does not change HTTP endpoints or
+require a frontend migration.
 
 ### `/smart_carrier/task_result` (`std_msgs/String`)
 

@@ -233,7 +233,7 @@ def test_invalid_cloud_order_is_rejected_before_navigation():
         )
 
 
-def test_multiple_orders_choose_lowest_total_weighted_route():
+def test_multiple_orders_preserve_borrow_first_stop_distance_preference():
     orders = [
         order_payload_to_order(
             {
@@ -261,9 +261,56 @@ def test_multiple_orders_choose_lowest_total_weighted_route():
 
     assert not deferred
     assert [order["task_id"] for order in route] == [
-        "near-navigation",
         "farther-borrow",
+        "near-navigation",
     ]
+
+    route, _, _ = schedule_orders(
+        orders, {"x": 0.0, "y": 0.0}, available_slots,
+        borrow_distance_weight=1.0,
+    )
+    assert route[0]["task_id"] == "near-navigation"
+
+
+def test_september_24_batch_does_not_reward_postponing_borrow():
+    orders = [
+        {"task_id": "return", "type": "return", "x": 7.5, "y": 5.6},
+        {
+            "task_id": "borrow", "type": "borrow", "x": -2.6, "y": 4.7,
+            "power_bank_id": "PB-01",
+        },
+    ]
+    slots = [
+        {"bank_id": "PB-01", "status": "full", "charge": 100},
+        None,
+        None,
+    ]
+    route, deferred, projected = schedule_orders(
+        orders, {"x": 2.4289, "y": 4.9260}, slots
+    )
+    assert not deferred
+    assert [order["task_id"] for order in route] == ["borrow", "return"]
+    assert projected[route[1]["slot_number"] - 1] is not None
+
+
+def test_equal_first_priority_uses_whole_route_not_claim_order():
+    # Both first stops are 1m away. Choosing the original queue head produces
+    # a 3.2m route; the whole-route comparison chooses the 3.1m alternative.
+    orders = [
+        {"task_id": "west", "type": "navigation", "x": -1.0, "y": 0.0},
+        {"task_id": "east", "type": "navigation", "x": 1.0, "y": 0.0},
+        {"task_id": "far-west", "type": "navigation", "x": -1.1, "y": 0.0},
+    ]
+    route, deferred, _ = schedule_orders(orders, {"x": 0.0, "y": 0.0}, [])
+    assert not deferred
+    assert [order["task_id"] for order in route] == ["east", "west", "far-west"]
+    assert sum(order["distance"] for order in route) == pytest.approx(3.1)
+
+
+@pytest.mark.parametrize("weight", [0.0, -0.7, float("inf"), float("nan")])
+def test_scheduler_rejects_invalid_borrow_weight(weight):
+    with pytest.raises(ValueError, match="borrow_distance_weight"):
+        schedule_orders([], {"x": 0.0, "y": 0.0}, [], borrow_distance_weight=weight)
 
 
 def test_batch_route_simulates_slot_changes_before_choosing_order():

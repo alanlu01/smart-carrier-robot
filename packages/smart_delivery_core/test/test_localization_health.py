@@ -2,12 +2,14 @@ import math
 from types import SimpleNamespace
 
 from smart_delivery_core.localization_health import (
+    EvidenceWaitClock,
     amcl_timeout_requires_recovery,
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
     localization_suspicion_required,
     map_match_status,
+    minimum_verification_wait,
     normalize_angle,
     occupancy_match_score,
     pose_is_near,
@@ -175,6 +177,23 @@ def test_stability_samples_only_count_each_timestamp_once():
     assert (count, timestamp) == (1, 10.0)
     count, timestamp = update_stability_samples(True, 11.0, timestamp, count)
     assert (count, timestamp) == (2, 11.0)
+
+
+def test_evidence_clock_excludes_outage_and_recovery_edges():
+    clock = EvidenceWaitClock()
+    assert clock.update(100.0, True) == 0.0
+    assert clock.update(105.0, True) == 5.0
+    assert clock.update(106.0, False) == 5.0
+    assert clock.update(120.0, False) == 5.0
+    assert clock.blocked_for(120.0) == 14.0
+    assert clock.update(121.0, True) == 5.0
+    assert clock.blocked_for(121.0) == 0.0
+    assert clock.update(123.0, True) == 7.0
+
+
+def test_verification_budget_fits_six_independent_updates_and_map_warmup():
+    assert minimum_verification_wait(6, 1.0, 1.0, 3) == 11.0
+    assert minimum_verification_wait(6, 3.0, 1.0, 3) == 27.0
 
 
 def test_stability_samples_reset_and_consume_unhealthy_timestamp():

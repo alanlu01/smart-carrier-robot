@@ -39,6 +39,43 @@ class ScanSampleSelection:
     valid_count: int
 
 
+@dataclass
+class EvidenceWaitClock:
+    """Count usable observation time, never charging a sensor outage as failure."""
+
+    elapsed: float = 0.0
+    last_checked_at: float | None = None
+    previously_ready: bool = False
+    blocked_since: float | None = None
+
+    def update(self, now, ready):
+        """Conservatively exclude both edges of an unavailable-data interval."""
+        now = float(now)
+        if self.last_checked_at is not None and self.previously_ready and ready:
+            self.elapsed += max(0.0, now - self.last_checked_at)
+        self.last_checked_at = now
+        self.previously_ready = bool(ready)
+        if ready:
+            self.blocked_since = None
+        elif self.blocked_since is None:
+            self.blocked_since = now
+        return self.elapsed
+
+    def blocked_for(self, now):
+        """Return the continuous outage duration for a bounded safe-stop wait."""
+        return 0.0 if self.blocked_since is None else max(
+            0.0, float(now) - self.blocked_since
+        )
+
+
+def minimum_verification_wait(samples, amcl_period, map_period, map_samples):
+    """Budget map-window warmup, independent AMCL samples and scheduling slack."""
+    interval = max(float(amcl_period), float(map_period))
+    return max(1, int(map_samples)) * float(map_period) + (
+        max(1, int(samples)) + 2
+    ) * interval
+
+
 def pose_quality(
     covariance,
     healthy_xy_std,

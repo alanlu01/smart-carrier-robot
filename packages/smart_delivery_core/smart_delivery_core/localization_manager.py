@@ -26,12 +26,14 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from smart_delivery_core.localization_health import (
+    EvidenceWaitClock,
     amcl_timeout_requires_recovery,
     damped_heading_command,
     heading_correction,
     heading_error_is_improving,
     localization_suspicion_required,
     map_match_status,
+    minimum_verification_wait,
     occupancy_match_score,
     pose_is_near,
     pose_jump,
@@ -107,6 +109,12 @@ class LocalizationManager(Node):
         )
         self.amcl_nomotion_refresh = float(
             self.get_parameter("amcl_nomotion_refresh_sec").value
+        )
+        self.verification_nomotion_refresh = max(
+            0.2, float(self.get_parameter("verification_nomotion_refresh_sec").value)
+        )
+        self.pipeline_wait_timeout = max(
+            1.0, float(self.get_parameter("recovery_pipeline_wait_timeout_sec").value)
         )
         self.odom_timeout = float(self.get_parameter("odom_timeout_sec").value)
         self.verify_timeout = float(self.get_parameter("verify_timeout_sec").value)
@@ -217,6 +225,18 @@ class LocalizationManager(Node):
         self.diagnostic_log_period = float(
             self.get_parameter("diagnostic_log_period_sec").value
         )
+        # Six confirmations cannot fit in nine seconds at a 3s AMCL cadence.
+        # Keep the evidence requirement and budget enough independent updates.
+        minimum_wait = minimum_verification_wait(
+            self.stable_samples_required,
+            self.verification_nomotion_refresh,
+            self.map_match_period,
+            self.map_match_window_min_samples,
+        )
+        self.local_wait = max(self.local_wait, minimum_wait)
+        self.global_wait = max(self.global_wait, minimum_wait)
+        self.global_max_wait = max(self.global_max_wait, self.global_wait)
+        self.verify_timeout = max(self.verify_timeout, minimum_wait)
 
         self.state = "UNINITIALIZED"
         self.state_since = time.monotonic()
@@ -282,6 +302,11 @@ class LocalizationManager(Node):
         self.sensor_waiting_for_pipeline = False
         self.last_pose_cache_write_at = 0.0
         self.last_map_only_warning_at = 0.0
+        self.observation_clock = EvidenceWaitClock()
+        self.pipeline_clock = EvidenceWaitClock()
+        self.observation_phase = None
+        self.transient_clock = EvidenceWaitClock()
+        self.last_state_publish_at = 0.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -376,6 +401,8 @@ class LocalizationManager(Node):
             "amcl_pose_timeout_sec": 8.0,
             "amcl_stationary_grace_sec": 2.0,
             "amcl_nomotion_refresh_sec": 3.0,
+            "verification_nomotion_refresh_sec": 1.0,
+            "recovery_pipeline_wait_timeout_sec": 30.0,
             "verify_timeout_sec": 15.0,
             "stable_samples": 6,
             "transient_recovery_samples": 2,
@@ -390,7 +417,7 @@ class LocalizationManager(Node):
             "suspect_max_sec": 12.0,
             "suspect_promising_max_sec": 30.0,
             "cancel_grace_sec": 2.0,
-            "local_recovery_wait_sec": 9.0,
+            "local_recovery_wait_sec": 12.0,
             "global_recovery_wait_sec": 12.0,
             "global_recovery_max_wait_sec": 30.0,
             "small_spin_angle": math.radians(20.0),
@@ -499,6 +526,7 @@ class LocalizationManager(Node):
 
     def _publish_state(self):
         now = time.monotonic()
+        self.last_state_publish_at = now
         message = String()
         freshness = self._freshness_snapshot(now)
         payload = {
@@ -521,6 +549,11 @@ class LocalizationManager(Node):
             "amcl_pose_age_sec": freshness["amcl_pose_age_sec"],
             "odom_age_sec": freshness["odom_age_sec"],
             "cmd_vel_age_sec": freshness["cmd_vel_age_sec"],
+            "stable_samples": self.stable_samples,
+            "stable_samples_required": self.stable_samples_required,
+            "verification_elapsed_sec": round(self.observation_clock.elapsed, 3),
+            "verification_blockers": self._verification_data_blockers(now),
+            "pipeline_outage_sec": round(self.pipeline_clock.blocked_for(now), 3),
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -802,6 +835,7 @@ class LocalizationManager(Node):
                 and map_match_ok
                 and self._verification_pose_is_consistent()
                 and self._scan_is_fresh(now)
+                and not self._verification_data_blockers(now)
                 and recovery_motion_complete
             )
             self.stable_samples, self.last_stable_map_score_at = (
@@ -813,7 +847,7 @@ class LocalizationManager(Node):
                 )
             )
             if self.transient_recovery_eligible:
-                if now - self.transient_recovery_started_at > self.transient_recovery_max:
+                if self.transient_clock.elapsed > self.transient_recovery_max:
                     self.transient_recovery_eligible = False
                 elif self._transient_recovery_is_qualified(now) and (
                     self.stable_samples >= self.transient_recovery_samples_required
@@ -860,9 +894,84 @@ class LocalizationManager(Node):
             self.odom_motion,
         )
 
+    def _verification_data_blockers(self, now):
+        """Separate unavailable observations from genuinely unhealthy covariance."""
+        blockers = []
+        for name, stamp, limit in (
+            ("raw_scan", self.latest_raw_scan_at, self.scan_timeout),
+            ("scan_filtered", self.latest_scan_at, self.scan_timeout),
+            ("odom", self.latest_odom_at, self.odom_timeout),
+            ("amcl_pose", self.last_amcl_at, self.amcl_pose_timeout),
+            ("map_match", self.latest_map_score_at, 2.0 * self.map_match_period),
+        ):
+            if stamp <= 0.0 or now - stamp > limit:
+                blockers.append(f"{name}_unavailable")
+        if self.latest_scan_stamp_ns > 0:
+            stamp_age = (
+                self.get_clock().now().nanoseconds - self.latest_scan_stamp_ns
+            ) / 1_000_000_000.0
+            if stamp_age < -0.1 or stamp_age > self.scan_timeout:
+                blockers.append("scan_timestamp_invalid")
+        if self.last_map_match_error:
+            blockers.append("map_match_update_failed")
+        return blockers
+
+    def _observe_wait(self, now):
+        """Pause verification deadlines during outages, with a bounded safe wait."""
+        phase = (self.state, self.recovery_step)
+        if phase != self.observation_phase:
+            self.observation_phase = phase
+            self.observation_clock = EvidenceWaitClock()
+            self.pipeline_clock = EvidenceWaitClock()
+        blockers = self._verification_data_blockers(now)
+        data_ready = not blockers
+        waiting_for_user = self.motion_inhibited and self.state.startswith("RECOVERING")
+        self.observation_clock.update(now, data_ready and not waiting_for_user)
+        # Waiting for a user is not a sensor outage; keep their clocks separate.
+        self.pipeline_clock.update(now, data_ready)
+        if self.transient_recovery_eligible:
+            self.transient_clock.update(now, data_ready and not waiting_for_user)
+        if not data_ready:
+            self.stable_samples = 0
+            self.last_stable_map_score_at = self.latest_map_score_at
+            self._request_nomotion_if_due(now)
+            if self.pipeline_clock.blocked_for(now) >= self.pipeline_wait_timeout:
+                self._require_manual(
+                    "定位資料管線持續未恢復，維持安全停車：" + ", ".join(blockers)
+                )
+            elif now - self.last_diagnostic_log_at >= self.diagnostic_log_period:
+                self.get_logger().warning(
+                    "等待新鮮定位資料，暫停驗證計時且不啟動自旋："
+                    + ", ".join(blockers)
+                )
+                self.last_diagnostic_log_at = now
+        return data_ready
+
+    def _recovery_failure_reason(self):
+        quality = self.latest_quality
+        details = [f"穩定樣本 {self.stable_samples}/{self.stable_samples_required}"]
+        if quality is None or not quality.healthy:
+            details.append("AMCL covariance 未達健康門檻")
+        if not self._map_match_has_recovered(time.monotonic()):
+            details.append("雷達地圖吻合度未恢復")
+        return "；".join(details)
+
     def _tick(self):
+        try:
+            self._tick_state_machine()
+        finally:
+            # Publish a lightweight heartbeat even when AMCL is stationary.
+            if time.monotonic() - self.last_state_publish_at >= 1.0:
+                self._publish_state()
+
+    def _tick_state_machine(self):
         now = time.monotonic()
+        observing = self.state in {
+            "VERIFYING", "SUSPECT", "RECOVERING_LOCAL", "RECOVERING_GLOBAL"
+        } and not (self.spin_in_progress or self.spin_waiting_for_stop)
         if not self._scan_is_fresh(now):
+            if observing:
+                self._observe_wait(now)
             if self.state == "LOCALIZED":
                 raw_scan_age = self._age_since(self.latest_raw_scan_at, now)
                 scan_age = self._age_since(self.latest_scan_at, now)
@@ -913,6 +1022,9 @@ class LocalizationManager(Node):
             self._publish_state()
             return
 
+        if observing and not self._observe_wait(now):
+            return
+
         if self.state in {"UNINITIALIZED", "WAITING_FOR_SENSORS"}:
             if not self.auto_initialize:
                 reason = "自動初始位置已停用"
@@ -933,15 +1045,14 @@ class LocalizationManager(Node):
             return
 
         if self.state == "VERIFYING":
-            if now - self.last_nomotion_request_at >= 1.0:
-                self._request_nomotion_update()
+            self._request_nomotion_if_due(now)
             if (
                 self.last_amcl_at < self.initial_pose_last_published
                 and now - self.initial_pose_last_published >= 2.0
                 and self.initial_pose_publisher.get_subscription_count() >= 1
             ):
                 self._publish_initial_pose(retry=True)
-            if now - self.state_since >= self.verify_timeout:
+            if self.observation_clock.elapsed >= self.verify_timeout:
                 self._begin_recovery("初始位置驗證逾時")
             return
 
@@ -1031,6 +1142,8 @@ class LocalizationManager(Node):
             return
 
         if self.state == "SUSPECT":
+            if not self.commanded_motion and not self.odom_motion:
+                self._request_nomotion_if_due(now)
             match_status = self._map_match_status(now)
             quality_critical = (
                 self.latest_quality is not None and self.latest_quality.critical
@@ -1064,7 +1177,7 @@ class LocalizationManager(Node):
             if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
             elif self.suspect_since is not None:
-                suspect_age = now - self.suspect_since
+                suspect_age = self.observation_clock.elapsed
                 convergence_promising = (
                     self._map_match_has_recovered(now)
                     and self.latest_quality is not None
@@ -1311,6 +1424,7 @@ class LocalizationManager(Node):
         self.transient_recovery_started_at = (
             now if self.transient_recovery_eligible else 0.0
         )
+        self.transient_clock = EvidenceWaitClock()
         self.recovery_diagnostics = self._freshness_snapshot(now)
         self.get_logger().warning(
             "定位觸發快照："
@@ -1353,7 +1467,11 @@ class LocalizationManager(Node):
         return False
 
     def _request_nomotion_if_due(self, now):
-        if now - self.last_nomotion_request_at >= self.amcl_nomotion_refresh:
+        interval = (
+            self.amcl_nomotion_refresh if self.state == "LOCALIZED"
+            else self.verification_nomotion_refresh
+        )
+        if now - self.last_nomotion_request_at >= interval:
             self._request_nomotion_update()
 
     def _motion_pipeline_is_ready(self):
@@ -1391,7 +1509,7 @@ class LocalizationManager(Node):
             )
             return
 
-        elapsed = now - self.recovery_step_started
+        elapsed = self.observation_clock.elapsed
         if self.recovery_step == "cancel_wait" and elapsed >= self.cancel_grace:
             self._request_nomotion_update()
             self.recovery_step = "nomotion_wait"
@@ -1426,6 +1544,7 @@ class LocalizationManager(Node):
         if not self.spin_client.server_is_ready():
             self._require_manual("Spin 行為伺服器未就緒")
             return
+        self.transient_recovery_eligible = False
         self.recovery_step = "small_spin"
         self.recovery_start_yaw = (
             None if self.last_odom_pose is None else self.last_odom_pose[2]
@@ -1459,7 +1578,7 @@ class LocalizationManager(Node):
         self._set_state("RECOVERING_GLOBAL", "全域粒子重新定位")
 
     def _tick_global_recovery(self, now):
-        elapsed = now - self.recovery_step_started
+        elapsed = self.observation_clock.elapsed
         if self.recovery_step == "global_settle" and elapsed >= 1.0:
             if self.motion_inhibited:
                 self.recovery_step_started = now
@@ -1498,7 +1617,10 @@ class LocalizationManager(Node):
                             f"延長觀察至最多 {self.global_max_wait:.0f} 秒"
                         )
                     return
-                self._require_manual("全域重新定位後仍未通過可信度檢查")
+                self._require_manual(
+                    "全域重新定位後仍未通過可信度檢查；"
+                    + self._recovery_failure_reason()
+                )
 
     def _send_next_spin(self):
         if self.spin_in_progress:

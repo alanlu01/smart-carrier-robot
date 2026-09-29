@@ -73,6 +73,11 @@ localization_manager:
     # before escalating a stale pose into a full localization recovery.
     amcl_stationary_grace_sec: 2.0
     amcl_nomotion_refresh_sec: 3.0
+    # Faster independent updates only while paused for verification/recovery.
+    verification_nomotion_refresh_sec: 1.0
+    # Sensor/TF outages pause observation deadlines; a persistent outage remains
+    # safely stopped and asks for help rather than spinning on missing data.
+    recovery_pipeline_wait_timeout_sec: 30.0
     verify_timeout_sec: 25.0
     stable_samples: 6
     # A sensor scheduling gap may recover without any spin, but only after a
@@ -95,7 +100,7 @@ localization_manager:
     # Stop navigation first, then try no-motion update, a collision-checked
     # +/-20 degree sweep, and finally one collision-checked 360 degree spin.
     cancel_grace_sec: 2.0
-    local_recovery_wait_sec: 9.0
+    local_recovery_wait_sec: 12.0
     global_recovery_wait_sec: 12.0
     # If scan-to-map is already good, let AMCL eliminate secondary hypotheses
     # without weakening the covariance safety thresholds.
