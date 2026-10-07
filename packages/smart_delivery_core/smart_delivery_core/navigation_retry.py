@@ -1,5 +1,22 @@
 """Bounded retry rules; a blocked path is not a transient TF failure."""
 
+import math
+
+
+def retry_data_fresh(sensor_times, monotonic_now, ros_now_ns, transform_stamp_ns):
+    """Require fresh receipt/source times and a fresh latest-common TF."""
+    stamps = [transform_stamp_ns]
+    for name in ('scan', 'odom'):
+        receipt, stamp = sensor_times.get(name, (0.0, 0))
+        receipt_age = monotonic_now - receipt
+        if not math.isfinite(receipt_age) or not 0.0 <= receipt_age <= 0.30:
+            return False
+        stamps.append(stamp)
+    return all(
+        stamp > 0 and -0.1 <= (ros_now_ns - stamp) / 1e9 <= 0.30
+        for stamp in stamps
+    )
+
 
 def transient_tf_failure(error_code, error_msg):
     """Recognize explicit transform failures, not arbitrary cancellation."""

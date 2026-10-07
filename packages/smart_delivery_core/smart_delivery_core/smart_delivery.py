@@ -29,8 +29,9 @@ from smart_delivery_core.delivery_state import (
 )
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
+from smart_delivery_core.dispatch_startup import StartupDispatchGate
 from smart_delivery_core.navigation_retry import (
-    result_sync_message, schedule_tf_retry, transient_tf_failure,
+    result_sync_message, retry_data_fresh, schedule_tf_retry, transient_tf_failure,
 )
 
 BORROW_DISTANCE_WEIGHT = 0.7
@@ -574,6 +575,7 @@ def main():
     dispatch_started_at = time.monotonic()
     dispatch_last_request_at = 0.0
     dispatch_last_warning_at = 0.0
+    startup_dispatch = StartupDispatchGate()
     navigation_started_at = 0.0
     last_tf_failure = (0.0, "")
     retry_sensor_times = {}
@@ -618,12 +620,17 @@ def main():
 
     def retry_data_ready():
         now, ros_now = time.monotonic(), navigator.get_clock().now()
-        for name in ("scan", "odom"):
-            receipt, stamp = retry_sensor_times.get(name, (0.0, 0))
-            if (stamp <= 0 or now - receipt > 0.30
-                    or not -0.1 <= (ros_now.nanoseconds - stamp) / 1e9 <= 0.30):
-                return False
-        return tf_buffer.can_transform("map", "base_footprint", ros_now)
+        try:
+            # Query the latest common time, not an instant newer than odom TF.
+            # Age validation below still rejects a stale but connected TF tree.
+            transform = tf_buffer.lookup_transform("map", "base_footprint", Time())
+        except TransformException:
+            return False
+        stamp = transform.header.stamp
+        return retry_data_fresh(
+            retry_sensor_times, now, ros_now.nanoseconds,
+            stamp.sec * 1_000_000_000 + stamp.nanosec,
+        )
     last_localization_warning_at = 0.0
     is_standby = False
     standby_retry = StandbyRetryPolicy()
@@ -1177,6 +1184,13 @@ def main():
     while rclpy.ok():
         rclpy.spin_once(navigator, timeout_sec=0.5)
 
+        # Observe work before cancellations/results can remove the initial batch.
+        # Only a matching-nonce response reaches dispatch_state (see callback).
+        startup_dispatch.observe(
+            has_work=bool(pending_orders) and pending_result is None,
+            sync_state=dispatch_state.get("state"),
+        )
+
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
@@ -1228,7 +1242,7 @@ def main():
 
         if not pending_orders:
             now = time.monotonic()
-            if dispatch_state.get("state") != "empty":
+            if startup_dispatch.waiting:
                 if now - dispatch_last_request_at >= 1.0:
                     request = String()
                     request.data = json.dumps({"request_id": dispatch_request_id})

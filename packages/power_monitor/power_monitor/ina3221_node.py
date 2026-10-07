@@ -261,15 +261,16 @@ class INA3221Node(Node):
             if address != previous_address:
                 for history in self.current_histories + self.voltage_histories:
                     history.clear()
-                level = (
-                    self.get_logger().warning
-                    if address != self.configured_i2c_address
-                    else self.get_logger().info
-                )
-                level(
+                message = (
                     "已偵測 INA3221："
                     f"bus={self.i2c_bus}, address=0x{address:02X}"
                 )
+                # rclpy caches severity per call site. Do not dynamically call
+                # info/warning at the same site when a retry changes address.
+                if address != self.configured_i2c_address:
+                    self.get_logger().warning(message)
+                else:
+                    self.get_logger().info(message)
             return True
 
         self.i2c_address = None
@@ -287,8 +288,11 @@ class INA3221Node(Node):
             return None
         try:
             data = self.bus.read_i2c_block_data(self.i2c_address, register, 2)
-        except OSError as exc:
+        except (OSError, IndexError) as exc:
             self.last_i2c_error = str(exc)
+            return None
+        if len(data) != 2:
+            self.last_i2c_error = f"I2C register 0x{register:02X}: incomplete read"
             return None
         return (data[0] << 8) | data[1]
 
@@ -341,6 +345,11 @@ class INA3221Node(Node):
 
         channels = {}
         cycle_failed = samples is None
+        if cycle_failed:
+            # Never mix readings from before a real outage into recovery data.
+            # The failed cycle below remains unknown rather than empty/full.
+            for history in self.current_histories + self.voltage_histories:
+                history.clear()
         for index in range(3):
             current_history = self.current_histories[index]
             voltage_history = self.voltage_histories[index]
