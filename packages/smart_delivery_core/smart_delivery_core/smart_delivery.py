@@ -8,10 +8,13 @@ from itertools import permutations
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
+from nav_msgs.msg import Odometry
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
 from rclpy.duration import Duration
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rcl_interfaces.msg import Log
+from sensor_msgs.msg import LaserScan
 from rclpy.time import Time
 from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -26,6 +29,9 @@ from smart_delivery_core.delivery_state import (
 )
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
+from smart_delivery_core.navigation_retry import (
+    result_sync_message, schedule_tf_retry, transient_tf_failure,
+)
 
 BORROW_DISTANCE_WEIGHT = 0.7
 POWER_STATUS_TIMEOUT_SECONDS = 10.0
@@ -563,6 +569,61 @@ def main():
     localization_ready_received = False
     localization_interrupt_generation = 0
     localization_wait_started_at = time.monotonic()
+    dispatch_request_id = str(uuid.uuid4())
+    dispatch_state = {}
+    dispatch_started_at = time.monotonic()
+    dispatch_last_request_at = 0.0
+    dispatch_last_warning_at = 0.0
+    navigation_started_at = 0.0
+    last_tf_failure = (0.0, "")
+    retry_sensor_times = {}
+    retry_tf_ready_since = None
+
+    def dispatch_sync_callback(message):
+        nonlocal dispatch_state
+        try:
+            payload = json.loads(message.data)
+            if payload.get("request_id") == dispatch_request_id:
+                dispatch_state = payload
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    dispatch_sync_publisher = navigator.create_publisher(
+        String, "/smart_carrier/dispatch_sync_request", COMMAND_QOS
+    )
+    navigator.create_subscription(
+        String, "/smart_carrier/dispatch_sync_state", dispatch_sync_callback, STATE_QOS
+    )
+
+    def record_retry_sensor(name, message):
+        stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+        retry_sensor_times[name] = (time.monotonic(), stamp)
+
+    navigator.create_subscription(LaserScan, "/scan_filtered",
+                                  lambda msg: record_retry_sensor("scan", msg),
+                                  qos_profile_sensor_data)
+    navigator.create_subscription(Odometry, "/odom",
+                                  lambda msg: record_retry_sensor("odom", msg), 10)
+
+    def navigation_log_callback(message):
+        nonlocal last_tf_failure
+        if (navigation_started_at > 0 and message.level >= Log.WARN
+                and message.name.rsplit('.', 1)[-1] in {
+                    "controller_server", "planner_server", "bt_navigator",
+                    "global_costmap", "local_costmap"}
+                and transient_tf_failure(0, message.msg)):
+            last_tf_failure = (time.monotonic(), message.msg)
+
+    navigator.create_subscription(Log, "/rosout", navigation_log_callback, 50)
+
+    def retry_data_ready():
+        now, ros_now = time.monotonic(), navigator.get_clock().now()
+        for name in ("scan", "odom"):
+            receipt, stamp = retry_sensor_times.get(name, (0.0, 0))
+            if (stamp <= 0 or now - receipt > 0.30
+                    or not -0.1 <= (ros_now.nanoseconds - stamp) / 1e9 <= 0.30):
+                return False
+        return tf_buffer.can_transform("map", "base_footprint", ros_now)
     last_localization_warning_at = 0.0
     is_standby = False
     standby_retry = StandbyRetryPolicy()
@@ -762,7 +823,8 @@ def main():
             task_state_publisher,
             task.get("task_id"),
             "result_pending",
-            progress_message="操作已完成，正在同步結果，請勿重複操作",
+            progress_message=result_sync_message(status),
+            terminal_status=status,
         )
         pending_result = {
             "event_id": str(uuid.uuid4()),
@@ -790,6 +852,13 @@ def main():
                     task_state_publisher,
                     completed_task_id,
                     "result_acked",
+                    ack_stage=ack.get("ack_stage", "local_durable"),
+                    cloud_confirmed=ack.get("ack_stage") == "cloud_confirmed",
+                    terminal_status=pending_result["status"],
+                    progress_message=(
+                        "雲端已確認任務結果" if ack.get("ack_stage") == "cloud_confirmed"
+                        else "結果已安全保存於車端，雲端確認由背景重送處理"
+                    ),
                 )
                 pending_orders[:] = [
                     order
@@ -1134,6 +1203,10 @@ def main():
             continue
 
         if not localization_can_resume():
+            retry_tf_ready_since = None
+            for order in pending_orders:
+                if order.get("_tf_retry_wait_started") is not None:
+                    order["_tf_retry_wait_started"] = time.time()
             now = time.monotonic()
             if (
                 (not localization_state_received or not localization_ready_received)
@@ -1154,6 +1227,19 @@ def main():
             continue
 
         if not pending_orders:
+            now = time.monotonic()
+            if dispatch_state.get("state") != "empty":
+                if now - dispatch_last_request_at >= 1.0:
+                    request = String()
+                    request.data = json.dumps({"request_id": dispatch_request_id})
+                    dispatch_sync_publisher.publish(request)
+                    dispatch_last_request_at = now
+                if now - dispatch_started_at >= 10.0 and now - dispatch_last_warning_at >= 10.0:
+                    navigator.get_logger().warning(
+                        "啟動任務對帳尚未確認無訂單：留在原地等待 API，不先前往待機點"
+                    )
+                    dispatch_last_warning_at = now
+                continue
             if not is_standby:
                 current_pos = refresh_current_position(current_pos)
                 point = min(
@@ -1217,6 +1303,19 @@ def main():
 
         current_pos = refresh_current_position(current_pos)
         target = interrupted_localization_order(pending_orders)
+        if target and target.get("_tf_retry_wait_started") is not None:
+            now = time.monotonic()
+            retry_tf_ready_since = (
+                (retry_tf_ready_since or now) if retry_data_ready() else None
+            )
+            if retry_tf_ready_since is None or now - retry_tf_ready_since < 1.0:
+                if time.time() - target["_tf_retry_wait_started"] >= 15.0:
+                    active_task = target
+                    fsm = DeliveryStateMachine("waiting_localization")
+                    queue_result(target, fsm, "failed", "TF/data readiness retry timed out (15 s)")
+                continue
+            target.pop("_tf_retry_wait_started", None)
+            retry_tf_ready_since = None
         resumed_after_localization = target is not None
         if target is None:
             if not route_planned:
@@ -1273,6 +1372,8 @@ def main():
         goal_pose.pose.orientation = yaw_to_quaternion(target["yaw"])
         set_navigation_active(True)
         navigation_localization_generation = localization_interrupt_generation
+        navigation_started_at = time.monotonic()
+        last_tf_failure = (0.0, "")
         navigator.goToPose(goal_pose)
         active_task_id = target.get("task_id")
         cancel_sent = False
@@ -1293,6 +1394,18 @@ def main():
 
         set_navigation_active(False)
         nav_result = navigator.getResult()
+        nav_error_code, nav_error_msg = 0, ""
+        try:
+            action_result = navigator.result_future.result().result
+            nav_error_code = int(action_result.error_code)
+            nav_error_msg = str(action_result.error_msg)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        recent_tf_failure = (
+            last_tf_failure[0] >= navigation_started_at
+            and time.monotonic() - last_tf_failure[0] <= 3.0
+        )
+        navigation_started_at = 0.0
         if (
             nav_result == TaskResult.CANCELED
             and active_task_id not in cancellation_requests
@@ -1343,7 +1456,24 @@ def main():
             note = (
                 "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else "Nav2 goal failed"
             )
-            queue_result(target, fsm, "failed", note)
+            transient = (nav_result == TaskResult.FAILED and (
+                transient_tf_failure(nav_error_code, nav_error_msg)
+                or (nav_error_code == 0 and recent_tf_failure)
+            ))
+            retries = int(target.get("_tf_retry_count", 0))
+            if transient and schedule_tf_retry(target, time.time()):
+                fsm.transition("waiting_localization")
+                persist(target, fsm.state, pending_result)
+                publish_task_state(
+                    task_state_publisher, target.get("task_id"), "waiting_localization",
+                    progress_message=f"短暫 TF 異常，保留任務等待新鮮資料 ({retries + 1}/2)",
+                )
+                navigator.get_logger().warning(
+                    f"TF 暫態重試 {retries + 1}/2：{nav_error_msg or last_tf_failure[1]}"
+                )
+                keep_pending = True
+            else:
+                queue_result(target, fsm, "failed", note + (": " + nav_error_msg if nav_error_msg else ""))
         else:
             current_pos = {"x": float(target["x"]), "y": float(target["y"])}
             progress(

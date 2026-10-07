@@ -19,6 +19,7 @@ from hailo_vision.semantic_protocol import (
     semantic_health_state,
 )
 from hailo_vision.pipeline_metrics import PipelineMetrics
+from hailo_vision.recovery_lease import RecoveryLease
 
 class SensorFusionNode(Node):
     def __init__(self):
@@ -41,6 +42,7 @@ class SensorFusionNode(Node):
         self.pipeline_metrics = PipelineMetrics(time.monotonic())
         self.last_pipeline_report_at = time.monotonic()
         self.semantic_sequence = None
+        self.recovery_lease = RecoveryLease()
 
         self.declare_parameter('semantic_timeout_sec', 0.80)
         self.declare_parameter('semantic_recovery_timeout_sec', 0.40)
@@ -108,6 +110,12 @@ class SensorFusionNode(Node):
         # 2. 訂閱與發布速度 (確保 cmd_vel_to_serial 訂閱的是 /chassis_cmd_vel！)
         self.sub_nav2_cmd = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.pub_safe_cmd = self.create_publisher(Twist, '/chassis_cmd_vel', 10)
+        self.recovery_guard_pub = self.create_publisher(
+            String, '/localization/recovery_motion_guard', 1
+        )
+        self.create_subscription(
+            String, '/localization/recovery_motion_lease', self.recovery_lease_callback, 1
+        )
         self.pub_speed_multiplier = self.create_publisher(
             Float32, '/semantic/speed_multiplier', 10
         )
@@ -205,6 +213,10 @@ class SensorFusionNode(Node):
 
     def semantic_watchdog_callback(self):
         now = time.monotonic()
+        if self.recovery_lease.enabled:
+            if self.recovery_lease.blocked(now):
+                self.pub_safe_cmd.publish(Twist())
+            self.publish_recovery_guard(now)
         self.pipeline_metrics.observe('watchdog', now)
         if now - self.last_pipeline_report_at >= 1.0:
             payload = self.pipeline_metrics.snapshot(now)
@@ -242,6 +254,10 @@ class SensorFusionNode(Node):
         self.semantic_health_state = next_state
 
     def cmd_vel_callback(self, msg):
+        lease = self.recovery_lease
+        if lease.blocked(time.monotonic()):
+            self.pub_safe_cmd.publish(Twist())
+            return
         effective_multiplier = min(
             self.speed_multiplier,
             self.semantic_speed_limit(),
@@ -250,7 +266,33 @@ class SensorFusionNode(Node):
         real_cmd.linear.x = msg.linear.x * effective_multiplier
         real_cmd.linear.y = msg.linear.y * effective_multiplier
         real_cmd.angular.z = msg.angular.z * effective_multiplier
+        if lease.enabled:
+            # Translation permission never authorizes other motion or a speed
+            # above the agreed cap; semantic stop/reduction still applies.
+            real_cmd.linear.x = real_cmd.angular.z = 0.0
+            real_cmd.linear.y = max(-0.25, min(0.25, msg.linear.y)) * effective_multiplier
         self.pub_safe_cmd.publish(real_cmd)
+
+    def recovery_lease_callback(self, message):
+        try:
+            payload = json.loads(message.data)
+            was_enabled = self.recovery_lease.enabled
+            if self.recovery_lease.receive(payload, time.monotonic()):
+                # Flush any preceding spin/navigation velocity before arming.
+                if payload.get('active') is True and not was_enabled:
+                    self.pub_safe_cmd.publish(Twist())
+                self.publish_recovery_guard(time.monotonic())
+        except (ValueError, TypeError, AttributeError):
+            self.pub_safe_cmd.publish(Twist())
+
+    def publish_recovery_guard(self, now):
+        message = String()
+        message.data = json.dumps({
+            'token': self.recovery_lease.token,
+            'active': self.recovery_lease.enabled,
+            'blocked': self.recovery_lease.blocked(now),
+        })
+        self.recovery_guard_pub.publish(message)
 
     def scan_callback(self, scan_msg):
         self.pipeline_metrics.observe('scan_filtered', time.monotonic())

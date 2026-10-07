@@ -55,6 +55,9 @@ def manager(monkeypatch):
         amcl_nomotion_refresh=3.0, verification_nomotion_refresh=1.0,
         last_nomotion_request_at=0.0, sensor_waiting_for_pipeline=False,
         local_wait=12.0, global_wait=12.0, global_max_wait=30.0,
+        enable_small_sweep=True, pre_global_wait=4.0, lateral_phase=None,
+        lateral_enabled=False, lateral_attempted=False,
+        latest_scan=None, last_pipeline_diagnostic_at=0.0,
         global_grace_announced=False, cancel_grace=2.0,
         suspect_since=100.0, suspect_hold=5.0, suspect_max=12.0,
         suspect_promising_max=30.0,
@@ -344,3 +347,140 @@ def test_convergence_grace_rejects_unsafe_evidence(manager, fault):
     else:
         clock.now = 110.0
     assert not node._convergence_grace(clock.now, 25.0, 40.0)
+
+
+def test_disabled_small_sweep_goes_directly_global_after_brief_wait(manager):
+    node, clock = manager
+    node.enable_small_sweep = False
+    node.auto_motion_recovery = True
+    node.latest_map_score = 0.1
+    node.observation_clock.elapsed = 4.0
+    node._tick_local_recovery(clock.now)
+    assert node.started_spins == ['global']
+
+
+def test_brief_wait_still_allows_six_healthy_samples_to_finish(manager):
+    node, clock = manager
+    node.enable_small_sweep = False
+    node.auto_motion_recovery = True
+    for at in range(100, 106):
+        fresh(node, clock, float(at))
+        amcl(node)
+        if not node.ready:
+            node._tick_state_machine()
+    assert node.ready
+    assert not node.started_spins
+
+
+def lateral_harness(manager):
+    """Wire real manager motion methods to fake sensors and a fake fusion ACK."""
+    import json
+    from hailo_vision.recovery_lease import RecoveryLease
+    node, clock = manager
+    node.lateral_enabled = node.auto_motion_recovery = True
+    node.lateral_attempted = False
+    node.lateral_distance, node.lateral_cap = .30, .25
+    node.last_odom_pose = (0.0, 0.0, 0.0)
+    node.latest_cmd_at = clock.now
+    node.lateral_guard, node.lateral_guard_at = {}, 0.0
+    node._cancel_navigation = lambda: None
+    node._lateral_sensors_ready = lambda _now: True
+    node._lateral_path_clear = lambda *_: True
+    node._reset_map_match_history = lambda: None
+    node.lateral_commands = []
+    node.recovery_cmd_pub = SimpleNamespace(publish=node.lateral_commands.append)
+    lease = RecoveryLease()
+
+    def lease_publish(message):
+        lease.receive(json.loads(message.data), clock.now)
+        node.lateral_guard = {'token': lease.token, 'active': lease.enabled,
+                              'blocked': lease.blocked(clock.now)}
+        node.lateral_guard_at = clock.now
+
+    node.recovery_lease_pub = SimpleNamespace(publish=lease_publish)
+    return node, clock, lease
+
+
+def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
+    node, clock, lease = lateral_harness(manager)
+    assert node._try_lateral_recovery(clock.now)
+    for _ in range(5):
+        clock.now += .05
+        node._tick_lateral_motion()
+    assert node.lateral_commands[-1].linear.y == .25
+    for distance in [.025 * step for step in range(1, 12)] + [.29]:
+        clock.now += .10
+        node.last_odom_pose = (0.0, distance, 0.0)
+        node._tick_lateral_motion()
+    assert node.lateral_phase == 'stopping'
+    assert lease.blocked(clock.now)
+    assert node.lateral_commands[-1].linear.y == 0.0
+    for _ in range(25):
+        clock.now += .05
+        node.latest_cmd_at = clock.now
+        node._tick_lateral_motion()
+    assert node.lateral_phase is None
+    assert not lease.enabled
+    assert node.started_spins == ['global']
+    assert not node._try_lateral_recovery(clock.now)  # never a second translation
+
+
+@pytest.mark.parametrize('fault', ['scan', 'obstacle', 'guard', 'inhibit', 'yaw', 'timeout'])
+def test_lateral_fault_always_outputs_zero_and_disarms_only_after_stop(manager, fault):
+    node, clock, lease = lateral_harness(manager)
+    node._try_lateral_recovery(clock.now)
+    for _ in range(5):
+        clock.now += .05
+        node._tick_lateral_motion()
+    if fault in {'scan', 'inhibit'}:
+        node._lateral_sensors_ready = lambda _: False
+    elif fault == 'obstacle':
+        node._lateral_path_clear = lambda *_: False
+    elif fault == 'guard':
+        node.lateral_guard_at = 0.0
+        node.recovery_lease_pub = SimpleNamespace(publish=lambda _: None)
+    elif fault == 'yaw':
+        node.last_odom_pose = (0.0, .1, .2)
+    else:
+        clock.now += 9.0
+    node._tick_lateral_motion()
+    assert node.lateral_phase == 'stopping'
+    assert node.lateral_abort_reason
+    assert node.lateral_commands[-1].linear.y == 0.0
+    assert not node.ready
+    assert not node.started_spins
+
+
+def test_amcl_cannot_accept_a_pose_during_translation(manager):
+    node, _clock = manager
+    node.recovery_step = 'lateral_move'
+    node.stable_samples = 5
+    amcl(node)
+    assert not node.ready
+    assert node.stable_samples == 0
+
+
+def test_odom_jump_cannot_count_as_successful_translation(manager):
+    node, clock, _lease = lateral_harness(manager)
+    node._try_lateral_recovery(clock.now)
+    for _ in range(5):
+        clock.now += .05
+        node._tick_lateral_motion()
+    clock.now += .05
+    node.last_odom_pose = (0, .29, 0)
+    node._tick_lateral_motion()
+    assert node.lateral_phase == 'stopping'
+    assert '跳躍' in node.lateral_abort_reason
+
+
+def test_no_feedback_during_stop_requests_help_but_keeps_zero_lease(manager):
+    node, clock, lease = lateral_harness(manager)
+    node._try_lateral_recovery(clock.now)
+    node._stop_lateral('test sensor loss')
+    node._lateral_sensors_ready = lambda _: False
+    clock.now += 3.1
+    node._tick_lateral_motion()
+    assert node.state == 'MANUAL_REQUIRED'
+    assert node.lateral_phase == 'stopping'
+    assert lease.blocked(clock.now)
+    assert node.lateral_commands[-1].linear.y == 0.0

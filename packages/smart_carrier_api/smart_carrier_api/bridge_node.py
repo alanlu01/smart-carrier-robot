@@ -83,6 +83,9 @@ class ApiBridgeNode(Node):
         self.power_healthy = False
         self.power_received = False
         self.heartbeat_confirmed = False
+        self.dispatch_request_id = None
+        self.dispatch_empty_checked = False
+        self.dispatch_last_publish_at = 0.0
 
         # Only this worker performs HTTP. SQLite and ROS publishers stay on the
         # executor thread, so a slow network can never starve local callbacks.
@@ -105,6 +108,16 @@ class ApiBridgeNode(Node):
         )
         self.result_ack_publisher = self.create_publisher(
             String, "/smart_carrier/task_result_ack", STATE_QOS
+        )
+        self.dispatch_sync_publisher = self.create_publisher(
+            String, "/smart_carrier/dispatch_sync_state", STATE_QOS
+        )
+        self.result_sync_publisher = self.create_publisher(
+            String, "/smart_carrier/result_sync_state", STATE_QOS
+        )
+        self.create_subscription(
+            String, "/smart_carrier/dispatch_sync_request", self.on_dispatch_sync_request,
+            COMMAND_QOS,
         )
         self.create_subscription(String, "power_status", self.on_power_status, 10)
         self.create_subscription(
@@ -141,6 +154,47 @@ class ApiBridgeNode(Node):
         except ValueError as exc:
             self.power_healthy = False
             self.get_logger().error(str(exc))
+
+    def on_dispatch_sync_request(self, message):
+        """A fresh startup nonce must not trust an old retained 'empty' state."""
+        try:
+            request_id = str(json.loads(message.data)["request_id"])
+            if not request_id or len(request_id) > 80:
+                return
+            if request_id != self.dispatch_request_id:
+                self.dispatch_request_id = request_id
+                self.dispatch_empty_checked = False
+                self.reconciled = not self.reconciliation_supported
+                self.next_reconcile_at = self.next_claim_at = time.monotonic()
+            self.last_batch_publish_at = 0.0
+            self.publish_claimed_orders()
+            self.publish_dispatch_sync(force=True)
+        except (ValueError, KeyError, TypeError):
+            pass
+
+    def publish_dispatch_sync(self, *, force=False):
+        if not self.dispatch_request_id:
+            return
+        now = time.monotonic()
+        if not force and now - self.dispatch_last_publish_at < 0.5:
+            return
+        tasks = self._collectable_tasks()
+        if tasks or self.active_batch:
+            state = "tasks"
+        elif (self.reconciled and self.network_online is True
+              and self.dispatch_empty_checked and not self.store.has_pending_results()
+              and self.collection_started_at is None):
+            state = "empty"
+        else:
+            state = "waiting"
+        message = String()
+        message.data = json.dumps({
+            "request_id": self.dispatch_request_id, "state": state,
+            "claimed_count": len(tasks), "reconciled": self.reconciled,
+            "online": self.network_online, "checked_at": time.time(),
+        })
+        self.dispatch_sync_publisher.publish(message)
+        self.dispatch_last_publish_at = now
 
     def task_ids(self):
         return {str(task.get("id")) for task in self.claimed_tasks if task.get("id")}
@@ -245,6 +299,8 @@ class ApiBridgeNode(Node):
             self._set_active_batch(None)
 
     def _submit(self, kind, callback, **context):
+        if kind == "claim":
+            self.dispatch_empty_checked = False
         self.network_action = (kind, context)
         self.network_future = self.network.submit(callback)
 
@@ -285,6 +341,7 @@ class ApiBridgeNode(Node):
         return True
 
     def network_cycle(self):
+        self.publish_dispatch_sync()
         if not self.configured:
             return
         self.publish_claimed_orders()
@@ -405,8 +462,11 @@ class ApiBridgeNode(Node):
         elif kind == "claim":
             self._accept_claim(result)
             self.store.set_pending_claim(None)
+            self.dispatch_empty_checked = not bool(result)
+        self.publish_dispatch_sync(force=True)
 
     def _handle_network_error(self, kind, context, error):
+        self.dispatch_empty_checked = False
         if kind == "reconcile" and error.status_code == 404:
             self.reconciliation_supported = False
             self.reconciled = True
@@ -583,8 +643,13 @@ class ApiBridgeNode(Node):
                 # retries independently across network outages and restarts.
                 self._complete_batch_task_locally(task_id)
                 ack = String()
-                ack.data = json.dumps({"event_id": event_id, "task_id": task_id})
+                ack.data = json.dumps({
+                    "event_id": event_id, "task_id": task_id,
+                    "ack_stage": "local_durable", "cloud_confirmed": False,
+                    "terminal_status": status,
+                })
                 self.result_ack_publisher.publish(ack)
+                self.result_sync_publisher.publish(ack)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"忽略無效任務結果：{exc}")
 
@@ -592,8 +657,14 @@ class ApiBridgeNode(Node):
         self.store.settle_result(item["event_id"], item["task_id"])
         self.claimed_tasks = self.store.get_claimed_tasks()
         ack = String()
-        ack.data = json.dumps({"event_id": item["event_id"], "task_id": item["task_id"]})
+        ack.data = json.dumps({
+            "event_id": item["event_id"], "task_id": item["task_id"],
+            "ack_stage": "cloud_reconciled" if terminally_reconciled else "cloud_confirmed",
+            "cloud_confirmed": not terminally_reconciled,
+            "terminal_status": item["status"],
+        })
         self.result_ack_publisher.publish(ack)
+        self.result_sync_publisher.publish(ack)
         self.last_cancel_publish_at.pop(item["task_id"], None)
         self.next_task_poll_at.pop(item["task_id"], None)
         if not terminally_reconciled:

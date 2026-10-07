@@ -1,6 +1,7 @@
 import json
 import math
 import time
+import uuid
 from collections import deque
 
 import rclpy
@@ -56,6 +57,10 @@ from smart_delivery_core.localization_persistence import (
     write_cache,
 )
 from smart_delivery_core.pipeline_health import ReceiptMetrics
+from smart_delivery_core.recovery_translation import (
+    lateral_progress, lateral_speed, swept_scan_clear,
+)
+from smart_delivery_core.wheel_feedback import WheelSampleAssembler
 
 
 STATE_QOS = QoSProfile(
@@ -149,6 +154,17 @@ class LocalizationManager(Node):
         )
         self.cancel_grace = float(self.get_parameter("cancel_grace_sec").value)
         self.local_wait = float(self.get_parameter("local_recovery_wait_sec").value)
+        self.enable_small_sweep = bool(self.get_parameter("enable_small_sweep").value)
+        self.pre_global_wait = float(self.get_parameter("pre_global_wait_sec").value)
+        self.lateral_enabled = bool(self.get_parameter("lateral_recovery_enabled").value)
+        self.lateral_distance = float(self.get_parameter("lateral_recovery_distance").value)
+        self.lateral_cap = float(self.get_parameter("lateral_recovery_speed").value)
+        if not 0 < self.lateral_distance <= 0.30 or not 0 < self.lateral_cap <= 0.25:
+            raise ValueError("Recovery translation exceeds 0.30 m / 0.25 m/s limits")
+        self.lateral_half_x = float(self.get_parameter("lateral_footprint_half_x").value)
+        self.lateral_half_y = float(self.get_parameter("lateral_footprint_half_y").value)
+        if min(self.lateral_half_x, self.lateral_half_y) <= 0:
+            raise ValueError("Recovery footprint dimensions must be positive")
         self.local_max_wait = max(
             self.local_wait,
             float(self.get_parameter("local_recovery_max_wait_sec").value),
@@ -292,6 +308,22 @@ class LocalizationManager(Node):
         self.motion_inhibited = False
         self.map_message = None
         self.latest_scan = None
+        self.latest_raw_scan = None
+        self.latest_odom_stamp_ns = 0
+        self.lateral_attempted = False
+        self.lateral_phase = None
+        self.lateral_token = None
+        self.lateral_anchor = None
+        self.lateral_direction = 0
+        self.lateral_abort_reason = None
+        self.lateral_started_at = 0.0
+        self.lateral_stop_started_at = 0.0
+        self.lateral_last_tick_at = 0.0
+        self.lateral_last_pose = None
+        self.lateral_stopped_since = None
+        self.lateral_guard = {}
+        self.lateral_guard_at = 0.0
+        self.recovery_feedback = WheelSampleAssembler(0.25, time.monotonic())
         self.latest_map_score = None
         self.latest_map_score_raw = None
         self.latest_map_score_at = 0.0
@@ -303,6 +335,7 @@ class LocalizationManager(Node):
         self.map_match_tf_failures = 0
         self.last_map_match_error = ""
         self.last_diagnostic_log_at = 0.0
+        self.last_pipeline_diagnostic_at = 0.0
         self.verification_pose_anchor = None
         self.last_map_match_check_at = 0.0
         self.last_nomotion_request_at = 0.0
@@ -381,6 +414,15 @@ class LocalizationManager(Node):
             CancelGoal, "/navigate_through_poses/_action/cancel_goal"
         )
         self.spin_client = ActionClient(self, Spin, "/spin")
+        # Upstream of velocity smoothing, collision monitoring and semantic safety.
+        self.recovery_cmd_pub = self.create_publisher(Twist, "/cmd_vel_nav", 1)
+        self.recovery_lease_pub = self.create_publisher(
+            String, "/localization/recovery_motion_lease", 1
+        )
+        self.create_subscription(String, "/localization/recovery_motion_guard",
+                                 self._recovery_guard_callback, 1)
+        self.create_subscription(String, "/stm32_data", self._recovery_feedback_callback, 50)
+        self.lateral_timer = self.create_timer(0.05, self._tick_lateral_motion)
         self.timer = self.create_timer(0.2, self._tick)
         self._publish_state()
         self.get_logger().info(
@@ -438,6 +480,13 @@ class LocalizationManager(Node):
             "suspect_promising_max_sec": 30.0,
             "cancel_grace_sec": 2.0,
             "local_recovery_wait_sec": 12.0,
+            "enable_small_sweep": False,
+            "pre_global_wait_sec": 4.0,
+            "lateral_recovery_enabled": True,
+            "lateral_recovery_distance": 0.30,
+            "lateral_recovery_speed": 0.25,
+            "lateral_footprint_half_x": 0.22,
+            "lateral_footprint_half_y": 0.16,
             "local_recovery_max_wait_sec": 30.0,
             "global_recovery_wait_sec": 12.0,
             "global_recovery_max_wait_sec": 30.0,
@@ -571,6 +620,10 @@ class LocalizationManager(Node):
             "map_match_sector_count": self.latest_map_sector_count,
             "map_match_tf_failures": self.map_match_tf_failures,
             "recovery_step": self.recovery_step,
+            "lateral_attempted": self.lateral_attempted,
+            "lateral_phase": self.lateral_phase,
+            "lateral_direction": self.lateral_direction,
+            "lateral_abort_reason": self.lateral_abort_reason,
             "amcl_pose_age_sec": freshness["amcl_pose_age_sec"],
             "odom_age_sec": freshness["odom_age_sec"],
             "cmd_vel_age_sec": freshness["cmd_vel_age_sec"],
@@ -701,6 +754,7 @@ class LocalizationManager(Node):
             self.latest_scan_stamp_age = None
 
     def _raw_scan_callback(self, _message):
+        self.latest_raw_scan = _message
         self.latest_raw_scan_at = time.monotonic()
         self._record_receipt("scan", _message, self.latest_raw_scan_at)
 
@@ -778,6 +832,9 @@ class LocalizationManager(Node):
 
     def _odom_callback(self, message):
         now = time.monotonic()
+        self.latest_odom_stamp_ns = (
+            message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+        )
         self._record_receipt("odom", message, now)
         self.latest_odom_at = now
         pose = message.pose.pose
@@ -868,7 +925,8 @@ class LocalizationManager(Node):
                 or self.spin_waiting_for_stop
                 or self.spin_restoring_heading
                 or self.recovery_step
-                in {"small_spin", "full_spin", "restore_heading", "spin_settle"}
+                in {"small_spin", "full_spin", "restore_heading", "spin_settle",
+                    "lateral_move", "lateral_stop"}
             )
             qualified = (
                 quality.healthy
@@ -901,6 +959,9 @@ class LocalizationManager(Node):
                 self._mark_localized()
 
     def _external_initial_pose_callback(self, _message):
+        if self.lateral_phase is not None:
+            self._stop_lateral("收到人工初始位置；先停止，待停妥後重新提供位置")
+            return
         if self.manual_initial_pose_pending:
             self.manual_initial_pose_pending = False
             return
@@ -1064,6 +1125,22 @@ class LocalizationManager(Node):
         try:
             self._tick_state_machine()
         finally:
+            if (started - self.last_pipeline_diagnostic_at >= 5.0
+                    and self.latest_scan is not None):
+                stamp_age = (
+                    self.get_clock().now().nanoseconds - self.latest_scan_stamp_ns
+                ) / 1e9 if self.latest_scan_stamp_ns > 0 else float('inf')
+                filtered_age = started - self.latest_scan_at
+                if filtered_age > 0.30 or stamp_age > 0.30:
+                    self.get_logger().warning(
+                        "雷達管線延遲診斷（不放寬定位安全門檻）："
+                        f"raw_receive={started - self.latest_raw_scan_at:.3f}s, "
+                        f"filtered_receive={filtered_age:.3f}s, "
+                        f"filtered_source={stamp_age:.3f}s, "
+                        f"tick_gap={self.tick_max_gap:.3f}s, "
+                        f"tf_failures={self.map_match_tf_failures}"
+                    )
+                    self.last_pipeline_diagnostic_at = started
             self.tick_max_duration = max(
                 self.tick_max_duration, time.monotonic() - started
             )
@@ -1076,6 +1153,10 @@ class LocalizationManager(Node):
 
     def _tick_state_machine(self):
         now = time.monotonic()
+        if self.lateral_phase is not None:
+            # Local raw-sensor safety is checked by the independent 20 Hz loop.
+            # AMCL/map evidence must not abort or accept localization mid-sidestep.
+            return
         observing = self.state in {
             "VERIFYING", "SUSPECT", "RECOVERING_LOCAL", "RECOVERING_GLOBAL"
         } and not (self.spin_in_progress or self.spin_waiting_for_stop)
@@ -1550,6 +1631,8 @@ class LocalizationManager(Node):
         self.stationary_amcl_anchor = None
         self.verify_reference_required = False
         self.recovery_reason = reason
+        self.lateral_attempted = False
+        self.lateral_abort_reason = None
         self.spin_sequence = []
         self.spin_in_progress = False
         self.spin_waiting_for_stop = False
@@ -1628,13 +1711,17 @@ class LocalizationManager(Node):
             self.recovery_step_started = now
         elif self.recovery_step == "nomotion_wait":
             self._request_nomotion_if_due(now)
-            if elapsed >= self.local_wait:
-                if self._convergence_grace(now, self.local_wait, self.local_max_wait):
+            wait = self.local_wait if self.enable_small_sweep else self.pre_global_wait
+            if elapsed >= wait:
+                if self._convergence_grace(now, wait, self.local_max_wait):
                     return
                 if not self.auto_motion_recovery:
                     self._require_manual("自動旋轉恢復已停用")
                 else:
-                    self._start_small_sweep()
+                    if self.enable_small_sweep:
+                        self._start_small_sweep()
+                    else:
+                        self._start_global_recovery()
         elif self.recovery_step == "post_small":
             self._request_nomotion_if_due(now)
             if elapsed >= self.local_wait:
@@ -1649,7 +1736,10 @@ class LocalizationManager(Node):
                 reason = self.recovery_reason or "小幅定位掃描未安全完成"
                 self._require_manual(f"{reason}；回正後定位仍未恢復")
         elif self.recovery_step == "motion_inhibited" and not self.motion_inhibited:
-            self._start_small_sweep()
+            if self.enable_small_sweep:
+                self._start_small_sweep()
+            else:
+                self._start_global_recovery()
 
     def _start_small_sweep(self):
         if self.motion_inhibited:
@@ -1735,10 +1825,202 @@ class LocalizationManager(Node):
                             f"延長觀察至最多 {self.global_max_wait:.0f} 秒"
                         )
                     return
-                self._require_manual(
-                    "全域重新定位後仍未通過可信度檢查；"
-                    + self._recovery_failure_reason()
+                if not self._try_lateral_recovery(now):
+                    self._require_manual(
+                        "全域重新定位後仍未通過可信度檢查；"
+                        + self._recovery_failure_reason()
+                    )
+
+    def _recovery_feedback_callback(self, message):
+        self.recovery_feedback.add_line(message.data, time.monotonic())
+
+    def _recovery_guard_callback(self, message):
+        try:
+            payload = json.loads(message.data)
+            if isinstance(payload, dict):
+                self.lateral_guard = payload
+                self.lateral_guard_at = time.monotonic()
+        except (ValueError, TypeError):
+            pass
+
+    def _publish_lateral_lease(self, active=True, permit=False):
+        message = String()
+        message.data = json.dumps({
+            "token": self.lateral_token, "active": active, "permit": permit,
+        })
+        self.recovery_lease_pub.publish(message)
+
+    def _lateral_sensors_ready(self, now):
+        if self.motion_inhibited or self.last_odom_pose is None:
+            return False
+        if self.recovery_feedback.last_complete_at is None:
+            return False
+        if self.recovery_feedback.is_stale(now, 0.30):
+            return False
+        for scan, at in ((self.latest_raw_scan, self.latest_raw_scan_at),
+                         (self.latest_scan, self.latest_scan_at)):
+            if scan is None or not 0 <= now - at <= 0.30:
+                return False
+            stamp = scan.header.stamp.sec * 1_000_000_000 + scan.header.stamp.nanosec
+            age = (self.get_clock().now().nanoseconds - stamp) / 1e9
+            if stamp <= 0 or not -0.1 <= age <= 0.30:
+                return False
+        age = (self.get_clock().now().nanoseconds - self.latest_odom_stamp_ns) / 1e9
+        return (self.latest_odom_stamp_ns > 0 and -0.1 <= age <= 0.25
+                and 0 <= now - self.latest_odom_at <= 0.25)
+
+    def _lateral_path_clear(self, direction, distance):
+        try:
+            # Local odometry TF only: global localization is deliberately untrusted.
+            transform = self.tf_buffer.lookup_transform("odom", "base_footprint", Time())
+            stamp = transform.header.stamp
+            age = (self.get_clock().now().nanoseconds
+                   - stamp.sec * 1_000_000_000 - stamp.nanosec) / 1e9
+            if not -0.1 <= age <= 0.30:
+                return False
+            for scan in (self.latest_raw_scan, self.latest_scan):
+                transform = self.tf_buffer.lookup_transform(
+                    "base_footprint", scan.header.frame_id, Time()
                 )
+                t = transform.transform
+                sensor_pose = (t.translation.x, t.translation.y, quaternion_to_yaw(t.rotation))
+                if not swept_scan_clear(scan, sensor_pose, direction, distance,
+                                        self.lateral_half_x, self.lateral_half_y):
+                    return False
+        except (TransformException, ValueError, TypeError):
+            return False
+        return True
+
+    def _try_lateral_recovery(self, now):
+        if (not self.lateral_enabled or self.lateral_attempted
+                or not self.auto_motion_recovery or self.motion_inhibited
+                or self.spin_in_progress or self.spin_waiting_for_stop
+                or self.commanded_motion or self.odom_motion):
+            return False
+        # Count even a rejected attempt, so missing data cannot create a retry loop.
+        self.lateral_attempted = True
+        if not self._lateral_sensors_ready(now):
+            self.get_logger().warning("橫移拒絕：即時雷達／完整四輪回授／里程計不足")
+            return False
+        directions = [d for d in (1, -1) if self._lateral_path_clear(d, self.lateral_distance)]
+        if not directions:
+            self.get_logger().warning("橫移拒絕：左右掃掠區域不具充分安全視野")
+            return False
+        self._cancel_navigation()
+        self.lateral_direction = directions[0]
+        self.lateral_anchor = self.last_odom_pose
+        self.lateral_started_at = now
+        self.lateral_stopped_since = None
+        self.lateral_abort_reason = None
+        self.lateral_token = str(uuid.uuid4())
+        self.lateral_phase = "arming"
+        self.recovery_step = "lateral_move"
+        self.stable_samples = 0
+        self._reset_map_match_history()
+        self.get_logger().warning(
+            f"首次全域定位未收斂，準備{'左' if directions[0] > 0 else '右'}橫移 "
+            f"{self.lateral_distance:.2f} m，速度上限 {self.lateral_cap:.2f} m/s"
+        )
+        return True
+
+    def _stop_lateral(self, reason=None):
+        if self.lateral_phase != "stopping":
+            self.lateral_stop_started_at = time.monotonic()
+        if reason:
+            self.lateral_abort_reason = reason
+        self.lateral_phase = "stopping"
+        self.recovery_step = "lateral_stop"
+        self._publish_lateral_lease(permit=False)
+        self.recovery_cmd_pub.publish(Twist())
+
+    def _tick_lateral_motion(self):
+        if self.lateral_phase is None:
+            return
+        now = time.monotonic()
+        phase = self.lateral_phase
+        guard_fresh = now - self.lateral_guard_at <= 0.25
+        guard_matches = (guard_fresh and self.lateral_guard.get("active") is True
+                         and self.lateral_guard.get("token") == self.lateral_token)
+        if phase == "disarming":
+            self._publish_lateral_lease(active=False)
+            self.recovery_cmd_pub.publish(Twist())
+            if guard_fresh and self.lateral_guard.get("active") is False:
+                self.lateral_phase = None
+                self.lateral_token = None
+                if self.lateral_abort_reason:
+                    self._require_manual("橫移已停止：" + self.lateral_abort_reason)
+                else:
+                    self._start_global_recovery()
+            return
+        self._publish_lateral_lease(permit=phase in {"authorize", "moving"})
+        if phase == "stopping":
+            self.recovery_cmd_pub.publish(Twist())
+            if self.last_odom_pose is not None:
+                travelled, cross, angle = lateral_progress(
+                    self.lateral_anchor, self.last_odom_pose, self.lateral_direction
+                )
+                if (not all(math.isfinite(v) for v in (travelled, cross, angle))
+                        or travelled > self.lateral_distance + 0.03
+                        or abs(cross) > 0.05 or abs(angle) > math.radians(5)):
+                    self.lateral_abort_reason = "橫移煞停距離／角度偏差超限"
+            stopped = (self._lateral_sensors_ready(now) and not self.commanded_motion
+                       and not self.odom_motion and now - self.latest_cmd_at <= 0.25)
+            self.lateral_stopped_since = (
+                (self.lateral_stopped_since or now) if stopped else None
+            )
+            if self.lateral_stopped_since and now - self.lateral_stopped_since >= 1.0:
+                self.lateral_phase = "disarming"
+            elif now - self.lateral_stop_started_at > 3.0 and self.state != "MANUAL_REQUIRED":
+                # Report the fault, but KEEP the stop lease latched until fresh
+                # physical feedback proves a stop. Do not unlock on a timer.
+                self._require_manual(self.lateral_abort_reason or "無新鮮回授確認橫移已停妥")
+            return  # Missing feedback latches STOP, never grants new motion.
+        if now - self.lateral_started_at > 8.0 or not self._lateral_sensors_ready(now):
+            self._stop_lateral("動作逾時或感測資料逾時／取還中")
+            return
+        if phase == "arming":
+            self.recovery_cmd_pub.publish(Twist())
+            if guard_matches:
+                self.lateral_phase = "authorize"
+            return
+        if phase == "authorize":
+            self.recovery_cmd_pub.publish(Twist())
+            if guard_matches and self.lateral_guard.get("blocked") is False:
+                self.lateral_phase = "moving"
+                self.lateral_last_tick_at = now
+                self.lateral_last_pose = self.last_odom_pose
+            return
+        if not guard_matches or self.lateral_guard.get("blocked") is not False:
+            self._stop_lateral("融合節點安全許可逾時")
+            return
+        progress, cross_track, yaw_error = lateral_progress(
+            self.lateral_anchor, self.last_odom_pose, self.lateral_direction
+        )
+        tick_gap = now - self.lateral_last_tick_at
+        step_distance = math.hypot(
+            self.last_odom_pose[0] - self.lateral_last_pose[0],
+            self.last_odom_pose[1] - self.lateral_last_pose[1],
+        )
+        if tick_gap > 0.25 or step_distance > max(0.04, self.lateral_cap * tick_gap + 0.03):
+            self._stop_lateral("控制迴圈逾時或里程計跳躍")
+            return
+        self.lateral_last_tick_at, self.lateral_last_pose = now, self.last_odom_pose
+        if (not all(math.isfinite(v) for v in (progress, cross_track, yaw_error))
+                or progress < -0.03 or progress > self.lateral_distance + 0.03
+                or abs(cross_track) > 0.05 or abs(yaw_error) > math.radians(5)):
+            self._stop_lateral("里程計軌跡偏移或旋轉超出限制")
+            return
+        speed = lateral_speed(progress, self.lateral_distance, self.lateral_cap)
+        if speed == 0.0:
+            self._stop_lateral()
+            return
+        if not self._lateral_path_clear(self.lateral_direction,
+                                        self.lateral_distance - progress + 0.07):
+            self._stop_lateral("橫移途中障礙物／盲區／TF 失效")
+            return
+        command = Twist()
+        command.linear.y = self.lateral_direction * speed
+        self.recovery_cmd_pub.publish(command)
 
     def _send_next_spin(self):
         if self.spin_in_progress:
@@ -1951,6 +2233,8 @@ class LocalizationManager(Node):
         )
 
     def _require_manual(self, reason):
+        if self.lateral_phase is not None and self.lateral_phase != "disarming":
+            self._stop_lateral(reason)
         self.spin_sequence = []
         self.spin_in_progress = False
         self.spin_waiting_for_stop = False
@@ -1976,6 +2260,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if node.lateral_phase is not None:
+            node._stop_lateral("定位管理器關閉")
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
