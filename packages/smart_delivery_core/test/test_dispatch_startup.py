@@ -100,6 +100,7 @@ def test_actual_idle_branch_waits_only_at_startup(
         return {'x': 2.4, 'y': 5.0}
 
     namespace = dict(
+        optional_runtime=None,
         pending_orders=[], startup_dispatch=StartupDispatchGate(confirmed),
         dispatch_state={'state': 'waiting', 'online': False},
         time=SimpleNamespace(monotonic=lambda: 100.0), math=math, is_standby=parked,

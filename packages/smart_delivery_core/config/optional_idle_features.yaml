@@ -1,0 +1,35 @@
+# Dormant preparation only. Never insert guessed coordinates to enable this.
+schema_version: 1
+map:
+  coordinates_verified: false
+  yaml_sha256: ""
+  occupancy_fingerprint: ""
+home:
+  enabled: false
+  pose: null
+  battery_source_verified: false
+  battery_topic: /vehicle_battery/verified_status
+  battery_source_id: main_battery
+  # Separate future feature settings; existing INA thresholds are NOT changed.
+  low_voltage_v: null
+  low_duration_sec: 15.0
+  battery_timeout_sec: 2.0
+  xy_tolerance_m: 0.02
+  yaw_tolerance_rad: 0.035
+  stopped_duration_sec: 1.0
+  navigation_timeout_sec: 180.0
+people:
+  enabled: false
+  observation_pose: null
+  standby_points: []
+  idle_before_observation_sec: 60.0
+  cooldown_sec: 600.0
+  observation_timeout_sec: 35.0
+  navigation_timeout_sec: 180.0
+  minimum_confidence: 0.65
+  bin_width_deg: 15.0
+  minimum_frames_per_bin: 3
+  minimum_heading_coverage: 0.75
+  camera_yaw_offset_rad: 0.0
+  scan_clearance_m: 0.10
+  max_unknown_arc_deg: 15.0

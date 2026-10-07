@@ -39,6 +39,7 @@ setup(
             'localization_manager = smart_delivery_core.localization_manager:main',
             'delivery_goal_guard = smart_delivery_core.delivery_goal_guard:main',
             'smart_delivery = smart_delivery_core.smart_delivery:main',
+            'optional_idle_map_inspect = smart_delivery_core.optional_idle_inspect:main',
             'smart_delivery_backup = smart_delivery_core.smart_delivery_backup:main',
         ],
     },

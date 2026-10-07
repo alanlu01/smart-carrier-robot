@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from itertools import permutations
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
@@ -30,6 +31,7 @@ from smart_delivery_core.delivery_state import (
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
 from smart_delivery_core.dispatch_startup import StartupDispatchGate
+from smart_delivery_core.optional_idle import load_idle_config
 from smart_delivery_core.navigation_retry import (
     result_sync_message, retry_data_fresh, schedule_tf_retry, transient_tf_failure,
 )
@@ -477,6 +479,7 @@ def go_to_standby(
     new_task_waiting=lambda: False,
     on_outcome=lambda _point, _state: None,
     standby_point=None,
+    optional_interrupt_requested=lambda: False,
 ):
     """尋找最近的待機點並前往避讓"""
     print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
@@ -500,6 +503,12 @@ def go_to_standby(
         while not navigator.isTaskComplete():
             time.sleep(0.1)  # 釋放 CPU
             rclpy.spin_once(navigator, timeout_sec=0.05)
+            if optional_interrupt_requested():
+                navigator.cancelTask()
+                while not navigator.isTaskComplete():
+                    rclpy.spin_once(navigator, timeout_sec=0.05)
+                on_outcome(closest_standby, "interrupted_by_optional_feature")
+                return None
             if new_task_waiting():
                 navigator.cancelTask()
                 navigator.get_logger().info("收到新任務，已中斷待機點導航")
@@ -544,6 +553,11 @@ def main():
     navigator = BasicNavigator()
     tf_buffer = Buffer()
     _tf_listener = TransformListener(tf_buffer, navigator)
+    core_share = get_package_share_directory("smart_delivery_core")
+    navigator.declare_parameter(
+        "optional_idle_config", core_share + "/config/optional_idle_features.yaml"
+    )
+    optional_config = load_idle_config(str(navigator.get_parameter("optional_idle_config").value))
     navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
     navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
     navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
@@ -794,6 +808,20 @@ def main():
         navigation_lease_publisher.publish(message)
 
     navigator.create_timer(0.2, publish_navigation_lease)
+
+    def suspend_navigation_lease():
+        nonlocal delivery_navigation_active
+        # Do not publish false: keep the guard armed while renewal expires.
+        delivery_navigation_active = False
+
+    optional_runtime = None
+    if optional_config["home"]["enabled"] or optional_config["people"]["enabled"]:
+        from smart_delivery_core.optional_idle_runtime import OptionalIdleRuntime
+        optional_runtime = OptionalIdleRuntime(
+            navigator, tf_buffer, optional_config, core_share,
+            localization_can_resume, set_navigation_active,
+            suspend_navigation_lease,
+        )
 
     set_motion_inhibited(False)
 
@@ -1191,6 +1219,12 @@ def main():
             sync_state=dispatch_state.get("state"),
         )
 
+        if optional_runtime and optional_runtime.poll(
+            bool(pending_orders or active_task or pending_result)
+        ):
+            is_standby = False
+            continue
+
         if pending_result:
             if time.monotonic() - last_result_publish_at >= 2.0:
                 emit_result(pending_result)
@@ -1215,6 +1249,18 @@ def main():
                 cancellation_requests.pop(cancelled_order["task_id"]),
             )
             continue
+
+        if optional_runtime and optional_runtime.home_requested:
+            protected_id = str((active_task or {}).get("task_id") or "")
+            unstarted = next((order for order in pending_orders
+                              if str(order.get("task_id")) != protected_id
+                              and not order.get("_resume_state")), None)
+            if unstarted is not None:
+                pending_orders.remove(unstarted)
+                active_task = unstarted
+                queue_result(unstarted, DeliveryStateMachine("task_accepted"), "released",
+                             "Vehicle returning home for low battery; unstarted task released")
+                continue
 
         if not localization_can_resume():
             retry_tf_ready_since = None
@@ -1242,6 +1288,10 @@ def main():
 
         if not pending_orders:
             now = time.monotonic()
+            if optional_runtime and optional_runtime.home_requested:
+                is_standby = False
+                optional_runtime.idle()
+                continue
             if startup_dispatch.waiting:
                 if now - dispatch_last_request_at >= 1.0:
                     request = String()
@@ -1253,6 +1303,16 @@ def main():
                         "啟動任務對帳尚未確認無訂單：留在原地等待 API，不先前往待機點"
                     )
                     dispatch_last_warning_at = now
+                continue
+            if optional_runtime and optional_runtime.idle():
+                if optional_runtime.motion:
+                    is_standby = False
+                if optional_runtime.parked_point is not None:
+                    point = optional_runtime.parked_point
+                    optional_runtime.parked_point = None
+                    current_pos = {"x": point["x"], "y": point["y"]}
+                    is_standby = True
+                    report_standby(point, "arrived")
                 continue
             if not is_standby:
                 current_pos = refresh_current_position(current_pos)
@@ -1276,10 +1336,15 @@ def main():
                     lambda: bool(pending_orders),
                     report_standby,
                     point,
+                    lambda: bool(optional_runtime and optional_runtime.home_requested),
                 )
                 if standby_pos is not None:
                     current_pos = standby_pos
                     is_standby = True
+            continue
+
+        if (optional_runtime and not optional_runtime.home_requested
+                and not optional_runtime.accepting_tasks):
             continue
 
         # A service order always bypasses parking backoff/exhaustion. Rearm the

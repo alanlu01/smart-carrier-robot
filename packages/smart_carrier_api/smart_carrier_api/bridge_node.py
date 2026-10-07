@@ -5,12 +5,15 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from power_monitor.power_status import payload_to_slots
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from smart_carrier_api.api_client import ApiError, SmartCarrierApi
+from smart_carrier_api.task_admission import TaskAdmissionGate
+from smart_delivery_core.optional_idle import load_idle_config
 from smart_carrier_api.bridge_store import BridgeStore, is_terminal_result_error
 from smart_carrier_api.claim_queue import (
     ClaimProjectionError,
@@ -51,6 +54,12 @@ class ApiBridgeNode(Node):
         self.declare_parameter("batch_quiet_period", 1.0)
         self.declare_parameter("batch_max_wait", 5.0)
         self.declare_parameter("batch_claim_retry_interval", 0.25)
+        self.declare_parameter(
+            "optional_idle_config", get_package_share_directory("smart_delivery_core")
+            + "/config/optional_idle_features.yaml"
+        )
+        idle_config = load_idle_config(str(self.get_parameter("optional_idle_config").value))
+        self.task_admission = TaskAdmissionGate(enabled=idle_config['home']['enabled'])
 
         api_url = str(self.get_parameter("api_url").value)
         robot_id = str(self.get_parameter("robot_id").value)
@@ -121,6 +130,9 @@ class ApiBridgeNode(Node):
         )
         self.create_subscription(String, "power_status", self.on_power_status, 10)
         self.create_subscription(
+            String, "/smart_carrier/task_admission", self.on_task_admission, STATE_QOS
+        )
+        self.create_subscription(
             String, "/smart_carrier/task_result", self.on_task_result, STATE_QOS
         )
         self.create_subscription(
@@ -139,6 +151,15 @@ class ApiBridgeNode(Node):
                 self.get_logger().warning(
                     f"已復原 {len(self.claimed_tasks)} 筆尚未完成任務，等待雲端對帳"
                 )
+
+    def on_task_admission(self, message):
+        try:
+            payload = json.loads(message.data)
+        except (ValueError, TypeError):
+            payload = {}
+        self.task_admission.observe(
+            payload, time.monotonic(), self.get_clock().now().nanoseconds / 1e9
+        )
 
     def on_power_status(self, message):
         try:
@@ -305,6 +326,8 @@ class ApiBridgeNode(Node):
         self.network_future = self.network.submit(callback)
 
     def _try_submit_claim(self, now, poll_interval):
+        if not self.task_admission.allows_claim(now):
+            return False
         if (
             self.active_batch
             or not self.reconciled

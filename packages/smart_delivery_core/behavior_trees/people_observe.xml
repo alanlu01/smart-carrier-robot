@@ -1,0 +1,6 @@
+<!-- A NavigateToPose-owned Spin: cancellation/orphan goal guard also halts Spin. -->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Spin spin_dist="6.283185307179586" time_allowance="30.0" error_code_id="{spin_error}"/>
+  </BehaviorTree>
+</root>

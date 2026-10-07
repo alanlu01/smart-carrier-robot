@@ -8,6 +8,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
+from smart_delivery_core.optional_nav_profile import OptionalNavParameters
 
 
 def generate_launch_description():
@@ -28,6 +29,11 @@ def generate_launch_description():
         default_value=default_params,
         description="Absolute path to Nav2 and localization manager parameters",
     )
+    optional_idle_argument = DeclareLaunchArgument(
+        "optional_idle_config",
+        default_value=os.path.join(core_share, "config", "optional_idle_features.yaml"),
+        description="Optional home/people features; disabled by default",
+    )
     behavior_tree_argument = DeclareLaunchArgument(
         "behavior_tree",
         default_value=default_behavior_tree,
@@ -43,7 +49,7 @@ def generate_launch_description():
     )
 
     configured_nav2_params = RewrittenYaml(
-        source_file=LaunchConfiguration("params_file"),
+        source_file=OptionalNavParameters(),
         param_rewrites={
             "default_nav_to_pose_bt_xml": LaunchConfiguration("behavior_tree")
         },
@@ -88,6 +94,7 @@ def generate_launch_description():
         [
             map_argument,
             params_argument,
+            optional_idle_argument,
             behavior_tree_argument,
             use_sim_time_argument,
             auto_initialize_argument,
