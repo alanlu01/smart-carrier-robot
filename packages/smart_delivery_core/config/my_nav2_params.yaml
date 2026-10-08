@@ -114,6 +114,9 @@ localization_manager:
     # If scan-to-map is already good, let AMCL eliminate secondary hypotheses
     # without weakening the covariance safety thresholds.
     global_recovery_max_wait_sec: 30.0
+    # Extra bounded grace ONLY for fresh, stationary and improving evidence.
+    # This is the total post-spin observation ceiling, not 40 additional seconds.
+    global_convergence_max_wait_sec: 40.0
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
     spin_time_allowance_sec: 35

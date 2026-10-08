@@ -1,10 +1,12 @@
 import json
 import math
+import os
 import time
 import uuid
 from collections import deque
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
 from builtin_interfaces.msg import Duration
@@ -56,9 +58,9 @@ from smart_delivery_core.localization_persistence import (
     select_same_boot_pose,
     write_cache,
 )
-from smart_delivery_core.pipeline_health import ReceiptMetrics
+from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics
 from smart_delivery_core.recovery_translation import (
-    lateral_progress, lateral_speed, swept_scan_clear,
+    lateral_progress, lateral_speed, load_self_mask, swept_scan_report,
 )
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
 
@@ -165,6 +167,19 @@ class LocalizationManager(Node):
         self.lateral_half_y = float(self.get_parameter("lateral_footprint_half_y").value)
         if min(self.lateral_half_x, self.lateral_half_y) <= 0:
             raise ValueError("Recovery footprint dimensions must be positive")
+        self.self_mask_config_file = str(self.get_parameter('self_mask_config_file').value)
+        if not self.self_mask_config_file:
+            self.self_mask_config_file = os.path.join(
+                get_package_share_directory('smart_delivery_core'), 'config', 'my_laser_filter.yaml'
+            )
+        self.lateral_self_mask = None
+        try:
+            self.lateral_self_mask = load_self_mask(
+                self.self_mask_config_file, self.lateral_half_x, self.lateral_half_y
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.get_logger().warning(f'自體遮罩無法驗證，橫移採原始保守檢查：{exc}')
+        self.lateral_path_reports = {}
         self.local_max_wait = max(
             self.local_wait,
             float(self.get_parameter("local_recovery_max_wait_sec").value),
@@ -173,6 +188,10 @@ class LocalizationManager(Node):
         self.global_max_wait = max(
             self.global_wait,
             float(self.get_parameter("global_recovery_max_wait_sec").value),
+        )
+        self.global_convergence_max_wait = max(
+            self.global_max_wait,
+            float(self.get_parameter('global_convergence_max_wait_sec').value),
         )
         self.small_spin_angle = float(self.get_parameter("small_spin_angle").value)
         self.full_spin_angle = float(self.get_parameter("full_spin_angle").value)
@@ -263,6 +282,9 @@ class LocalizationManager(Node):
         self.local_wait = max(self.local_wait, minimum_wait)
         self.global_wait = max(self.global_wait, minimum_wait)
         self.global_max_wait = max(self.global_max_wait, self.global_wait)
+        self.global_convergence_max_wait = max(
+            self.global_convergence_max_wait, self.global_max_wait
+        )
         self.verify_timeout = max(self.verify_timeout, minimum_wait)
 
         self.state = "UNINITIALIZED"
@@ -357,6 +379,8 @@ class LocalizationManager(Node):
         self.tick_max_duration = 0.0
         self.last_tick_metrics_at = time.monotonic()
         self.receipt_metrics = ReceiptMetrics()
+        self.scan_pair_metrics = ScanPairMetrics()
+        self.duration_metrics = DurationMetrics()
         self.transient_clock = EvidenceWaitClock()
         self.last_state_publish_at = 0.0
 
@@ -487,9 +511,11 @@ class LocalizationManager(Node):
             "lateral_recovery_speed": 0.25,
             "lateral_footprint_half_x": 0.22,
             "lateral_footprint_half_y": 0.16,
+            "self_mask_config_file": "",  # Same installed YAML as my_lidar.launch.py
             "local_recovery_max_wait_sec": 30.0,
             "global_recovery_wait_sec": 12.0,
             "global_recovery_max_wait_sec": 30.0,
+            "global_convergence_max_wait_sec": 40.0,
             "small_spin_angle": math.radians(20.0),
             "full_spin_angle": 2.0 * math.pi,
             "spin_time_allowance_sec": 35,
@@ -604,6 +630,7 @@ class LocalizationManager(Node):
         message = String()
         freshness = self._freshness_snapshot(now)
         payload = {
+            'sample_ros_stamp_ns': self.get_clock().now().nanoseconds,
             "state": self.state,
             "ready": self.ready,
             "reason": self.state_reason,
@@ -635,6 +662,10 @@ class LocalizationManager(Node):
             "tick_max_gap_sec": round(self.tick_max_gap, 3),
             "tick_max_duration_sec": round(self.tick_max_duration, 3),
             "pipeline_receipts": self.receipt_metrics.snapshot(now),
+            "scan_pair_timing": self.scan_pair_metrics.snapshot(now),
+            "wall_durations": self.duration_metrics.snapshot(now),
+            "lateral_path_reports": self.lateral_path_reports,
+            "lateral_self_mask": self.lateral_self_mask,
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -654,7 +685,8 @@ class LocalizationManager(Node):
         if self.state != "LOCALIZED" and self.recovery_diagnostics:
             payload["recovery_diagnostics"] = self.recovery_diagnostics
         message.data = json.dumps(payload, ensure_ascii=False)
-        self.state_publisher.publish(message)
+        with self.duration_metrics.measure('state_publish'):
+            self.state_publisher.publish(message)
 
     @staticmethod
     def _age_since(timestamp, now):
@@ -766,6 +798,8 @@ class LocalizationManager(Node):
             self.get_clock().now().nanoseconds - stamp_ns
         ) / 1e9
         self.receipt_metrics.observe(name, now, source_age)
+        if name in ('scan', 'scan_filtered'):
+            self.scan_pair_metrics.observe(name, stamp_ns, now)
 
     def _map_callback(self, message):
         self.map_message = message
@@ -1825,6 +1859,10 @@ class LocalizationManager(Node):
                             f"延長觀察至最多 {self.global_max_wait:.0f} 秒"
                         )
                     return
+                if self._convergence_grace(
+                    now, self.global_max_wait, self.global_convergence_max_wait
+                ):
+                    return
                 if not self._try_lateral_recovery(now):
                     self._require_manual(
                         "全域重新定位後仍未通過可信度檢查；"
@@ -1870,6 +1908,8 @@ class LocalizationManager(Node):
                 and 0 <= now - self.latest_odom_at <= 0.25)
 
     def _lateral_path_clear(self, direction, distance):
+        reports = {}
+        self.lateral_path_reports[str(direction)] = reports
         try:
             # Local odometry TF only: global localization is deliberately untrusted.
             transform = self.tf_buffer.lookup_transform("odom", "base_footprint", Time())
@@ -1877,19 +1917,29 @@ class LocalizationManager(Node):
             age = (self.get_clock().now().nanoseconds
                    - stamp.sec * 1_000_000_000 - stamp.nanosec) / 1e9
             if not -0.1 <= age <= 0.30:
+                reports['reason'] = 'odom_tf_stale'
                 return False
-            for scan in (self.latest_raw_scan, self.latest_scan):
+            clear = True
+            for name, scan in (('scan', self.latest_raw_scan), ('scan_filtered', self.latest_scan)):
                 transform = self.tf_buffer.lookup_transform(
                     "base_footprint", scan.header.frame_id, Time()
                 )
                 t = transform.transform
-                sensor_pose = (t.translation.x, t.translation.y, quaternion_to_yaw(t.rotation))
-                if not swept_scan_clear(scan, sensor_pose, direction, distance,
-                                        self.lateral_half_x, self.lateral_half_y):
+                # The current inverted mounting is yaw=pi, not a tilted scan plane.
+                # Do not project a changed roll/pitch installation as a flat scan.
+                if abs(t.rotation.x) > 1e-4 or abs(t.rotation.y) > 1e-4:
+                    reports[name] = {'clear': False, 'reason': 'unsupported_laser_tilt'}
                     return False
-        except (TransformException, ValueError, TypeError):
+                sensor_pose = (t.translation.x, t.translation.y, quaternion_to_yaw(t.rotation))
+                reports[name] = swept_scan_report(
+                    scan, sensor_pose, direction, distance, self.lateral_half_x, self.lateral_half_y,
+                    self_mask=self.lateral_self_mask, sensor_z=t.translation.z,
+                )
+                clear = clear and reports[name]['clear']
+        except (TransformException, ValueError, TypeError, AttributeError) as exc:
+            reports['reason'] = f'transform_or_geometry_error: {exc}'
             return False
-        return True
+        return clear
 
     def _try_lateral_recovery(self, now):
         if (not self.lateral_enabled or self.lateral_attempted
@@ -1904,7 +1954,10 @@ class LocalizationManager(Node):
             return False
         directions = [d for d in (1, -1) if self._lateral_path_clear(d, self.lateral_distance)]
         if not directions:
-            self.get_logger().warning("橫移拒絕：左右掃掠區域不具充分安全視野")
+            self.get_logger().warning(
+                '橫移拒絕：左右掃掠區域不具充分安全視野；'
+                + json.dumps(self.lateral_path_reports, ensure_ascii=False)
+            )
             return False
         self._cancel_navigation()
         self.lateral_direction = directions[0]

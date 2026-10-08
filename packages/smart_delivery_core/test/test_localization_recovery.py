@@ -9,7 +9,7 @@ import pytest
 
 from smart_delivery_core import localization_manager as module
 from smart_delivery_core.localization_health import EvidenceWaitClock, pose_quality
-from smart_delivery_core.pipeline_health import ReceiptMetrics
+from smart_delivery_core.pipeline_health import ReceiptMetrics, ScanPairMetrics
 
 
 @pytest.fixture
@@ -55,6 +55,8 @@ def manager(monkeypatch):
         amcl_nomotion_refresh=3.0, verification_nomotion_refresh=1.0,
         last_nomotion_request_at=0.0, sensor_waiting_for_pipeline=False,
         local_wait=12.0, global_wait=12.0, global_max_wait=30.0,
+        global_convergence_max_wait=40.0,
+        scan_pair_metrics=ScanPairMetrics(), lateral_path_reports={}, lateral_self_mask=None,
         enable_small_sweep=True, pre_global_wait=4.0, lateral_phase=None,
         lateral_enabled=False, lateral_attempted=False,
         latest_scan=None, last_pipeline_diagnostic_at=0.0,
@@ -484,3 +486,103 @@ def test_no_feedback_during_stop_requests_help_but_keeps_zero_lease(manager):
     assert node.lateral_phase == 'stopping'
     assert lease.blocked(clock.now)
     assert node.lateral_commands[-1].linear.y == 0.0
+
+
+def test_post_global_two_of_six_finishes_during_bounded_grace(manager):
+    node, clock = manager
+    node.state, node.recovery_step = 'RECOVERING_GLOBAL', 'post_global'
+    node._observe_wait(100.0)
+    node.observation_clock.elapsed = 30.0
+    node.stable_samples = 2
+    node._tick_state_machine()
+    assert not node.manual_reasons and not node.ready
+    assert node.convergence_grace_announced
+    for at in range(101, 105):
+        fresh(node, clock, float(at))
+        amcl(node)
+        if not node.ready:
+            node._tick_state_machine()
+    assert node.ready
+    assert not node.started_spins and not node.manual_reasons
+
+
+def test_post_global_grace_expires_and_only_then_attempts_lateral(manager):
+    node, clock = manager
+    node.state, node.recovery_step = 'RECOVERING_GLOBAL', 'post_global'
+    node.observation_clock.elapsed = 39.9
+    node.stable_samples = 2
+    attempts = []
+    node._try_lateral_recovery = lambda now: attempts.append(now) or True
+    node._tick_global_recovery(clock.now)
+    assert not attempts and not node.ready
+    node.observation_clock.elapsed = 40.0
+    node._tick_global_recovery(clock.now)
+    assert attempts == [100.0]
+    assert not node.ready
+
+
+@pytest.mark.parametrize('fault', ['bad_map', 'critical', 'moving', 'stale', 'pose_jump'])
+def test_post_global_does_not_extend_unsafe_solution(manager, fault):
+    node, clock = manager
+    node.state, node.recovery_step = 'RECOVERING_GLOBAL', 'post_global'
+    node.observation_clock.elapsed = 30.0
+    node.stable_samples = 2
+    if fault == 'bad_map':
+        node.map_score_window = deque([.1] * 5)
+        node.latest_map_score = .1
+    elif fault == 'critical':
+        amcl(node, xy_std=.6)
+    elif fault == 'moving':
+        node.odom_motion = True
+    elif fault == 'pose_jump':
+        node.latest_pose = (3, 5, 0)
+    else:
+        clock.now = 110.0
+    node._tick_global_recovery(clock.now)
+    assert node.manual_reasons and not node.ready
+
+
+@pytest.mark.parametrize('fault', [None, 'obstacle', 'tilt', 'stale_tf'])
+def test_lateral_manager_checks_both_scans_and_live_tf(manager, fault):
+    import math
+    from geometry_msgs.msg import TransformStamped
+    from sensor_msgs.msg import LaserScan
+    node, clock = manager
+    node.lateral_half_x, node.lateral_half_y = .22, .16
+    node.lateral_self_mask = (-.20, .20, -.125, .125, -.5, .5)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=int(clock.now * 1e9))
+    )
+    transform = TransformStamped()
+    transform.header.stamp.sec = 98 if fault == 'stale_tf' else 100
+    transform.transform.rotation.w = 1.0
+    sensor = TransformStamped()
+    sensor.transform.translation.x = .15
+    sensor.transform.translation.y = -.025
+    sensor.transform.translation.z = .425
+    sensor.transform.rotation.z = 1.0
+    sensor.transform.rotation.w = 0.0
+    if fault == 'tilt':
+        sensor.transform.rotation.x = .01
+    node.tf_buffer = SimpleNamespace(lookup_transform=lambda target, *_:
+                                    transform if target == 'odom' else sensor)
+    raw = LaserScan()
+    raw.header.frame_id = 'laser'
+    raw.angle_min, raw.angle_increment = -math.pi, math.pi / 360
+    raw.range_min, raw.range_max = .05, 8.0
+    raw.ranges = [3.0] * 720
+    index = round(math.atan2(.067, -.149) / raw.angle_increment)
+    raw.ranges[index] = .163
+    filtered = LaserScan()
+    filtered.header = raw.header
+    filtered.angle_min, filtered.angle_increment = raw.angle_min, raw.angle_increment
+    filtered.range_min, filtered.range_max = raw.range_min, raw.range_max
+    filtered.ranges = list(raw.ranges)
+    filtered.ranges[index] = float('nan')
+    if fault == 'obstacle':
+        filtered.ranges[180] = .35
+    node.latest_raw_scan, node.latest_scan = raw, filtered
+    assert node._lateral_path_clear(1, .30) == (fault is None), node.lateral_path_reports
+    if fault in (None, 'obstacle'):
+        assert set(node.lateral_path_reports['1']) == {'scan', 'scan_filtered'}
+        assert node.lateral_path_reports['1']['scan']['masked_beams'] == 1

@@ -73,6 +73,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
+  printf 'diagnostic_schema=20261008-publication-timing\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \
@@ -91,6 +92,8 @@ fi
   fi
   sha256sum "$RECORD_DIR/config_snapshot/"* "$RECORD_DIR/recording_qos.yaml" 2>/dev/null || true
 } > "$RECORD_DIR/environment.txt" 2>&1
+# New timing fields travel in EXISTING /localization/state and
+# /chassis/feedback_health; no old topic is removed and no raw images are added.
 
 graph_snapshot() {
   printf '\n--- %s ---\n' "$(date --iso-8601=ns)"

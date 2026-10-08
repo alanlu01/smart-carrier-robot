@@ -9,7 +9,7 @@ import time
 import json
 
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
-from smart_delivery_core.pipeline_health import ReceiptMetrics
+from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics
 
 class MecanumOdomReal(Node):
     def __init__(self):
@@ -61,6 +61,7 @@ class MecanumOdomReal(Node):
         )
         self.feedback_state = 'waiting'
         self.receipt_metrics = ReceiptMetrics()
+        self.duration_metrics = DurationMetrics()
         self.feedback_health_pub = self.create_publisher(
             String, '/chassis/feedback_health', 1
         )
@@ -96,6 +97,10 @@ class MecanumOdomReal(Node):
         self.get_logger().info('真實硬體里程計解析節點已成功啟動！監聽中...')
 
     def stm32_data_callback(self, msg):
+        with self.duration_metrics.measure('stm32_callback'):
+            self._consume_stm32_data(msg)
+
+    def _consume_stm32_data(self, msg):
         self.receipt_metrics.observe('stm32_data', time.monotonic())
         raw_str = msg.data
         try:
@@ -129,6 +134,10 @@ class MecanumOdomReal(Node):
         return q
 
     def update_odometry(self):
+        with self.duration_metrics.measure('odom_callback'):
+            self._update_odometry()
+
+    def _update_odometry(self):
         current_time = time.monotonic()
         self.receipt_metrics.observe('odom_timer', current_time)
         dt = min(
@@ -185,7 +194,8 @@ class MecanumOdomReal(Node):
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0
         t.transform.rotation = self.euler_to_quaternion(self.th)
-        self.tf_broadcaster.sendTransform(t)
+        with self.duration_metrics.measure('tf_publish'):
+            self.tf_broadcaster.sendTransform(t)
         
         # 5. 發布標準 Odometry 話題
         odom = Odometry()
@@ -198,20 +208,24 @@ class MecanumOdomReal(Node):
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = vth
-        self.odom_pub.publish(odom)
+        with self.duration_metrics.measure('odom_publish'):
+            self.odom_pub.publish(odom)
 
     def publish_feedback_health(self):
         """Report receipt/group/timer timing without altering odometry control."""
         now = time.monotonic()
         payload = {
+            'sample_ros_stamp_ns': self.get_clock().now().nanoseconds,
             'state': self.feedback_state,
             'complete_sample_count': self.feedback_assembler.complete_sample_count,
             'complete_sample_age_sec': round(self.feedback_assembler.sample_age(now), 3),
             'receipts': self.receipt_metrics.snapshot(now),
+            'wall_durations': self.duration_metrics.snapshot(now),
         }
         message = String()
         message.data = json.dumps(payload)
-        self.feedback_health_pub.publish(message)
+        with self.duration_metrics.measure('health_publish'):
+            self.feedback_health_pub.publish(message)
 
 def main(args=None):
     rclpy.init(args=args)
