@@ -1,14 +1,29 @@
 """Persist a trusted AMCL pose only within the current Linux boot."""
 
 import json
+import hashlib
 import math
 import os
 import time
 from pathlib import Path
+import yaml
 
 
 CACHE_VERSION = 1
 DEFAULT_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+def map_file_identity(path):
+    """Bind cached poses to the YAML plus actual raster, not just a file name."""
+    source = Path(path)
+    content = source.read_bytes()
+    metadata = yaml.safe_load(content)
+    raster = Path(metadata['image'])
+    if not raster.is_absolute():
+        raster = source.parent/raster
+    digest = hashlib.sha256(content)
+    digest.update(raster.read_bytes())
+    return digest.hexdigest()
 
 
 def read_boot_id(path=DEFAULT_BOOT_ID_PATH):
@@ -30,7 +45,7 @@ def load_cache(path):
 
 
 def select_same_boot_pose(
-    cache, boot_id, now=None, max_age_sec=3600.0
+    cache, boot_id, now=None, max_age_sec=3600.0, map_identity=None
 ):
     """Classify startup and return a trusted pose only from this Linux boot.
 
@@ -47,6 +62,8 @@ def select_same_boot_pose(
         return "new_boot", None
 
     pose = cache.get("pose")
+    if map_identity is not None and cache.get('map_identity') != map_identity:
+        return 'same_boot_untrusted', None
     saved_at = cache.get("saved_at")
     if not isinstance(pose, dict):
         return "same_boot_untrusted", None
@@ -63,7 +80,7 @@ def select_same_boot_pose(
     return "same_boot_cached", values
 
 
-def write_cache(path, boot_id, pose=None, now=None):
+def write_cache(path, boot_id, pose=None, now=None, map_identity=None):
     """Atomically write the boot marker and optional trusted pose."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +89,7 @@ def write_cache(path, boot_id, pose=None, now=None):
         "boot_id": str(boot_id),
         "saved_at": float(now if now is not None else time.time()),
         "pose": None,
+        "map_identity": map_identity,
     }
     if pose is not None:
         x, y, yaw = (float(value) for value in pose)

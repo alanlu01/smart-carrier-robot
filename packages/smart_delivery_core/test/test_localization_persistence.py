@@ -4,6 +4,7 @@ from smart_delivery_core.localization_persistence import (
     load_cache,
     select_same_boot_pose,
     write_cache,
+    map_file_identity,
 )
 
 
@@ -50,3 +51,22 @@ def test_corrupt_same_boot_pose_is_not_treated_as_power_on(tmp_path):
         "same_boot_untrusted",
         None,
     )
+
+
+def test_same_boot_pose_is_never_reused_for_different_or_legacy_map(tmp_path):
+    path=tmp_path/'pose.json'
+    write_cache(path,'boot-a',(1,2,0),now=100.,map_identity='map-a')
+    assert select_same_boot_pose(load_cache(path),'boot-a',now=101.,map_identity='map-b')[0]=='same_boot_untrusted'
+    assert select_same_boot_pose(load_cache(path),'boot-a',now=101.,map_identity='map-a')[0]=='same_boot_cached'
+    write_cache(path,'boot-a',(1,2,0),now=100.)
+    assert select_same_boot_pose(load_cache(path),'boot-a',now=101.,map_identity='map-a')[0]=='same_boot_untrusted'
+
+
+def test_map_identity_binds_yaml_and_raster(tmp_path):
+    source=tmp_path/'map.yaml'
+    source.write_text('image: map.pgm\n')
+    raster=tmp_path/'map.pgm'
+    raster.write_bytes(b'old raster')
+    original=map_file_identity(source)
+    raster.write_bytes(b'new raster')
+    assert map_file_identity(source)!=original

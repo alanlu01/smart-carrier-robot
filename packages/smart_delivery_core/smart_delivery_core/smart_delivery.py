@@ -31,7 +31,7 @@ from smart_delivery_core.delivery_state import (
 from smart_delivery_core.service_locations import LOCATION_DB, STANDBY_POINTS
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
 from smart_delivery_core.dispatch_startup import StartupDispatchGate
-from smart_delivery_core.optional_idle import load_idle_config
+from smart_delivery_core.optional_idle import home_pending_decision, load_idle_config
 from smart_delivery_core.navigation_retry import (
     result_sync_message, retry_data_fresh, schedule_tf_retry, transient_tf_failure,
 )
@@ -1250,16 +1250,26 @@ def main():
             )
             continue
 
-        if optional_runtime and optional_runtime.home_requested:
+        if optional_runtime and optional_runtime.stop_accepting:
             protected_id = str((active_task or {}).get("task_id") or "")
+            # Finish physical handover; all other started work is aborted at 9.7V.
+            aborted = next((order for order in pending_orders
+                if home_pending_decision(order, home_requested=optional_runtime.home_requested,
+                                         protected_id=protected_id)=='failed'), None)
+            if aborted is not None:
+                pending_orders.remove(aborted)
+                active_task = aborted
+                queue_result(aborted, DeliveryStateMachine('task_accepted'), 'failed',
+                             'Low main battery: interrupted task safely stopped for return home')
+                continue
             unstarted = next((order for order in pending_orders
-                              if str(order.get("task_id")) != protected_id
-                              and not order.get("_resume_state")), None)
+                              if home_pending_decision(order, home_requested=optional_runtime.home_requested,
+                                                       protected_id=protected_id)=='released'), None)
             if unstarted is not None:
                 pending_orders.remove(unstarted)
                 active_task = unstarted
                 queue_result(unstarted, DeliveryStateMachine("task_accepted"), "released",
-                             "Vehicle returning home for low battery; unstarted task released")
+                             "Vehicle battery admission closed; unstarted task released")
                 continue
 
         if not localization_can_resume():
@@ -1343,8 +1353,8 @@ def main():
                     is_standby = True
             continue
 
-        if (optional_runtime and not optional_runtime.home_requested
-                and not optional_runtime.accepting_tasks):
+        if (optional_runtime and not optional_runtime.accepting_tasks
+                and not optional_runtime.service_may_resume(pending_orders[0])):
             continue
 
         # A service order always bypasses parking backoff/exhaustion. Rearm the
@@ -1463,6 +1473,10 @@ def main():
             if active_task_id in cancellation_requests and not cancel_sent:
                 navigator.cancelTask()
                 cancel_sent = True
+            elif optional_runtime and optional_runtime.home_requested and not cancel_sent:
+                navigator.get_logger().warning('低電量返航：先安全取消當前服務導航')
+                navigator.cancelTask()
+                cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
                     f"定位進入 {localization_state}，取消導航並保留任務等待重送"
@@ -1520,6 +1534,9 @@ def main():
                 "cancelled",
                 cancellation_requests.pop(active_task_id),
             )
+        elif optional_runtime and optional_runtime.home_requested:
+            queue_result(target, fsm, 'failed',
+                         'Low main battery: service navigation cancelled for return home')
         elif localization_aborted:
             fsm.transition("waiting_localization")
             target["_resume_state"] = "waiting_localization"

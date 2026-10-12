@@ -103,6 +103,8 @@ def sensor(monkeypatch):
     node.messages, node.batteries = [], []
     node.publisher = SimpleNamespace(publish=node.messages.append)
     node.vehicle_battery_publisher = SimpleNamespace(publish=node.batteries.append)
+    node.verified_battery_publisher = None
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=100000000000))
     return node, bus
 
 
@@ -157,3 +159,20 @@ def test_same_cycle_retry_does_not_publish_false_empty(monkeypatch):
     payload = json.loads(node.messages[-1].data)
     assert payload['ch1']['sensor_ok']
     assert payload['ch1']['status'] != 'empty'
+
+
+def test_verified_main_stream_is_absent_by_default_and_reports_invalid_sensor_honestly(monkeypatch):
+    import json
+    node,bus=sensor(monkeypatch)
+    verified=[]
+    assert node.verified_battery_publisher is None
+    node.verified_battery_publisher=SimpleNamespace(publish=verified.append)
+    assert node._probe_sensor(force=True)
+    node.timer_callback()
+    payload=json.loads(verified[-1].data)
+    assert payload['source_id']=='main_battery' and payload['sensor_ok'] is True
+    assert payload['stamp_sec']>0
+    bus.short_read=True
+    node.timer_callback()
+    payload=json.loads(verified[-1].data)
+    assert payload['sensor_ok'] is False and payload['voltage'] is None

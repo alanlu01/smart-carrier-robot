@@ -40,6 +40,7 @@ TOPICS=(
   /global_costmap/costmap /global_costmap/costmap_updates
   /global_costmap/published_footprint
   /localization/state /localization/ready
+  /localization/speed_limit
   /localization/motion_inhibited
   /localization/recovery_motion_lease /localization/recovery_motion_guard
   /smart_carrier/dispatch_sync_request /smart_carrier/dispatch_sync_state
@@ -73,7 +74,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261008-publication-timing\n'
+  printf 'diagnostic_schema=20261012-idle-and-localization\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \

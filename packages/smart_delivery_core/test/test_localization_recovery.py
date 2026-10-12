@@ -10,6 +10,7 @@ import pytest
 from smart_delivery_core import localization_manager as module
 from smart_delivery_core.localization_health import EvidenceWaitClock, pose_quality
 from smart_delivery_core.pipeline_health import ReceiptMetrics, ScanPairMetrics
+from smart_delivery_core.degraded_localization import MildMapGuard
 
 
 @pytest.fixture
@@ -56,6 +57,8 @@ def manager(monkeypatch):
         last_nomotion_request_at=0.0, sensor_waiting_for_pipeline=False,
         local_wait=12.0, global_wait=12.0, global_max_wait=30.0,
         global_convergence_max_wait=40.0,
+        global_attempts=1, recovery_stall_window=8.0, restore_heading=True,
+        mild_map_enabled=False, mild_map_active=False, mild_map_guard=MildMapGuard(),
         scan_pair_metrics=ScanPairMetrics(), lateral_path_reports={}, lateral_self_mask=None,
         enable_small_sweep=True, pre_global_wait=4.0, lateral_phase=None,
         lateral_enabled=False, lateral_attempted=False,
@@ -95,6 +98,7 @@ def manager(monkeypatch):
     node._start_small_sweep = lambda: node.started_spins.append('small')
     node._start_global_recovery = lambda: node.started_spins.append('global')
     node._begin_recovery = lambda reason, **_: node.started_spins.append(reason)
+    node._recovery_spin_clear = lambda _now: False
     return node, clock
 
 
@@ -586,3 +590,97 @@ def test_lateral_manager_checks_both_scans_and_live_tf(manager, fault):
     if fault in (None, 'obstacle'):
         assert set(node.lateral_path_reports['1']) == {'scan', 'scan_filtered'}
         assert node.lateral_path_reports['1']['scan']['masked_beams'] == 1
+
+
+def test_second_global_is_possible_without_translation_but_only_when_rotation_safe(manager):
+    node,clock=manager
+    node._try_lateral_recovery=lambda _:False
+    node._recovery_spin_clear=lambda _:True
+    node._global_recovery_failed(clock.now,'test')
+    assert node.started_spins==['global'] and not node.manual_reasons
+    node.global_attempts=2
+    node._global_recovery_failed(clock.now,'test')
+    assert node.manual_reasons and node.started_spins==['global']
+
+
+def test_production_global_counter_caps_service_requests_at_two(manager):
+    node,_=manager
+    calls=[]
+    node.global_attempts=0
+    node.global_localization_client=SimpleNamespace(server_is_ready=lambda:True,
+        service_is_ready=lambda:True,call_async=calls.append)
+    node._reset_map_match_history=lambda:None
+    node._set_state=lambda *_:None
+    for _ in range(3):
+        module.LocalizationManager._start_global_recovery(node)
+    assert len(calls)==2 and node.global_attempts==2 and node.manual_reasons
+
+
+def test_critical_flat_convergence_moves_to_second_safe_strategy_early(manager):
+    node,clock=manager
+    node.recovery_step='post_global'
+    node.observation_clock.elapsed=9.
+    node.convergence_samples.extend((float(i),2.) for i in range(10))
+    amcl(node,xy_std=2.)
+    node._try_lateral_recovery=lambda _:False
+    node._recovery_spin_clear=lambda _:True
+    node._tick_global_recovery(clock.now)
+    assert node.started_spins==['global'] and not node.ready
+
+
+def test_disabled_heading_restore_never_sends_extra_angle_command(manager):
+    node,_=manager
+    node.restore_heading=False
+    node.spin_failure_reason=None
+    node._heading_restore_command=lambda:pytest.fail('extra correction must remain disabled')
+    node._finish_spin_sequence=lambda:node.started_spins.append('finished_without_correction')
+    node._complete_spin_sequence()
+    assert node.started_spins==['finished_without_correction']
+
+
+def test_mild_map_low_score_stays_ready_only_briefly_with_healthy_fresh_sensors(manager):
+    node,clock=manager
+    node.state='LOCALIZED'
+    node.mild_map_enabled=True
+    node.ready=True
+    node.suspect_since=None
+    node.amcl_stationary_grace=30.
+    node.ready_publisher=SimpleNamespace(publish=lambda _: None)
+    node.commanded_motion=True
+    node.latest_map_score=.27
+    node.map_score_window=deque([.27]*5)
+    node.map_match_unknown_since=None
+    node.map_match_stale_grace=5.
+    node.latest_scan_stamp_age=.09
+    node.last_odom_pose=(0,0,0)
+    node.latest_raw_scan=SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=100,nanosec=0)))
+    node.latest_odom_stamp_ns=100000000000
+    node.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int(clock.now*1e9)))
+    node._tick_state_machine()
+    assert node.state=='LOCALIZED' and node.mild_map_active
+    fresh(node,clock,101.)
+    node.latest_raw_scan.header.stamp.sec=101
+    node.latest_odom_stamp_ns=101000000000
+    node.last_amcl_at=101.
+    node._tick_state_machine()
+    assert node.mild_map_active
+    fresh(node,clock,102.)
+    node.latest_raw_scan.header.stamp.sec=102
+    node.latest_odom_stamp_ns=102000000000
+    node.last_amcl_at=102.
+    node.ready_publisher=SimpleNamespace(publish=lambda _:None)
+    node._tick_state_machine()
+    assert node.state=='SUSPECT' and not node.mild_map_active
+
+
+def test_delayed_source_data_cannot_enable_soft_map_window(manager):
+    node,clock=manager
+    node.latest_raw_scan=SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=100,nanosec=0)))
+    node.latest_odom_stamp_ns=100000000000
+    node.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int(clock.now*1e9)))
+    assert node._mild_map_sources_fresh()
+    node.latest_odom_stamp_ns=99000000000
+    assert not node._mild_map_sources_fresh()
+    node.latest_odom_stamp_ns=100000000000
+    node.latest_raw_scan.header.stamp.sec=99
+    assert not node._mild_map_sources_fresh()

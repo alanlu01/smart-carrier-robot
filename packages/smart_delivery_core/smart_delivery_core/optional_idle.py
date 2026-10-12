@@ -50,13 +50,19 @@ def load_idle_config(path):
             raise ValueError('Unverified legacy INA topic cannot trigger automatic home return')
         if not str(home.get('battery_topic', '')).startswith('/') or not home.get('battery_source_id'):
             raise ValueError('Dedicated verified battery topic/source is required')
-        for key in ('low_voltage_v', 'low_duration_sec', 'battery_timeout_sec',
+        for key in ('low_voltage_v', 'stop_claim_voltage_v', 'reset_voltage_v',
+                    'reset_duration_sec', 'cutoff_voltage_v', 'low_duration_sec', 'battery_timeout_sec',
                     'xy_tolerance_m', 'yaw_tolerance_rad', 'stopped_duration_sec',
                     'navigation_timeout_sec'):
             if not finite_number(home.get(key)) or home[key] <= 0:
                 raise ValueError(f'home.{key} must be explicitly positive')
-        if home['xy_tolerance_m'] > 0.05 or home['yaw_tolerance_rad'] > 0.10:
-            raise ValueError('Home tolerances must stay tighter than normal parking')
+        if not home['cutoff_voltage_v'] < home['low_voltage_v'] < home['stop_claim_voltage_v'] < home['reset_voltage_v']:
+            raise ValueError('Home voltage thresholds must be cutoff < return < stop-claim < reset')
+        mode = home.get('mode', 'precise_dock')
+        if mode not in ('return_point', 'precise_dock'):
+            raise ValueError('Unsupported home mode')
+        if home['xy_tolerance_m'] > (.10 if mode == 'return_point' else .05) or home['yaw_tolerance_rad'] > .10:
+            raise ValueError('Home tolerances exceed the selected arrival mode')
     if data['people']['enabled']:
         people = data['people']
         if not valid_pose(people.get('observation_pose')):
@@ -108,6 +114,17 @@ class HomeVoltageLatch:
         self.last_stamp = None
         self.last_voltage = None
         self.healthy = False
+        self.admission_latched = latched
+        self.stop_claim_since = None
+        self.recovered_since = None
+
+    @property
+    def cutoff(self):
+        return self.last_voltage is not None and self.last_voltage <= self.config['cutoff_voltage_v']
+
+    def reset_ready(self, now):
+        return (self.healthy and not self.cutoff and self.recovered_since is not None
+                and now-self.recovered_since >= self.config['reset_duration_sec'])
 
     def observe(self, payload, now, ros_now):
         """Ignore stale, repeated, wrong-source and unhealthy voltage samples."""
@@ -116,33 +133,65 @@ class HomeVoltageLatch:
             valid = (payload.get('source_id') == self.config['battery_source_id']
                      and payload.get('sensor_ok') is True
                      and finite_number(stamp) and stamp > 0
-                     and finite_number(voltage) and voltage > 0
+                     and finite_number(voltage) and 6.0 <= voltage <= 13.5
                      and -0.1 <= ros_now - stamp <= self.config['battery_timeout_sec']
                      and (self.last_stamp is None or stamp > self.last_stamp))
         except (KeyError, TypeError):
             valid = False
         if not valid:
             self.low_since = None
+            self.stop_claim_since = self.recovered_since = None
             self.healthy = False
             return False
         if (self.last_receipt is not None
                 and now - self.last_receipt > self.config['battery_timeout_sec']):
             self.low_since = None
+            self.stop_claim_since = self.recovered_since = None
         self.last_receipt, self.last_stamp = now, stamp
         self.last_voltage, self.healthy = voltage, True
-        if voltage >= self.config['low_voltage_v']:
+        if voltage >= self.config['reset_voltage_v']:
+            if self.recovered_since is None:
+                self.recovered_since = now
+            if not self.latched and self.reset_ready(now):
+                self.admission_latched = False
+        else:
+            self.recovered_since = None
+        if voltage <= self.config['stop_claim_voltage_v']:
+            if self.stop_claim_since is None:
+                self.stop_claim_since = now
+            if now-self.stop_claim_since >= self.config['low_duration_sec']:
+                self.admission_latched = True
+        else:
+            self.stop_claim_since = None
+        if voltage > self.config['low_voltage_v']:
             self.low_since = None
         elif self.low_since is None:
             self.low_since = now
         elif now - self.low_since >= self.config['low_duration_sec']:
             self.latched = True
+        if self.cutoff:
+            self.latched = True  # Emergency never waits for the fifteen-second filter.
+        if self.latched:
+            self.admission_latched = True
         return self.latched
 
     def expire(self, now):
         """A missing stream cannot count toward the continuous low interval."""
         if self.last_receipt is None or now - self.last_receipt > self.config['battery_timeout_sec']:
             self.low_since = None
+            self.stop_claim_since = self.recovered_since = None
             self.healthy = False
+
+
+def home_pending_decision(task, *, home_requested, protected_id):
+    """Physical handover is protected; never label an unstarted task completed."""
+    resume = task.get('_resume_state')
+    physical = resume in {'waiting_action', 'wrong_slot', 'verifying_action'}
+    if home_requested and resume and not physical:
+        return 'failed'
+    if not resume and str(task.get('task_id')) != protected_id:
+        return 'released'
+    return None
 
 
 class DirectionalPeople:
@@ -186,17 +235,29 @@ class DirectionalPeople:
             return None
         demand = [statistics.median(values) if len(values) >= self.config['minimum_frames_per_bin']
                   else 0.0 for values in self.frames]
+        directions = {p['name']: math.atan2(p['y']-observation_pose['y'],
+                                           p['x']-observation_pose['x'])
+                      for p in self.config['standby_points']}
+        assigned = {p['name']: [] for p in self.config['standby_points']}
+        distances = {p['name']: math.hypot(p['x']-observation_pose['x'],
+                                          p['y']-observation_pose['y'])
+                     for p in self.config['standby_points']}
+        for index, value in enumerate(demand):
+            bearing = (index+.5)*self.width
+            name = min(directions, key=lambda name: (
+                abs(math.atan2(math.sin(bearing-directions[name]), math.cos(bearing-directions[name]))),
+                distances[name], name))
+            assigned[name].append(value)
+        # Per-angle-bin frame medians, never summed per-frame sightings.
+        # Averaging compensates for unequal angular widths of the real sectors.
         candidates = []
         for point in self.config['standby_points']:
             dx, dy = point['x'] - observation_pose['x'], point['y'] - observation_pose['y']
-            bearing = math.atan2(dy, dx)
-            score = max((value for index, value in enumerate(demand)
-                         if abs(math.atan2(math.sin((index + 0.5) * self.width - bearing),
-                                           math.cos((index + 0.5) * self.width - bearing)))
-                         <= math.pi / 4), default=0.0)
+            values = assigned[point['name']]
+            score = sum(values)/len(values) if values else 0.0
             candidates.append((-score, math.hypot(dx, dy), point['name'], point))
         best = min(candidates)
-        return dict(best[3]) if best[0] <= -1.0 else None
+        return dict(best[3]) if best[0] < 0 else None
 
 
 def home_nav_parameters(parameters, config):

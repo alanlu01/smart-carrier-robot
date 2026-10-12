@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from smart_delivery_core.recovery_translation import (
-    lateral_progress, lateral_speed, load_self_mask, swept_scan_clear, swept_scan_report,
+    lateral_progress, lateral_speed, load_self_mask, spin_scan_clear, swept_scan_clear, swept_scan_report,
 )
 
 
@@ -128,3 +128,15 @@ def test_unverified_self_masks_are_rejected(tmp_path, mutate):
     test_path.write_text('invalid: [' if mutate == 'syntax' else yaml.safe_dump(config))
     with pytest.raises(ValueError):
         load_self_mask(test_path, .22, .16)
+
+
+def test_rotation_safety_never_ignores_near_obstacle_or_large_unknown_wedge():
+    data=scan()
+    assert spin_scan_clear(data,(.15,-.025,math.pi))
+    data.ranges[360]=.5  # Ahead of backwards laser reaches body sweep.
+    assert not spin_scan_clear(data,(.15,-.025,math.pi))
+    data=scan()
+    for i in range(100,140):
+        data.ranges[i]=float('inf')
+    assert not spin_scan_clear(data,(.15,-.025,math.pi))
+    assert spin_scan_clear(body_echo_scan(),(.15,-.025,math.pi),mask(),.425)

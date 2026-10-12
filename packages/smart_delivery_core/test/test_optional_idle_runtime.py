@@ -15,7 +15,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 from smart_delivery_core.optional_idle_runtime import OptionalIdleRuntime
-from smart_delivery_core.optional_idle import load_idle_config
+from smart_delivery_core.optional_idle import home_pending_decision, load_idle_config
 
 ROOT = Path(__file__).parents[1]
 
@@ -82,7 +82,8 @@ def runtime(monkeypatch, tmp_path):
     from smart_delivery_core import optional_idle_runtime as module
     config = load_idle_config(ROOT / 'config/optional_idle_features.yaml')
     config['home'].update(enabled=True, pose={'name': 'HOME', 'x': 1., 'y': 2., 'yaw': 0.},
-                          low_voltage_v=10., battery_source_verified=True)
+                          low_voltage_v=10., stop_claim_voltage_v=10.2, reset_voltage_v=10.7,
+                          xy_tolerance_m=.02, yaw_tolerance_rad=.035, battery_source_verified=True)
     config['people'].update(enabled=True,
         observation_pose={'name': 'OBS', 'x': 0., 'y': 0., 'yaw': 0.},
         standby_points=[{'name': 'A', 'x': 1., 'y': 0., 'yaw': 0.},
@@ -208,9 +209,12 @@ def test_home_arrival_requires_precise_pose_and_stopped_duration(runtime):
 
 
 def test_latched_home_priority_wins_over_people_observation(runtime):
-    manager, navigator, _ = runtime
+    manager, navigator, moment = runtime
     manager._safe = lambda: True
     manager.home.latched = True
+    manager._stationary = lambda: True
+    manager.idle()
+    moment[0] += 1.1
     manager.idle()
     assert manager.state == 'going_home'
     assert navigator.sent[-1].behavior_tree.endswith('smart_home_navigate.xml')
@@ -260,25 +264,99 @@ def test_old_home_latch_survives_delivery_restart(runtime):
     assert restarted.home_requested and not restarted.accepting_tasks
 
 
-def test_only_unstarted_orders_are_released_not_paused_current_task():
+def test_home_aborts_paused_navigation_and_releases_unstarted_orders():
     source = ROOT / 'smart_delivery_core/smart_delivery.py'
     main = next(node for node in ast.parse(source.read_text()).body
                 if isinstance(node, ast.FunctionDef) and node.name == 'main')
     loop = next(node for node in main.body if isinstance(node, ast.While)
                 and ast.unparse(node.test) == 'rclpy.ok()')
     branch = next(node for node in loop.body if isinstance(node, ast.If)
-                  and ast.unparse(node.test) == 'optional_runtime and optional_runtime.home_requested')
+                  and ast.unparse(node.test) == 'optional_runtime and optional_runtime.stop_accepting')
     wrapper = ast.fix_missing_locations(ast.Module(body=[ast.For(
         target=ast.Name(id='_once', ctx=ast.Store()), iter=ast.List(elts=[ast.Constant(1)], ctx=ast.Load()),
         body=[branch], orelse=[])], type_ignores=[]))
     released = []
     paused = {'task_id': 'current', '_resume_state': 'waiting_localization'}
-    namespace = dict(optional_runtime=SimpleNamespace(home_requested=True),
+    namespace = dict(optional_runtime=SimpleNamespace(home_requested=True, stop_accepting=True),
                      active_task=paused, pending_orders=[paused, {'task_id': 'later1'}, {'task_id': 'later2'}],
+                     RECOVERABLE_ACTION_STATES={'waiting_action', 'wrong_slot', 'verifying_action'},
+                     home_pending_decision=home_pending_decision,
                      DeliveryStateMachine=lambda _: None,
                      queue_result=lambda order, *args: released.append(order['task_id']))
     for _ in range(3):
         exec(compile(wrapper, str(source), 'exec'), namespace)
         namespace['active_task'] = None  # durable ACK of the released task
-    assert released == ['later1', 'later2']
-    assert namespace['pending_orders'] == [paused]
+    assert released == ['current', 'later1', 'later2']
+    assert namespace['pending_orders'] == []
+
+
+def test_two_stage_stop_claim_finishes_started_work_but_home_protects_only_physical_handover():
+    for phase in ('waiting_action','wrong_slot','verifying_action'):
+        assert home_pending_decision({'task_id':'a','_resume_state':phase},home_requested=True,
+                                     protected_id='a') is None
+    task={'task_id':'a','_resume_state':'waiting_localization'}
+    assert home_pending_decision(task,home_requested=False,protected_id='a') is None
+    assert home_pending_decision(task,home_requested=True,protected_id='a')=='failed'
+    assert home_pending_decision({'task_id':'later'},home_requested=True,protected_id='a')=='released'
+
+
+def test_safe_reset_requires_recovered_voltage_stopped_and_home_pose(runtime):
+    manager,_,moment=runtime
+    response=SimpleNamespace()
+    manager.home.latched=True
+    manager.home.admission_latched=True
+    manager.state='home_arrived'
+    manager._safe=lambda:True
+    manager._stationary=lambda:True
+    manager._pose=lambda:manager.config['home']['pose']
+    manager._reset(None,response)
+    assert not response.success and manager.home_requested
+    manager.home.recovered_since=84.
+    manager._reset(None,response)
+    assert response.success and not manager.home_requested and manager.accepting_tasks
+
+
+def test_return_point_does_not_start_before_confirmed_stop(runtime):
+    manager,navigator,moment=runtime
+    manager.home.latched=True
+    manager._safe=lambda:True
+    manager._stationary=lambda:False
+    manager.idle()
+    assert not navigator.sent
+    manager._stationary=lambda:True
+    manager.idle()
+    assert not navigator.sent
+    moment[0]+=1.1
+    manager.idle()
+    assert len(navigator.sent)==1
+
+
+def test_cutoff_never_starts_home_navigation(runtime):
+    manager,navigator,_=runtime
+    manager.home.latched=True
+    manager.home.last_voltage=9.4
+    manager._safe=lambda:True
+    manager._stationary=lambda:True
+    assert manager.idle()
+    assert not navigator.sent and manager.reason=='battery_cutoff_safe_stop'
+
+
+def test_home_reset_storage_error_does_not_unlock(runtime):
+    manager,_,_=runtime
+    manager.home.latched=manager.home.admission_latched=True
+    manager.home.recovered_since=84.
+    manager.state='home_arrived'
+    manager._safe=manager._stationary=lambda:True
+    manager._pose=lambda:manager.config['home']['pose']
+    manager._save_latch=lambda _: (_ for _ in ()).throw(OSError('disk full'))
+    response=manager._reset(None,SimpleNamespace())
+    assert not response.success and manager.home_requested and manager.stop_accepting
+
+
+def test_persisted_admission_stop_also_survives_restart(runtime):
+    manager,navigator,_=runtime
+    manager.home.admission_latched=True
+    manager._save_latch(False)
+    restarted=OptionalIdleRuntime(navigator,manager.buffer,manager.config,ROOT,
+                                 lambda:True,lambda _:None,lambda:None)
+    assert not restarted.home_requested and restarted.stop_accepting

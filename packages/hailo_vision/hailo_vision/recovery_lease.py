@@ -1,5 +1,21 @@
 """Short-lived, token-scoped permission for automatic recovery translation."""
 
+import math
+
+
+class LocalizationSpeedLimit:
+    """No producer is compatible with teleop; an expired known producer stops."""
+
+    def __init__(self, timeout=1.0):
+        self.timeout, self.received_at, self.value = timeout, None, 1.0
+
+    def observe(self, value, now):
+        self.received_at = now
+        self.value = float(value) if math.isfinite(value) and 0 <= value <= 1 else 0.0
+
+    def limit(self, now):
+        return self.value if self.received_at is None or now-self.received_at <= self.timeout else 0.0
+
 
 class RecoveryLease:
     """A lost producer latches STOP until the same token is explicitly disarmed."""

@@ -5,7 +5,7 @@ from geometry_msgs.msg import Twist
 
 from hailo_vision import fusion_node as module
 from hailo_vision.pipeline_metrics import PipelineMetrics
-from hailo_vision.recovery_lease import RecoveryLease
+from hailo_vision.recovery_lease import LocalizationSpeedLimit, RecoveryLease
 
 
 def fusion(monkeypatch, age):
@@ -16,6 +16,7 @@ def fusion(monkeypatch, age):
     node.last_pipeline_report_at = 100.0
     node.semantic_sequence = 10
     node.recovery_lease = RecoveryLease()
+    node.localization_speed_limit = LocalizationSpeedLimit()
     node.speed_multiplier = 1.0
     node.semantic_health_state = 'healthy'
     node.latest_semantic_received_at = 100.0
@@ -42,6 +43,28 @@ def test_diagnostics_preserve_hard_stop_on_stale_semantics(monkeypatch):
     assert len(node.commands) == 1
     assert node.commands[0].linear.x == 0.0
     assert node.semantic_speed_limit() == 0.0
+
+
+def test_localization_soft_limit_combines_by_minimum_and_expiry_stops(monkeypatch):
+    node=fusion(monkeypatch,age=.1)
+    node.localization_speed_limit.observe(.5,103.)
+    command=Twist()
+    command.linear.x=.5
+    node.cmd_vel_callback(command)
+    assert node.commands[-1].linear.x==.25
+    node.speed_multiplier=.5
+    node.cmd_vel_callback(command)
+    assert node.commands[-1].linear.x==.25  # no accidental quarter-speed multiplication
+    node.localization_speed_limit.received_at=101.
+    node.cmd_vel_callback(command)
+    assert node.commands[-1].linear.x==0.
+
+
+def test_known_localization_producer_loss_flushes_zero_even_without_new_commands(monkeypatch):
+    node=fusion(monkeypatch,age=.1)
+    node.localization_speed_limit.observe(1.,101.)
+    node.semantic_watchdog_callback()
+    assert node.commands[-1].linear.x==0.
 
 
 def test_diagnostics_preserve_soft_timeout_and_healthy_recovery(monkeypatch):

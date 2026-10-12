@@ -24,7 +24,9 @@ def configuration():
     config['map'].update(coordinates_verified=True, yaml_sha256='a' * 64,
                          occupancy_fingerprint='b' * 64)
     config['home'].update(enabled=True, pose={'name': 'HOME', 'x': 1., 'y': 2., 'yaw': 0.},
-                          battery_source_verified=True, low_voltage_v=10.0)
+                          battery_source_verified=True, low_voltage_v=10.0,
+                          stop_claim_voltage_v=10.2, reset_voltage_v=10.7,
+                          mode='precise_dock', xy_tolerance_m=.02, yaw_tolerance_rad=.035)
     config['people'].update(enabled=True,
         observation_pose={'name': 'OBS', 'x': 0., 'y': 0., 'yaw': 0.},
         standby_points=[{'name': 'E', 'x': 2., 'y': 0., 'yaw': 0.},
@@ -33,12 +35,14 @@ def configuration():
     return config
 
 
-def test_defaults_are_disabled_with_no_guessed_coordinates_or_battery_threshold():
+def test_measured_people_enabled_but_unverified_main_battery_return_disabled():
     config = load_idle_config(DEFAULT)
-    assert not config['home']['enabled'] and not config['people']['enabled']
-    assert config['home']['pose'] is None and config['people']['observation_pose'] is None
-    assert config['people']['standby_points'] == []
-    assert config['home']['low_voltage_v'] is None
+    assert not config['home']['enabled'] and config['people']['enabled']
+    assert not config['home']['battery_source_verified']
+    assert config['home']['pose']['x'] == 0 and config['home']['low_voltage_v'] == 9.7
+    assert config['home']['stop_claim_voltage_v'] == 10.0
+    from smart_delivery_core.service_locations import STANDBY_POINTS
+    assert config['people']['standby_points'] == STANDBY_POINTS
 
 
 @pytest.mark.parametrize('section,key,value', [
@@ -147,8 +151,14 @@ def test_disabled_navigation_substitution_returns_original_file_without_overlay(
     from launch import LaunchContext
     from smart_delivery_core.optional_nav_profile import OptionalNavParameters
     context = LaunchContext()
-    context.launch_configurations.update(params_file='original.yaml', optional_idle_config=str(DEFAULT))
-    assert OptionalNavParameters().perform(context) == 'original.yaml'
+    config = load_idle_config(DEFAULT)
+    config['people']['enabled'] = False
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder)/'disabled.yaml'
+        path.write_text(yaml.safe_dump(config))
+        context.launch_configurations.update(params_file='original.yaml', optional_idle_config=str(path))
+        assert OptionalNavParameters().perform(context) == 'original.yaml'
 
 
 def test_disabled_delivery_does_not_construct_optional_runtime_or_subscriptions():
@@ -158,7 +168,9 @@ def test_disabled_delivery_does_not_construct_optional_runtime_or_subscriptions(
                 if isinstance(node, ast.FunctionDef) and node.name == 'main')
     branch = next(node for node in main.body if isinstance(node, ast.If)
                   and ast.unparse(node.test).startswith("optional_config['home']['enabled']"))
-    namespace = dict(optional_config=load_idle_config(DEFAULT), optional_runtime=None)
+    config = load_idle_config(DEFAULT)
+    config['people']['enabled'] = False
+    namespace = dict(optional_config=config, optional_runtime=None)
     # No navigator, callbacks or buffers are supplied: entering the branch would
     # fail, so this exercises the production activation condition directly.
     exec(compile(ast.Module(body=[branch], type_ignores=[]), str(source), 'exec'), namespace)
@@ -247,3 +259,49 @@ def test_people_repeated_frames_low_confidence_and_non_people_are_not_counted():
     people.observe(values, 0., 10)
     people.observe([{'class': 'Person', 'angle': 0., 'score': .99}], 0., 10)
     assert max(max(items, default=0) for items in people.frames) == 0
+
+
+def test_two_stage_battery_stop_at_ten_return_at_nine_point_seven():
+    config=load_idle_config(DEFAULT)['home']
+    latch=HomeVoltageLatch(config)
+    for step in range(16):
+        latch.observe(sample(1000+step,10.),float(step),1000+step)
+    assert latch.admission_latched and not latch.latched
+    for step in range(16,32):
+        latch.observe(sample(1000+step,9.7),float(step),1000+step)
+    assert latch.latched
+    for step in range(32,48):
+        latch.observe(sample(1000+step,12.),float(step),1000+step)
+    assert latch.latched and latch.reset_ready(47.)
+
+
+def test_admission_only_stop_recovers_with_hysteresis_but_return_latch_never_auto_unlocks():
+    latch=HomeVoltageLatch(load_idle_config(DEFAULT)['home'])
+    for step in range(16):
+        latch.observe(sample(1000+step,9.9),float(step),1000+step)
+    assert latch.admission_latched and not latch.latched
+    for step in range(16,32):
+        latch.observe(sample(1000+step,10.4),float(step),1000+step)
+    assert latch.admission_latched
+    for step in range(32,48):
+        latch.observe(sample(1000+step,10.5),float(step),1000+step)
+    assert not latch.admission_latched
+
+
+def test_cutoff_latches_immediately_and_bad_voltage_cannot_fake_recovery():
+    latch=HomeVoltageLatch(load_idle_config(DEFAULT)['home'])
+    assert latch.observe(sample(1000,9.5),0.,1000)
+    assert latch.cutoff and latch.admission_latched
+    latch.observe(sample(1001,999.),1.,1001)
+    assert not latch.healthy and not latch.reset_ready(100.)
+
+
+@pytest.mark.parametrize('bearing,name', [(90.,'CYCU EE'),(180.,'座位燈'),(0.,'座位')])
+def test_real_station_bearings_partition_each_direction_once(bearing,name):
+    config=load_idle_config(DEFAULT)['people']
+    people=DirectionalPeople(config)
+    people.headings=set(range(people.count))
+    people.frames=[[0]*5 for _ in range(people.count)]
+    index=int(bearing/15)%people.count
+    people.frames[index]=[2]*5
+    assert people.select(config['observation_pose'])['name']==name

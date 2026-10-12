@@ -15,7 +15,7 @@ def generate_launch_description():
     """Start Nav2 together with the robot-side localization safety manager."""
     core_share = get_package_share_directory("smart_delivery_core")
     nav2_share = get_package_share_directory("nav2_bringup")
-    default_map = os.path.join(core_share, "maps", "3f_platform.yaml")
+    default_map = os.path.join(core_share, "maps", "3F_NEW.yaml")
     default_params = os.path.join(core_share, "config", "my_nav2_params.yaml")
     default_behavior_tree = os.path.join(
         core_share, "behavior_trees", "smart_delivery_navigate.xml"
@@ -32,7 +32,7 @@ def generate_launch_description():
     optional_idle_argument = DeclareLaunchArgument(
         "optional_idle_config",
         default_value=os.path.join(core_share, "config", "optional_idle_features.yaml"),
-        description="Optional home/people features; disabled by default",
+        description="Idle feature policy (home trigger disabled; crowd selection enabled)",
     )
     behavior_tree_argument = DeclareLaunchArgument(
         "behavior_tree",
@@ -76,6 +76,7 @@ def generate_launch_description():
         parameters=[
             LaunchConfiguration("params_file"),
             {
+                "map_yaml_file": LaunchConfiguration("map"),
                 "auto_initialize": ParameterValue(
                     LaunchConfiguration("auto_initialize"), value_type=bool
                 )

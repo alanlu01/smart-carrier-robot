@@ -61,10 +61,14 @@ class OptionalIdleRuntime:
         self.home = None
         if config['home']['enabled']:
             saved = False
+            saved_admission = False
             if self.latch_path.exists():
                 # An unreadable latch must fail closed, not silently admit tasks.
-                saved = bool(json.loads(self.latch_path.read_text())['latched'])
+                previous = json.loads(self.latch_path.read_text())
+                saved = bool(previous['latched'])
+                saved_admission = bool(previous.get('admission_latched', saved))
             self.home = HomeVoltageLatch(config['home'], latched=saved)
+            self.home.admission_latched = saved or saved_admission
             navigator.create_subscription(String, config['home']['battery_topic'], self._battery, 10)
             self.admission_pub = navigator.create_publisher(
                 String, '/smart_carrier/task_admission', STATE_QOS)
@@ -90,7 +94,19 @@ class OptionalIdleRuntime:
         if self.home is None:
             return True
         self.home.expire(time.monotonic())
-        return self.map_matches and self.home.healthy and not self.home.latched
+        return self.map_matches and self.home.healthy and not self.home.admission_latched and not self.home.latched
+
+    @property
+    def stop_accepting(self):
+        return self.home is not None and (self.home.admission_latched or self.home.latched)
+
+    def service_may_resume(self, task):
+        if self.home is None:
+            return True
+        physical = task.get('_resume_state') in {'waiting_action', 'wrong_slot', 'verifying_action'}
+        if self.home.latched:
+            return physical
+        return self.home.healthy and (not self.home.admission_latched or bool(task.get('_resume_state')))
 
     def _map(self, message):
         self.map_matches = occupancy_fingerprint(message) == self.config['map']['occupancy_fingerprint']
@@ -115,28 +131,40 @@ class OptionalIdleRuntime:
             payload = json.loads(message.data)
         except (ValueError, TypeError):
             payload = {}
-        was_latched = self.home.latched
+        previous = (self.home.latched, self.home.admission_latched)
         self.home.observe(payload, time.monotonic(), self.navigator.get_clock().now().nanoseconds / 1e9)
-        if self.home.latched and not was_latched:
-            self._save_latch(True)
-            self.navigator.get_logger().warning('大電池持續低電壓：停止新接單，當前任務結束後回家')
+        if previous != (self.home.latched, self.home.admission_latched):
+            self._save_latch(self.home.latched)
+            self.navigator.get_logger().warning('大電池狀態更新：stop_claim=%s, return_home=%s' %
+                                                (self.home.admission_latched, self.home.latched))
 
     def _save_latch(self, latched):
         self.latch_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.latch_path.with_suffix('.tmp')
-        temporary.write_text(json.dumps({'latched': latched}), encoding='utf-8')
+        temporary.write_text(json.dumps({'latched': latched,
+            'admission_latched': self.home.admission_latched}), encoding='utf-8')
         os.replace(temporary, self.latch_path)
 
     def _reset(self, request, response):
         self.home.expire(time.monotonic())
         if (self.motion or self.state != 'home_arrived' or not self.home.healthy
-                or self.home.last_voltage < self.config['home']['low_voltage_v'] + 0.5
-                or not self._stationary()):
+                or not self.home.reset_ready(time.monotonic())
+                or not self._safe() or not self._stationary()
+                or not self._at_goal(self.config['home']['pose'],
+                                     self.config['home']['xy_tolerance_m'],
+                                     self.config['home']['yaw_tolerance_rad'])):
             response.success = False
             response.message = '需已停妥在家且確認大電池電壓恢復後，才能人工解除回家鎖定'
             return response
-        self._save_latch(False)
         self.home.latched = False
+        self.home.admission_latched = False
+        try:
+            self._save_latch(False)
+        except OSError:
+            self.home.latched = self.home.admission_latched = True
+            response.success = False
+            response.message = '鎖定狀態儲存失敗，維持停車與回家鎖定'
+            return response
         self.home.low_since = None
         self.state = 'idle'
         response.success, response.message = True, '回家鎖定已人工解除'
@@ -150,11 +178,13 @@ class OptionalIdleRuntime:
             message = String()
             message.data = json.dumps({'source': 'optional_idle', 'stamp_sec': stamp,
                                        'accepting': self.accepting_tasks,
-                                       'reason': 'home_latched' if self.home_requested else 'battery_health'})
+                                       'reason': 'home_latched' if self.home_requested else
+                                       'low_battery_stop_claim' if self.stop_accepting else 'battery_health'})
             self.admission_pub.publish(message)
         message = String()
         message.data = json.dumps({'stamp_sec': stamp, 'state': self.state, 'reason': self.reason,
                                    'home_latched': self.home_requested, 'map_matches': self.map_matches,
+                                   'stop_claim_latched': self.stop_accepting,
                                    'accepting_tasks': self.accepting_tasks})
         self.status_pub.publish(message)
 
@@ -186,7 +216,7 @@ class OptionalIdleRuntime:
     def _safe(self):
         if self.home is not None:
             self.home.expire(time.monotonic())
-            if not self.home.healthy:
+            if not self.home.healthy or self.home.cutoff:
                 return False
         return (self.map_matches and self.ready() and not self.inhibited
                 and self.last_odom is not None
@@ -292,7 +322,7 @@ class OptionalIdleRuntime:
             self.idle_since = None
         if (not self.motion and self.state in (
                 'waiting_observation_stop', 'people_destination_selected', 'people_arrival_check')
-                and (has_work or self.home_requested)):
+                and (has_work or self.stop_accepting)):
             # A service can start between auxiliary actions. Never resume an
             # old observation/parking decision from a different position.
             self._people_finished('observation_preempted_between_actions')
@@ -309,7 +339,7 @@ class OptionalIdleRuntime:
                 return True
             return False
         interrupt = (not self._safe() or time.monotonic() >= self.deadline
-                     or (self.state != 'going_home' and (has_work or self.home_requested))
+                     or (self.state != 'going_home' and (has_work or self.stop_accepting))
                      or (self.home is not None and not self.home.healthy)
                      or (self.state == 'observing' and not self._clear_to_spin(False)))
         if interrupt and not self.cancel_requested:
@@ -409,9 +439,18 @@ class OptionalIdleRuntime:
                     self.state, self.reason = 'home_failed', 'precise_arrival_not_verified'
                 return True
             if self.home.healthy:
-                self._start(self.config['home']['pose'], 'going_home',
-                            str(self.share / 'behavior_trees/smart_home_navigate.xml'),
-                            self.config['home']['navigation_timeout_sec'])
+                if self.home.cutoff:
+                    self.reason = 'battery_cutoff_safe_stop'
+                    return True
+                if not self._safe() or not self._stationary():
+                    self.stop_since = None
+                    return True
+                self.stop_since = self.stop_since if self.stop_since is not None else now
+                if now-self.stop_since >= self.config['home']['stopped_duration_sec']:
+                    self.stop_since = None
+                    self._start(self.config['home']['pose'], 'going_home',
+                                str(self.share / 'behavior_trees/smart_home_navigate.xml'),
+                                self.config['home']['navigation_timeout_sec'])
             return True
         if self.home and not self.accepting_tasks:
             self.reason = 'waiting_verified_main_battery'

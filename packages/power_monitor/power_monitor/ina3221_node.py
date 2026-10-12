@@ -88,6 +88,11 @@ class INA3221Node(Node):
         self.declare_parameter("vehicle_critical_voltage_v", 9.8)
         self.declare_parameter("vehicle_cutoff_voltage_v", 9.5)
         self.declare_parameter("slot_enabled", [True, True, True])
+        self.declare_parameter('main_battery_source_verified', False)
+        self.verified_battery_publisher = None
+        if self.get_parameter('main_battery_source_verified').value:
+            self.verified_battery_publisher = self.create_publisher(
+                String, '/vehicle_battery/verified_status', 1)
 
         self.i2c_bus = int(self.get_parameter("i2c_bus").value)
         self.configured_i2c_address = int(self.get_parameter("i2c_address").value)
@@ -457,6 +462,14 @@ class INA3221Node(Node):
         battery_message = String()
         battery_message.data = json.dumps(vehicle_battery, ensure_ascii=False)
         self.vehicle_battery_publisher.publish(battery_message)
+        if self.verified_battery_publisher is not None:
+            verified = String()
+            verified.data = json.dumps({
+                'source_id': 'main_battery', 'stamp_sec': self.get_clock().now().nanoseconds/1e9,
+                'sensor_ok': vehicle_battery['sensor_ok'], 'voltage': vehicle_battery['voltage'],
+                'cutoff': vehicle_battery['cutoff'],
+            })
+            self.verified_battery_publisher.publish(verified)
 
     def destroy_node(self):
         if self.bus is not None:

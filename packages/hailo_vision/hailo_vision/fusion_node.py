@@ -19,7 +19,7 @@ from hailo_vision.semantic_protocol import (
     semantic_health_state,
 )
 from hailo_vision.pipeline_metrics import PipelineMetrics
-from hailo_vision.recovery_lease import RecoveryLease
+from hailo_vision.recovery_lease import LocalizationSpeedLimit, RecoveryLease
 
 class SensorFusionNode(Node):
     def __init__(self):
@@ -43,6 +43,7 @@ class SensorFusionNode(Node):
         self.last_pipeline_report_at = time.monotonic()
         self.semantic_sequence = None
         self.recovery_lease = RecoveryLease()
+        self.localization_speed_limit = LocalizationSpeedLimit()
 
         self.declare_parameter('semantic_timeout_sec', 0.80)
         self.declare_parameter('semantic_recovery_timeout_sec', 0.40)
@@ -119,6 +120,7 @@ class SensorFusionNode(Node):
         self.pub_speed_multiplier = self.create_publisher(
             Float32, '/semantic/speed_multiplier', 10
         )
+        self.create_subscription(Float32, '/localization/speed_limit', self.localization_limit_callback, 1)
 
         # 3. 發布虛擬玻璃點雲給 Nav2 代價地圖
         self.pub_virtual_glass = self.create_publisher(PointCloud2, '/visual_glass', 10)
@@ -213,6 +215,8 @@ class SensorFusionNode(Node):
 
     def semantic_watchdog_callback(self):
         now = time.monotonic()
+        if self.localization_speed_limit.limit(now) == 0.0:
+            self.pub_safe_cmd.publish(Twist())
         if self.recovery_lease.enabled:
             if self.recovery_lease.blocked(now):
                 self.pub_safe_cmd.publish(Twist())
@@ -223,8 +227,10 @@ class SensorFusionNode(Node):
             payload['sequence'] = self.semantic_sequence
             payload['source_age_sec'] = round(self.semantic_age(now), 3)
             payload['effective_speed_multiplier'] = min(
-                self.speed_multiplier, self.semantic_speed_limit(now)
+                self.speed_multiplier, self.semantic_speed_limit(now),
+                self.localization_speed_limit.limit(now),
             )
+            payload['localization_speed_limit'] = self.localization_speed_limit.limit(now)
             message = String()
             message.data = json.dumps(payload)
             self.pipeline_pub.publish(message)
@@ -261,6 +267,7 @@ class SensorFusionNode(Node):
         effective_multiplier = min(
             self.speed_multiplier,
             self.semantic_speed_limit(),
+            self.localization_speed_limit.limit(time.monotonic()),
         )
         real_cmd = Twist()
         real_cmd.linear.x = msg.linear.x * effective_multiplier
@@ -272,6 +279,11 @@ class SensorFusionNode(Node):
             real_cmd.linear.x = real_cmd.angular.z = 0.0
             real_cmd.linear.y = max(-0.25, min(0.25, msg.linear.y)) * effective_multiplier
         self.pub_safe_cmd.publish(real_cmd)
+
+    def localization_limit_callback(self, message):
+        self.localization_speed_limit.observe(message.data, time.monotonic())
+        if self.localization_speed_limit.value == 0.0:
+            self.pub_safe_cmd.publish(Twist())
 
     def recovery_lease_callback(self, message):
         try:

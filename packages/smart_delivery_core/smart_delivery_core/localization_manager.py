@@ -24,7 +24,7 @@ from rclpy.qos import (
 )
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32, String
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -54,14 +54,16 @@ from smart_delivery_core.localization_health import (
 )
 from smart_delivery_core.localization_persistence import (
     load_cache,
+    map_file_identity,
     read_boot_id,
     select_same_boot_pose,
     write_cache,
 )
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics
 from smart_delivery_core.recovery_translation import (
-    lateral_progress, lateral_speed, load_self_mask, swept_scan_report,
+    lateral_progress, lateral_speed, load_self_mask, spin_scan_clear, swept_scan_report,
 )
+from smart_delivery_core.degraded_localization import MildMapGuard, convergence_is_stalled
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
 
 
@@ -83,6 +85,12 @@ class LocalizationManager(Node):
     def __init__(self):
         super().__init__("localization_manager")
         self._declare_parameters()
+        self.mild_map_enabled = bool(self.get_parameter('mild_map_observation_enabled').value)
+        self.mild_map_guard = MildMapGuard()
+        self.mild_map_active = False
+        self.restore_heading = bool(self.get_parameter('restore_heading_after_recovery').value)
+        self.global_attempts = 0
+        self.recovery_stall_window = float(self.get_parameter('global_stall_window_sec').value)
 
         self.initial_x = float(self.get_parameter("initial_pose.x").value)
         self.initial_y = float(self.get_parameter("initial_pose.y").value)
@@ -99,6 +107,9 @@ class LocalizationManager(Node):
             1.0, float(self.get_parameter("pose_cache_write_period_sec").value)
         )
         self.boot_id = read_boot_id()
+        map_yaml = str(self.get_parameter('map_yaml_file').value) or os.path.join(
+            get_package_share_directory('smart_delivery_core'), 'maps', '3F_NEW.yaml')
+        self.map_identity = map_file_identity(map_yaml)
         self.initial_pose_source = "fixed_power_on"
         self.same_boot_pose_untrusted = False
         self._configure_startup_pose()
@@ -388,6 +399,7 @@ class LocalizationManager(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.ready_publisher = self.create_publisher(Bool, "/localization/ready", STATE_QOS)
+        self.speed_limit_publisher = self.create_publisher(Float32, '/localization/speed_limit', 1)
         self.state_publisher = self.create_publisher(
             String, "/localization/state", STATE_QOS
         )
@@ -477,6 +489,7 @@ class LocalizationManager(Node):
             "pose_cache_path": "~/.local/state/smart-carrier/localization_pose.json",
             "pose_cache_max_age_sec": 3600.0,
             "pose_cache_write_period_sec": 2.0,
+            "map_yaml_file": "",
             "motion_cmd_topic": "/chassis_cmd_vel",
             "raw_scan_topic": "/scan",
             "filtered_scan_topic": "/scan_filtered",
@@ -516,6 +529,9 @@ class LocalizationManager(Node):
             "global_recovery_wait_sec": 12.0,
             "global_recovery_max_wait_sec": 30.0,
             "global_convergence_max_wait_sec": 40.0,
+            "global_stall_window_sec": 8.0,
+            "restore_heading_after_recovery": False,
+            "mild_map_observation_enabled": True,
             "small_spin_angle": math.radians(20.0),
             "full_spin_angle": 2.0 * math.pi,
             "spin_time_allowance_sec": 35,
@@ -562,6 +578,7 @@ class LocalizationManager(Node):
             cache,
             self.boot_id,
             max_age_sec=self.pose_cache_max_age,
+            map_identity=self.map_identity,
         )
         if status == "same_boot_cached":
             self.initial_x, self.initial_y, self.initial_yaw = pose
@@ -578,7 +595,7 @@ class LocalizationManager(Node):
         # prevents a second process in the same boot from making that assumption
         # before any pose has become trustworthy.
         try:
-            write_cache(self.pose_cache_path, self.boot_id)
+            write_cache(self.pose_cache_path, self.boot_id, map_identity=self.map_identity)
         except OSError as exc:
             self.startup_cache_error = str(exc)
 
@@ -593,7 +610,7 @@ class LocalizationManager(Node):
         if not force and now - self.last_pose_cache_write_at < self.pose_cache_write_period:
             return
         try:
-            write_cache(self.pose_cache_path, self.boot_id, self.latest_pose)
+            write_cache(self.pose_cache_path, self.boot_id, self.latest_pose, map_identity=self.map_identity)
         except (OSError, ValueError) as exc:
             if now - self.last_pose_cache_write_at >= self.diagnostic_log_period:
                 self.get_logger().warning(f"無法保存同次開機可信位置：{exc}")
@@ -666,6 +683,8 @@ class LocalizationManager(Node):
             "wall_durations": self.duration_metrics.snapshot(now),
             "lateral_path_reports": self.lateral_path_reports,
             "lateral_self_mask": self.lateral_self_mask,
+            "mild_map_observation": self.mild_map_active,
+            "global_attempts": self.global_attempts,
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -1052,6 +1071,16 @@ class LocalizationManager(Node):
             blockers.append("map_match_update_failed")
         return blockers
 
+    def _mild_map_sources_fresh(self):
+        """Receipt timing alone cannot turn delayed source data into fresh data."""
+        if self.latest_raw_scan is None or self.latest_odom_stamp_ns <= 0:
+            return False
+        stamp = self.latest_raw_scan.header.stamp
+        raw_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        now_ns = self.get_clock().now().nanoseconds
+        return (raw_ns > 0 and -.1 <= (now_ns-raw_ns)/1e9 <= .30
+                and -.1 <= (now_ns-self.latest_odom_stamp_ns)/1e9 <= .25)
+
     def _observe_wait(self, now):
         """Pause verification deadlines during outages, with a bounded safe wait."""
         phase = (self.state, self.recovery_step)
@@ -1159,6 +1188,11 @@ class LocalizationManager(Node):
         try:
             self._tick_state_machine()
         finally:
+            if hasattr(self, 'speed_limit_publisher'):
+                limit = Float32()
+                # Recovery Spin retains the original protected command chain.
+                limit.data = .5 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0
+                self.speed_limit_publisher.publish(limit)
             if (started - self.last_pipeline_diagnostic_at >= 5.0
                     and self.latest_scan is not None):
                 stamp_age = (
@@ -1187,6 +1221,7 @@ class LocalizationManager(Node):
 
     def _tick_state_machine(self):
         now = time.monotonic()
+        self.mild_map_active = False
         if self.lateral_phase is not None:
             # Local raw-sensor safety is checked by the independent 20 Hz loop.
             # AMCL/map evidence must not abort or accept localization mid-sidestep.
@@ -1330,6 +1365,21 @@ class LocalizationManager(Node):
                 self.commanded_motion,
                 self.odom_motion,
             )
+            if match_status != 'degraded':
+                self.mild_map_guard.reset()
+            if (self.mild_map_enabled and match_status == 'degraded'
+                    and self.latest_quality.healthy and not self.motion_inhibited
+                    and not self._verification_data_blockers(now)
+                    and now-self.latest_raw_scan_at <= .30
+                    and now-self.latest_scan_at <= .30
+                    and now-self.latest_odom_at <= .25
+                    and now-self.last_amcl_at <= 1.0
+                    and self._mild_map_sources_fresh()
+                    and self.latest_scan_stamp_age is not None
+                    and -.1 <= self.latest_scan_stamp_age <= .30
+                    and self.mild_map_guard.allows(now, self.latest_map_score_at, self.last_odom_pose)):
+                self.mild_map_active = True
+                return
             if self.latest_quality.critical or (map_match_bad and suspicion_required):
                 if self.suspect_since is None:
                     self.suspect_since = now
@@ -1665,6 +1715,8 @@ class LocalizationManager(Node):
         self.stationary_amcl_anchor = None
         self.verify_reference_required = False
         self.recovery_reason = reason
+        self.global_attempts = 0
+        self.mild_map_guard.reset()
         self.lateral_attempted = False
         self.lateral_abort_reason = None
         self.spin_sequence = []
@@ -1807,11 +1859,15 @@ class LocalizationManager(Node):
         self._send_next_spin()
 
     def _start_global_recovery(self):
+        if self.global_attempts >= 2:
+            self._require_manual('同次定位恢復已達兩輪上限')
+            return
         self.transient_recovery_eligible = False
         if not self.global_localization_client.service_is_ready():
             self._require_manual("AMCL 全域重新定位服務未就緒")
             return
         self.global_localization_client.call_async(Empty.Request())
+        self.global_attempts += 1
         self.stable_samples = 0
         self._reset_map_match_history()
         self.recovery_step = "global_settle"
@@ -1826,6 +1882,9 @@ class LocalizationManager(Node):
                 self.recovery_step_started = now
                 return
             if not self._motion_pipeline_is_ready():
+                return
+            if self.global_attempts >= 2 and not self._recovery_spin_clear(now):
+                self._require_manual('第二輪自旋前安全視野／回授不足，維持停車')
                 return
             if not self.spin_client.server_is_ready():
                 self._require_manual("Spin 行為伺服器未就緒")
@@ -1844,6 +1903,12 @@ class LocalizationManager(Node):
             self._send_next_spin()
         elif self.recovery_step == "post_global":
             self._request_nomotion_if_due(now)
+            if (self.latest_quality is not None and self.latest_quality.critical
+                    and not self._verification_data_blockers(now)
+                    and convergence_is_stalled(self.convergence_samples, elapsed,
+                                              self.recovery_stall_window)):
+                self._global_recovery_failed(now, '新鮮觀測下 AMCL 收斂停滯')
+                return
             if elapsed >= self.global_wait:
                 map_match_recovered = self._map_match_has_recovered(now)
                 if should_extend_global_recovery(
@@ -1863,11 +1928,38 @@ class LocalizationManager(Node):
                     now, self.global_max_wait, self.global_convergence_max_wait
                 ):
                     return
-                if not self._try_lateral_recovery(now):
-                    self._require_manual(
-                        "全域重新定位後仍未通過可信度檢查；"
-                        + self._recovery_failure_reason()
-                    )
+                self._global_recovery_failed(now, '全域重新定位後仍未通過可信度檢查')
+
+    def _global_recovery_failed(self, now, reason):
+        if self.global_attempts < 2:
+            if self._try_lateral_recovery(now):
+                return
+            if self._recovery_spin_clear(now):
+                self.get_logger().warning(reason+'；橫移不可用，但旋轉安全，嘗試第二輪原地全域定位')
+                self._start_global_recovery()
+                return
+        self._require_manual(reason+'；'+self._recovery_failure_reason())
+
+    def _recovery_spin_clear(self, now):
+        if (not self.auto_motion_recovery or self.commanded_motion or self.odom_motion
+                or not self._lateral_sensors_ready(now)):
+            return False
+        try:
+            tf = self.tf_buffer.lookup_transform('odom', 'base_footprint', Time())
+            stamp = tf.header.stamp
+            age = (self.get_clock().now().nanoseconds-stamp.sec*1_000_000_000-stamp.nanosec)/1e9
+            if not -.1 <= age <= .30:
+                return False
+            for scan in (self.latest_raw_scan, self.latest_scan):
+                tf = self.tf_buffer.lookup_transform('base_footprint', scan.header.frame_id, Time()).transform
+                if abs(tf.rotation.x)>1e-4 or abs(tf.rotation.y)>1e-4:
+                    return False
+                if not spin_scan_clear(scan, (tf.translation.x, tf.translation.y,
+                    quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z):
+                    return False
+        except (TransformException, AttributeError, TypeError, ValueError):
+            return False
+        return True
 
     def _recovery_feedback_callback(self, message):
         self.recovery_feedback.add_line(message.data, time.monotonic())
@@ -2224,7 +2316,7 @@ class LocalizationManager(Node):
         return True
 
     def _complete_spin_sequence(self):
-        correction = self._heading_restore_command()
+        correction = self._heading_restore_command() if self.restore_heading else None
         if correction is not None and correction != 0.0:
             if self._queue_heading_correction(
                 correction, "定位掃描完成後衰減回正"
@@ -2252,6 +2344,10 @@ class LocalizationManager(Node):
 
         self.spin_sequence = []
         self.spin_failure_reason = reason
+        if not self.restore_heading:
+            self.recovery_start_yaw = None
+            self._finish_failed_small_spin()
+            return
         correction = self._heading_restore_command()
         if correction is None:
             self._require_manual(f"{reason}；沒有里程計角度可安全回正")

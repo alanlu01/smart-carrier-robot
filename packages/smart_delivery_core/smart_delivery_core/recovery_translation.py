@@ -127,3 +127,31 @@ def lateral_speed(progress, distance=0.30, cap=0.25):
     if remaining <= 0.015:
         return 0.0
     return min(cap, math.sqrt(2.0 * 0.5 * max(0.0, remaining - 0.015)))
+
+
+def spin_scan_clear(scan, sensor_pose, self_mask=None, sensor_z=0.0,
+                    radius=math.hypot(.22, .16)+.10, max_unknown_deg=15.0):
+    """Require local full-circle evidence; unknown is never presumed free."""
+    sx, sy, yaw = sensor_pose
+    if (not scan.ranges or not all(math.isfinite(v) for v in
+            (sx, sy, yaw, sensor_z, scan.angle_min, scan.angle_increment, radius))
+            or not 6.0 <= abs(scan.angle_increment)*len(scan.ranges) <= 2*math.pi+.1):
+        return False
+    known = []
+    for index, value in enumerate(scan.ranges):
+        valid = math.isfinite(value) and scan.range_min <= value <= scan.range_max
+        angle = scan.angle_min+index*scan.angle_increment+yaw
+        if valid:
+            x, y = sx+value*math.cos(angle), sy+value*math.sin(angle)
+            if (self_mask is not None and self_mask[0]<x<self_mask[1]
+                    and self_mask[2]<y<self_mask[3] and self_mask[4]<sensor_z<self_mask[5]):
+                valid = False
+            elif math.hypot(x, y) <= radius:
+                return False
+        known.append(valid)
+    run = longest = 0
+    for valid in known+known:
+        run = 0 if valid else run+1
+        longest = max(longest, run)
+    gap = min(longest, len(known))*abs(scan.angle_increment)*180/math.pi
+    return sum(known)/len(known) >= .75 and gap <= max_unknown_deg

@@ -117,6 +117,10 @@ localization_manager:
     # Extra bounded grace ONLY for fresh, stationary and improving evidence.
     # This is the total post-spin observation ceiling, not 40 additional seconds.
     global_convergence_max_wait_sec: 40.0
+    global_stall_window_sec: 8.0
+    restore_heading_after_recovery: false
+    # Healthy AMCL + fresh sensors only: bounded 50% speed, <=3s / 0.4m / 3 map samples.
+    mild_map_observation_enabled: true
     small_spin_angle: 0.349066
     full_spin_angle: 6.283185
     spin_time_allowance_sec: 35

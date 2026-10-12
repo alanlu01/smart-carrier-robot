@@ -8,6 +8,7 @@ def test_service_and_standby_locations_match_the_3f_map():
         "電機工程學系": {"x": -2.6, "y": 4.7, "yaw": 0.0},
     }
     assert STANDBY_POINTS == [
-        {"name": "CYCU EE", "x": 2.4, "y": 5.0, "yaw": 0.0},
-        {"name": "座位燈", "x": 1.2, "y": -5.0, "yaw": 0.0},
+        {"name": "CYCU EE", "x": 2.0, "y": 5.18, "yaw": 0.0},
+        {"name": "座位燈", "x": 1.4, "y": -5.3, "yaw": 0.0},
+        {"name": "座位", "x": 6.6, "y": -0.3, "yaw": 3.141592653589793},
     ]

@@ -1,10 +1,9 @@
 """Service and standby poses for the current 3F map."""
 
 STANDBY_POINTS = [
-    {"name": "CYCU EE", "x": 2.4, "y": 5.0, "yaw": 0.0},
-    # 2026-09-29 costmap: x=0.7 overlaps obstacles; x=1.2 also reserves
-    # the existing 0.10 m arrival tolerance away from the rear obstruction.
-    {"name": "座位燈", "x": 1.2, "y": -5.0, "yaw": 0.0},
+    {"name": "CYCU EE", "x": 2.0, "y": 5.18, "yaw": 0.0},
+    {"name": "座位燈", "x": 1.4, "y": -5.3, "yaw": 0.0},
+    {"name": "座位", "x": 6.6, "y": -0.3, "yaw": 3.141592653589793},
 ]
 
 LOCATION_DB = {
