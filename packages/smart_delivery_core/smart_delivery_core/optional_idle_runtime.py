@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import time
+import tempfile
 
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import TaskResult
@@ -57,6 +58,18 @@ class OptionalIdleRuntime:
         self.stop_since = None
         self.settling_after_cancel = False
         self.parked_point = None
+        self.guard_report = {}
+        self.safe_scan_count = 0
+        self.safe_scan_stamp = None
+        self.safe_stop_since = None
+        self.spin_resumes = 0
+        self.people_failures = 0
+        self.observation_collecting = False
+        self.observation_session_deadline = None
+        self.observation_tree_path = None
+        self.interrupt_reason = None
+        self.log_key = None
+        self.last_progress_log = 0.0
         self.latch_path = Path.home() / '.ros/smart_carrier_home_latch.json'
         self.home = None
         if config['home']['enabled']:
@@ -121,7 +134,7 @@ class OptionalIdleRuntime:
         now = time.monotonic()
         previous = self.last_odom
         self.last_odom = (now, message)
-        if self.state == 'observing' and previous is not None:
+        if self.observation_collecting and previous is not None:
             old = yaw_of(previous[1].pose.pose.orientation)
             new = yaw_of(message.pose.pose.orientation)
             self.spin_travel += math.atan2(math.sin(new - old), math.cos(new - old))
@@ -185,8 +198,43 @@ class OptionalIdleRuntime:
         message.data = json.dumps({'stamp_sec': stamp, 'state': self.state, 'reason': self.reason,
                                    'home_latched': self.home_requested, 'map_matches': self.map_matches,
                                    'stop_claim_latched': self.stop_accepting,
-                                   'accepting_tasks': self.accepting_tasks})
+                                   'accepting_tasks': self.accepting_tasks,
+                                   'spin_progress_deg': round(math.degrees(self.spin_travel), 1),
+                                   'spin_resume_count': self.spin_resumes,
+                                   'consecutive_observation_failures': self.people_failures,
+                                   'cooldown_remaining_sec': round(max(0., self.next_people_at-time.monotonic()), 1),
+                                   'idle_remaining_sec': None if self.idle_since is None else round(max(0.,
+                                       self.config['people']['idle_before_observation_sec']-(time.monotonic()-self.idle_since)), 1),
+                                   'spin_guard': self.guard_report})
+        payload = json.loads(message.data)
+        payload['observed_heading_coverage'] = None if self.people is None else round(
+            len(self.people.headings)/self.people.count, 3)
+        message.data = json.dumps(payload)
         self.status_pub.publish(message)
+        self._log_people_state()
+
+    def _log_people_state(self):
+        """Log transitions and bounded progress, never every detector frame."""
+        if not self.config['people']['enabled']:
+            return
+        labels = {'idle': '待機／冷卻', 'going_observation': '前往人流分析點',
+                  'waiting_observation_stop': '已到分析點，等待停妥及連續安全雷達',
+                  'observing': '人流自旋分析', 'waiting_observation_retry': '自旋已取消，停妥後等待安全續轉',
+                  'people_destination_selected': '已選出人流待機點',
+                  'going_people_standby': '前往選定待機點', 'people_arrival_check': '確認待機點抵達'}
+        key = (self.state, self.reason)
+        now = time.monotonic()
+        transition = key != self.log_key
+        progress = self.state in ('observing', 'waiting_observation_retry') and now-self.last_progress_log >= 5.
+        if not transition and not progress:
+            return
+        self.log_key, self.last_progress_log = key, now
+        point = self.goal or {}
+        self.navigator.get_logger().info(
+            '人流｜%s；原因=%s；目標=%s；進度=%.1f°；續轉=%d/%d；冷卻剩餘=%.0fs；安全=%s' %
+            (labels.get(self.state, self.state), self.reason or '正常', point.get('name', '-'),
+             math.degrees(self.spin_travel), self.spin_resumes, self.config['people']['max_spin_resumes'],
+             max(0., self.next_people_at-now), json.dumps(self.guard_report, ensure_ascii=False)))
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
         now = self.navigator.get_clock().now().nanoseconds
@@ -224,26 +272,31 @@ class OptionalIdleRuntime:
                 and self._pose() is not None)
 
     def _clear_to_spin(self, require_stationary=True):
+        self.guard_report = self._spin_guard_report(require_stationary)
+        return self.guard_report['clear']
+
+    def _spin_guard_report(self, require_stationary=True):
+        report = {'clear': False, 'reason': 'unsafe_localization_or_odom'}
         if (not self._safe() or (require_stationary and not self._stationary())
                 or self.last_scan is None):
-            return False
+            return report
         receipt, scan = self.last_scan
         if not self._stamp_fresh(receipt, scan.header.stamp) or not scan.ranges:
-            return False
+            return dict(report, reason='scan_stale_or_absent')
         try:
             transform = self.buffer.lookup_transform('base_footprint', scan.header.frame_id, Time())
         except TransformException:
-            return False
+            return dict(report, reason='laser_tf_unavailable')
         q = transform.transform.rotation
         tx, ty = transform.transform.translation.x, transform.transform.translation.y
         if not all(math.isfinite(value) for value in (
                 q.x, q.y, q.z, q.w, tx, ty, scan.angle_min, scan.angle_increment,
                 scan.range_min, scan.range_max)):
-            return False
+            return dict(report, reason='invalid_laser_geometry')
         if abs(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w - 1.) > .05:
-            return False
+            return dict(report, reason='invalid_laser_geometry')
         if not 6.0 <= abs(scan.angle_increment) * len(scan.ranges) <= 2 * math.pi + .1:
-            return False
+            return dict(report, reason='incomplete_scan_circle')
         xx, xy = 1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w)
         yx, yy = 2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x * q.x + q.z * q.z)
         radius = math.hypot(0.22, 0.16) + self.config['people']['scan_clearance_m']
@@ -258,17 +311,41 @@ class OptionalIdleRuntime:
             angle = scan.angle_min + index * scan.angle_increment
             lx, ly = distance * math.cos(angle), distance * math.sin(angle)
             if math.hypot(tx + xx * lx + xy * ly, ty + yx * lx + yy * ly) <= radius:
-                return False
+                return dict(report, reason='near_obstacle', obstacle_distance_m=round(
+                    math.hypot(tx + xx * lx + xy * ly, ty + yx * lx + yy * ly), 3))
         longest, run = 0, 0
         for available in known + known:
             run = 0 if available else run + 1
             longest = max(longest, run)
         unknown_arc = min(longest, len(known)) * abs(scan.angle_increment) * 180 / math.pi
-        return (valid / len(scan.ranges) >= 0.75
-                and unknown_arc <= self.config['people']['max_unknown_arc_deg'])
+        clear = (valid / len(scan.ranges) >= 0.75
+                 and unknown_arc <= self.config['people']['max_unknown_arc_deg'])
+        return {'clear': clear, 'reason': 'clear' if clear else 'unknown_scan_coverage',
+                'valid_fraction': round(valid/len(scan.ranges), 4), 'unknown_arc_deg': round(unknown_arc, 3)}
+
+    def _spin_start_ready(self):
+        """Require independent safe scans AND continuously stopped feedback."""
+        now = time.monotonic()
+        clear = self._clear_to_spin()
+        if not self._stationary():
+            self.safe_scan_count = 0
+            self.safe_scan_stamp = self.safe_stop_since = None
+            return False
+        self.safe_stop_since = self.safe_stop_since if self.safe_stop_since is not None else now
+        if not clear:
+            self.safe_scan_count = 0
+            self.safe_scan_stamp = None
+            return False
+        scan = self.last_scan[1]
+        stamp = (scan.header.stamp.sec, scan.header.stamp.nanosec)
+        if stamp != self.safe_scan_stamp:
+            self.safe_scan_count += 1
+            self.safe_scan_stamp = stamp
+        return (self.safe_scan_count >= self.config['people']['safe_scan_samples']
+                and now-self.safe_stop_since >= self.config['people']['stopped_before_spin_sec'])
 
     def _vision(self, message):
-        if self.state != 'observing' or self.people is None:
+        if not self.observation_collecting or self.people is None:
             return
         try:
             payload = json.loads(message.data)
@@ -309,19 +386,71 @@ class OptionalIdleRuntime:
         self.cancel_requested, self.cancel_started = False, None
         self.cancel_future, self.last_cancel_at = None, 0.0
         self.reason = ''
+        self.interrupt_reason = None
+        if state == 'going_observation':
+            self.spin_travel = 0.0
+            self.spin_resumes = 0
+            self.people = None
+            self.guard_report = {}
+        if state == 'observing' and self.observation_session_deadline is not None:
+            self.deadline = min(self.deadline, self.observation_session_deadline)
+        self._log_people_state()
         return True
 
     def _people_finished(self, reason):
+        successful = reason in ('parked_at_selected_standby', 'insufficient_directional_demand')
+        preempted = reason.startswith('observation_preempted')
+        self.people_failures = 0 if successful else self.people_failures if preempted else self.people_failures+1
         self.state, self.reason = 'idle', reason
-        self.next_people_at = time.monotonic() + self.config['people']['cooldown_sec']
+        long_wait = successful or self.people_failures >= self.config['people']['max_consecutive_failures']
+        self.next_people_at = time.monotonic() + self.config['people'][
+            'cooldown_sec' if long_wait else 'failure_cooldown_sec']
+        if long_wait:
+            self.people_failures = 0
         self.idle_since = None
+        self.observation_collecting = False
+        self.observation_session_deadline = None
+        self._remove_spin_tree()
+        self._log_people_state()
+
+    def _remove_spin_tree(self):
+        if self.observation_tree_path is not None:
+            try:
+                Path(self.observation_tree_path).unlink(missing_ok=True)
+            except OSError as exc:
+                self.navigator.get_logger().warning('人流暫存 BT 清理失敗：%s' % exc)
+            self.observation_tree_path = None
+
+    def _resume_spin_tree(self):
+        """A remaining-angle BT, never a fresh extra full revolution."""
+        remaining = max(0., 2*math.pi-self.spin_travel)
+        self._remove_spin_tree()
+        with tempfile.NamedTemporaryFile(prefix='robot_people_remaining_', suffix='.xml',
+                                         mode='w', encoding='utf-8', delete=False) as stream:
+            stream.write('<root BTCPP_format="4" main_tree_to_execute="MainTree">'
+                         '<BehaviorTree ID="MainTree"><Spin spin_dist="%.9f" time_allowance="30.0" '
+                         'error_code_id="{spin_error}"/></BehaviorTree></root>' % remaining)
+            self.observation_tree_path = stream.name
+        return stream.name
+
+    def _finish_people_scan(self):
+        self.observation_collecting = False
+        self._remove_spin_tree()
+        selected = self.people.select(self.config['people']['observation_pose']) if self.people else None
+        if selected is None:
+            self._people_finished('insufficient_directional_demand')
+        else:
+            self.goal, self.state = selected, 'people_destination_selected'
+            self.reason = 'full_scan_completed'
+            self._log_people_state()
 
     def poll(self, has_work):
         """Cancel on unsafe data/new service work and drain before any new goal."""
         if has_work:
             self.idle_since = None
         if (not self.motion and self.state in (
-                'waiting_observation_stop', 'people_destination_selected', 'people_arrival_check')
+                'waiting_observation_stop', 'waiting_observation_retry',
+                'people_destination_selected', 'people_arrival_check')
                 and (has_work or self.stop_accepting)):
             # A service can start between auxiliary actions. Never resume an
             # old observation/parking decision from a different position.
@@ -338,13 +467,21 @@ class OptionalIdleRuntime:
                     self.stop_since = None
                 return True
             return False
-        interrupt = (not self._safe() or time.monotonic() >= self.deadline
-                     or (self.state != 'going_home' and (has_work or self.stop_accepting))
-                     or (self.home is not None and not self.home.healthy)
-                     or (self.state == 'observing' and not self._clear_to_spin(False)))
-        if interrupt and not self.cancel_requested:
+        reason = None
+        if self.state != 'going_home' and (has_work or self.stop_accepting):
+            reason = 'observation_preempted_by_service_or_battery'
+        elif not self._safe():
+            reason = 'unsafe_localization_or_odom_or_battery'
+        elif time.monotonic() >= self.deadline:
+            reason = 'observation_or_navigation_timeout'
+        elif self.state == 'observing' and not self._clear_to_spin(False):
+            reason = self.guard_report.get('reason', 'spin_safety_rejected')
+        if reason and not self.cancel_requested:
             self.cancel_requested = True
             self.cancel_started = time.monotonic()
+            self.interrupt_reason = reason
+            self.reason = reason
+            self._log_people_state()
         if self.goal_request is not None:
             if not self.goal_request.done():
                 if self.cancel_started and time.monotonic() - self.cancel_started > 5:
@@ -392,23 +529,33 @@ class OptionalIdleRuntime:
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
+            elif (self.state == 'observing' and self.interrupt_reason == 'unknown_scan_coverage'
+                  and self.spin_resumes < self.config['people']['max_spin_resumes']
+                  and self.observation_session_deadline is not None
+                  and time.monotonic() < self.observation_session_deadline):
+                self.state, self.reason = 'waiting_observation_retry', self.interrupt_reason
+                self.safe_scan_count = 0
+                self.safe_scan_stamp = self.safe_stop_since = None
+                self.deadline = min(time.monotonic()+self.config['people']['spin_ready_wait_sec'],
+                                    self.observation_session_deadline)
+                self._log_people_state()
             else:
-                self._people_finished('observation_interrupted_or_failed')
+                self._people_finished(self.interrupt_reason or 'nav2_failed')
         elif self.state == 'going_home':
             self.state, self.stop_since = 'verifying_home', None
             self.deadline = time.monotonic() + 5.0
         elif self.state == 'going_observation':
             self.state = 'waiting_observation_stop'
-            self.deadline = time.monotonic() + 5.0
+            self.deadline = time.monotonic() + self.config['people']['spin_ready_wait_sec']
+            self.safe_scan_count = 0
+            self.safe_scan_stamp = self.safe_stop_since = None
         elif self.state == 'observing':
+            self.settling_after_cancel = True
+            self.stop_since = None
             if abs(self.spin_travel) < 5.8:
                 self._people_finished('insufficient_rotation_coverage')
             else:
-                selected = self.people.select(self.config['people']['observation_pose'])
-                if selected is None:
-                    self._people_finished('insufficient_directional_demand')
-                else:
-                    self.goal, self.state = selected, 'people_destination_selected'
+                self._finish_people_scan()
         elif self.state == 'going_people_standby':
             self.state = 'people_arrival_check'
             self.deadline = time.monotonic() + 5.0
@@ -420,9 +567,11 @@ class OptionalIdleRuntime:
                 and abs(math.atan2(math.sin(pose['yaw'] - point['yaw']),
                                    math.cos(pose['yaw'] - point['yaw']))) <= yaw)
 
-    def idle(self):
+    def idle(self, parked=False):
         """Return True when optional policy owns idle flow, even while stopped."""
         now = time.monotonic()
+        if self.settling_after_cancel:
+            return True
         if self.home_requested:
             if self.motion or self.state in ('home_arrived', 'home_failed'):
                 return True
@@ -460,15 +609,40 @@ class OptionalIdleRuntime:
         people = self.config['people']
         if self.motion:
             return True
-        if self.state == 'waiting_observation_stop':
-            if self._clear_to_spin():
+        if self.state in ('waiting_observation_stop', 'waiting_observation_retry'):
+            if self.settling_after_cancel:
+                return True
+            retry = self.state == 'waiting_observation_retry'
+            if (retry and (not self._safe() or self.observation_session_deadline is None
+                          or now >= self.observation_session_deadline)):
+                self._people_finished('retry_localization_or_session_unavailable')
+                return True
+            if now >= self.deadline:
+                self._people_finished('spin_ready_timeout:'+self.guard_report.get('reason','unknown'))
+                return True
+            pose = self._pose()
+            point = people['observation_pose']
+            if pose is None or math.hypot(pose['x']-point['x'],pose['y']-point['y']) > .10:
+                if now >= self.deadline:
+                    self._people_finished('observation_position_not_verified')
+                return True
+            if retry and self.spin_travel >= 5.8 and self._stationary():
+                self._finish_people_scan()
+                return True
+            if self._spin_start_ready():
+                if retry:
+                    tree = self._resume_spin_tree()
+                    if self._start(point, 'observing', tree, people['observation_timeout_sec']):
+                        self.spin_resumes += 1
+                    return True
                 self.people = DirectionalPeople(people)
                 self.spin_travel = 0.0
+                self.spin_resumes = 0
+                self.observation_session_deadline = now+people['observation_session_timeout_sec']
+                self.observation_collecting = True
                 self._start(people['observation_pose'], 'observing',
                             str(self.share / 'behavior_trees/people_observe.xml'),
                             people['observation_timeout_sec'])
-            elif now >= self.deadline:
-                self._people_finished('unsafe_spin_clearance_or_sensor_data')
             return True
         if self.state == 'people_destination_selected':
             self._start(self.goal, 'going_people_standby', '', people['navigation_timeout_sec'])
@@ -482,7 +656,15 @@ class OptionalIdleRuntime:
             if now >= self.deadline:
                 self._people_finished('standby_arrival_not_verified')
             return True
-        self.idle_since = self.idle_since or now
+        pose = self._pose()
+        at_standby = pose is not None and any(
+            math.hypot(pose['x']-p['x'],pose['y']-p['y']) <= .10
+            and abs(math.atan2(math.sin(pose['yaw']-p['yaw']),math.cos(pose['yaw']-p['yaw']))) <= .10
+            for p in people['standby_points'])
+        if not parked or not self._safe() or not self._stationary() or not at_standby:
+            self.idle_since = None
+            return False
+        self.idle_since = self.idle_since if self.idle_since is not None else now
         if now < self.next_people_at or now - self.idle_since < people['idle_before_observation_sec']:
             return False
         self._start(people['observation_pose'], 'going_observation', '', people['navigation_timeout_sec'])

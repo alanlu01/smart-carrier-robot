@@ -1314,7 +1314,7 @@ def main():
                     )
                     dispatch_last_warning_at = now
                 continue
-            if optional_runtime and optional_runtime.idle():
+            if optional_runtime and optional_runtime.idle(parked=is_standby):
                 if optional_runtime.motion:
                     is_standby = False
                 if optional_runtime.parked_point is not None:

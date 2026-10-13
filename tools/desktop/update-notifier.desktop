@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Robot manual updates only
+Hidden=true
+# Install as ~/.config/autostart/update-notifier.desktop to override GNOME autostart.
+# Does not remove packages, install updates, or change the pinned kernel.

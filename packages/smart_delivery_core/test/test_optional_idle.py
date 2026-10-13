@@ -55,6 +55,9 @@ def test_measured_people_enabled_but_unverified_main_battery_return_disabled():
     ('home', 'xy_tolerance_m', .2), ('people', 'observation_pose', None),
     ('people', 'standby_points', []), ('people', 'minimum_frames_per_bin', 1),
     ('people', 'minimum_heading_coverage', 0), ('people', 'bin_width_deg', 17),
+    ('people', 'max_spin_resumes', 3), ('people', 'max_spin_resumes', True),
+    ('people', 'safe_scan_samples', 2), ('people', 'max_consecutive_failures', 4),
+    ('people', 'failure_cooldown_sec', 1000), ('people', 'observation_session_timeout_sec', 1),
 ])
 def test_incomplete_enabled_feature_configuration_is_refused(tmp_path, section, key, value):
     config = configuration()

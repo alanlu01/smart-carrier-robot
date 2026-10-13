@@ -73,9 +73,19 @@ def load_idle_config(path):
         if len({point['name'] for point in points}) != len(points):
             raise ValueError('People standby names must be unique')
         for key in ('idle_before_observation_sec', 'cooldown_sec', 'observation_timeout_sec',
-                    'navigation_timeout_sec', 'scan_clearance_m'):
+                    'navigation_timeout_sec', 'scan_clearance_m', 'failure_cooldown_sec',
+                    'stopped_before_spin_sec', 'spin_ready_wait_sec', 'observation_session_timeout_sec'):
             if not finite_number(people.get(key)) or people[key] <= 0:
                 raise ValueError(f'people.{key} must be positive')
+        for key, low, high in (('max_spin_resumes', 0, 2), ('max_consecutive_failures', 1, 3),
+                               ('safe_scan_samples', 3, 10)):
+            value = people.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f'people.{key} must be an integer in [{low},{high}]')
+        if people['failure_cooldown_sec'] > people['cooldown_sec']:
+            raise ValueError('Failure cooldown cannot exceed successful cooldown')
+        if people['observation_session_timeout_sec'] < people['observation_timeout_sec']:
+            raise ValueError('Session timeout cannot be shorter than one spin attempt')
         for key in ('minimum_confidence', 'minimum_heading_coverage'):
             if not finite_number(people.get(key)) or not 0 < people[key] <= 1:
                 raise ValueError(f'people.{key} must be in (0,1]')

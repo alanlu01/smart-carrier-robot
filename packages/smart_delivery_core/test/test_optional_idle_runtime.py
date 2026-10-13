@@ -68,7 +68,7 @@ class Navigator:
         return SimpleNamespace(now=lambda: Time(nanoseconds=100_000_000_000))
 
     def get_logger(self):
-        return SimpleNamespace(warning=lambda _: None)
+        return SimpleNamespace(warning=lambda _: None, info=lambda _: None)
 
     def isTaskComplete(self):
         return self.complete
