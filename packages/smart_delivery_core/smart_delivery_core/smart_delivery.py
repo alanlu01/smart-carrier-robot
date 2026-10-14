@@ -10,7 +10,9 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
-from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from nav2_simple_commander.robot_navigator import TaskResult
+from smart_delivery_core.delivery_navigator import DeliveryNavigator, Nav2StartupUnavailable
+from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -550,7 +552,7 @@ def go_to_standby(
 
 def main():
     rclpy.init()
-    navigator = BasicNavigator()
+    navigator = DeliveryNavigator()
     tf_buffer = Buffer()
     _tf_listener = TransformListener(tf_buffer, navigator)
     core_share = get_package_share_directory("smart_delivery_core")
@@ -558,6 +560,7 @@ def main():
         "optional_idle_config", core_share + "/config/optional_idle_features.yaml"
     )
     optional_config = load_idle_config(str(navigator.get_parameter("optional_idle_config").value))
+    optional_runtime = None
     navigator.declare_parameter("slot_confirmation_warning_sec", SLOT_CONFIRMATION_WARNING_SECONDS)
     navigator.declare_parameter("slot_confirmation_timeout_sec", SLOT_CONFIRMATION_TIMEOUT_SECONDS)
     navigator.declare_parameter("slot_confirmation_samples", SLOT_CONFIRMATION_SAMPLES)
@@ -668,6 +671,8 @@ def main():
             )
         elif state == "arrived":
             standby_retry.reset()
+            if optional_runtime is not None and last_standby_status != (point['name'],'arrived',0):
+                optional_runtime.mark_parked(point)
         payload = {
             "state": state, "name": point["name"],
             "x": point["x"], "y": point["y"], "yaw": point["yaw"],
@@ -748,7 +753,14 @@ def main():
     # The AMCL mode publishes BasicNavigator's default initial pose. Treat the
     # external LocalizationManager as the localization owner so this call only
     # waits for navigation activation and never writes to /initialpose.
-    navigator.waitUntilNav2Active(localizer="robot_localization")
+    try:
+        navigator.waitUntilNav2Active(localizer="robot_localization")
+    except (Nav2StartupUnavailable, KeyboardInterrupt, ExternalShutdownException) as exc:
+        print(f'Delivery 未啟動：{exc}；未清除或取消雲端訂單')
+        navigator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 1
     print("✅ Nav2 準備就緒！")
     print("⏳ 定位尚未就緒時會保留任務，但仍會接收訂單、取消與結果確認")
 

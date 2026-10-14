@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import time
 import tempfile
+from collections import deque
 
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import TaskResult
@@ -19,6 +20,8 @@ from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 
 from smart_delivery_core.optional_idle import DirectionalPeople, HomeVoltageLatch, occupancy_fingerprint
+from smart_delivery_core.standby_idle_clock import StandbyIdleClock
+from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
 
 STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -51,6 +54,10 @@ class OptionalIdleRuntime:
         self.last_scan = None
         self.map_matches = False
         self.idle_since = None
+        self.idle_clock = StandbyIdleClock()
+        self.scan_history = deque(maxlen=5)
+        self.spin_cache = None
+        self.scan_evidence_error = ''
         self.next_people_at = 0.0
         self.people = None
         self.spin_yaw = None
@@ -128,7 +135,31 @@ class OptionalIdleRuntime:
         self.inhibited = bool(message.data)
 
     def _scan(self, message):
-        self.last_scan = (time.monotonic(), message)
+        now = time.monotonic()
+        self.last_scan = (now, message)
+        self.spin_cache = None
+        if self.state not in ('waiting_observation_stop', 'waiting_observation_retry', 'observing'):
+            return
+        stamp = Time(nanoseconds=message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec)
+        try:
+            sensor = self.buffer.lookup_transform('odom',message.header.frame_id,stamp).transform
+            base = self.buffer.lookup_transform('odom','base_footprint',stamp).transform
+            for q in (sensor.rotation,base.rotation):
+                if (abs(q.x)>1e-4 or abs(q.y)>1e-4
+                        or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
+                    raise ValueError('unsupported laser/base tilt or invalid quaternion')
+            evidence = ScanEvidence.from_scan(message, now,
+                (sensor.translation.x,sensor.translation.y,yaw_of(sensor.rotation)),
+                (base.translation.x,base.translation.y,yaw_of(base.rotation)))
+            self.scan_history.append(evidence)
+            self.scan_evidence_error = ''
+        except (TransformException, ValueError, TypeError, AttributeError) as exc:
+            self.scan_evidence_error = str(exc)
+
+    def mark_parked(self, point):
+        """Only the existing successful arrival flow grants this parking proof."""
+        self.idle_clock.mark_parked(point)
+        self.idle_since = None
 
     def _odom(self, message):
         now = time.monotonic()
@@ -204,7 +235,9 @@ class OptionalIdleRuntime:
                                    'consecutive_observation_failures': self.people_failures,
                                    'cooldown_remaining_sec': round(max(0., self.next_people_at-time.monotonic()), 1),
                                    'idle_remaining_sec': None if self.idle_since is None else round(max(0.,
-                                       self.config['people']['idle_before_observation_sec']-(time.monotonic()-self.idle_since)), 1),
+                                       self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed), 1),
+                                   'idle_clock_reason': self.idle_clock.reason,
+                                   'idle_elapsed_sec': round(self.idle_clock.elapsed,1),
                                    'spin_guard': self.guard_report})
         payload = json.loads(message.data)
         payload['observed_heading_coverage'] = None if self.people is None else round(
@@ -259,7 +292,9 @@ class OptionalIdleRuntime:
         if not self.last_odom or not self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp):
             return False
         velocity = self.last_odom[1].twist.twist
-        return max(abs(velocity.linear.x), abs(velocity.linear.y)) <= 0.02 and abs(velocity.angular.z) <= 0.03
+        values=(velocity.linear.x,velocity.linear.y,velocity.angular.z)
+        return (all(math.isfinite(v) for v in values)
+                and max(abs(values[0]),abs(values[1])) <= .02 and abs(values[2]) <= .03)
 
     def _safe(self):
         if self.home is not None:
@@ -276,6 +311,49 @@ class OptionalIdleRuntime:
         return self.guard_report['clear']
 
     def _spin_guard_report(self, require_stationary=True):
+        # Freshness/safety is rechecked even when geometry has a short cache.
+        if (not self._safe() or (require_stationary and not self._stationary())):
+            return {'clear':False,'reason':'unsafe_localization_or_odom'}
+        if self.last_scan is None or not self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp):
+            return {'clear':False,'reason':'scan_stale_or_absent'}
+        if self.scan_evidence_error:
+            return {'clear':False,'reason':'laser_tf_unavailable','detail':self.scan_evidence_error}
+        if not self.scan_history:
+            # No historical permission: retain original conservative single scan.
+            return self._single_spin_guard_report(require_stationary)
+        scan = self.last_scan[1]
+        source = scan.header.stamp.sec+scan.header.stamp.nanosec/1e9
+        if self.scan_history[-1].source_sec != source or self.scan_evidence_error:
+            return {'clear':False,'reason':'laser_tf_unavailable','detail':self.scan_evidence_error}
+        try:
+            base = self.buffer.lookup_transform('odom','base_footprint',Time())
+            if not self._stamp_fresh(time.monotonic(),base.header.stamp):
+                return {'clear':False,'reason':'odom_tf_stale'}
+            t = base.transform
+            q = t.rotation
+            if (not all(math.isfinite(v) for v in (q.x,q.y,q.z,q.w))
+                    or abs(q.x)>1e-4 or abs(q.y)>1e-4
+                    or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
+                return {'clear':False,'reason':'invalid_base_orientation'}
+            pose = (t.translation.x,t.translation.y,yaw_of(t.rotation))
+            now = time.monotonic()
+            if self.spin_cache is not None:
+                key,at,old_pose,report = self.spin_cache
+                angle = abs(math.atan2(math.sin(pose[2]-old_pose[2]),math.cos(pose[2]-old_pose[2])))
+                if (source==key and 0<=now-at<=.04
+                        and self.navigator.get_clock().now().nanoseconds/1e9 <= report.get('evidence_deadline_sec',0.)
+                        and math.hypot(pose[0]-old_pose[0],pose[1]-old_pose[1])<=.005 and angle<=.01):
+                    return report
+            report = aligned_spin_report(self.scan_history,pose,now,
+                self.navigator.get_clock().now().nanoseconds/1e9,
+                math.hypot(.22,.16)+self.config['people']['scan_clearance_m'],
+                self.config['people']['max_unknown_arc_deg'])
+            self.spin_cache=(source,now,pose,report)
+            return report
+        except (TransformException, ValueError, TypeError, AttributeError) as exc:
+            return {'clear':False,'reason':'laser_tf_unavailable','detail':str(exc)}
+
+    def _single_spin_guard_report(self, require_stationary=True):
         report = {'clear': False, 'reason': 'unsafe_localization_or_odom'}
         if (not self._safe() or (require_stationary and not self._stationary())
                 or self.last_scan is None):
@@ -408,6 +486,9 @@ class OptionalIdleRuntime:
         if long_wait:
             self.people_failures = 0
         self.idle_since = None
+        self.idle_clock.reset()
+        self.scan_history.clear()
+        self.spin_cache = None
         self.observation_collecting = False
         self.observation_session_deadline = None
         self._remove_spin_tree()
@@ -448,6 +529,7 @@ class OptionalIdleRuntime:
         """Cancel on unsafe data/new service work and drain before any new goal."""
         if has_work:
             self.idle_since = None
+            self.idle_clock.reset()
         if (not self.motion and self.state in (
                 'waiting_observation_stop', 'waiting_observation_retry',
                 'people_destination_selected', 'people_arrival_check')
@@ -657,15 +739,15 @@ class OptionalIdleRuntime:
                 self._people_finished('standby_arrival_not_verified')
             return True
         pose = self._pose()
-        at_standby = pose is not None and any(
-            math.hypot(pose['x']-p['x'],pose['y']-p['y']) <= .10
-            and abs(math.atan2(math.sin(pose['yaw']-p['yaw']),math.cos(pose['yaw']-p['yaw']))) <= .10
-            for p in people['standby_points'])
-        if not parked or not self._safe() or not self._stationary() or not at_standby:
-            self.idle_since = None
+        odom = None if self.last_odom is None else self.last_odom[1].pose.pose
+        odom_pose = None if odom is None else (odom.position.x,odom.position.y,yaw_of(odom.orientation))
+        if not self.idle_clock.update(now,parked=parked,safe=self._safe(),
+                                     stationary=self._stationary(),pose=pose,odom=odom_pose):
+            if self.idle_clock.elapsed == 0.:
+                self.idle_since = None
             return False
         self.idle_since = self.idle_since if self.idle_since is not None else now
-        if now < self.next_people_at or now - self.idle_since < people['idle_before_observation_sec']:
+        if now < self.next_people_at or self.idle_clock.elapsed < people['idle_before_observation_sec']:
             return False
         self._start(people['observation_pose'], 'going_observation', '', people['navigation_timeout_sec'])
         return True

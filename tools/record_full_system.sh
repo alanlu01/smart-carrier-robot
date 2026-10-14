@@ -48,6 +48,7 @@ TOPICS=(
   /smart_carrier/optional_idle_state /smart_carrier/task_admission
   /vehicle_battery/verified_status
   /smart_carrier/delivery_navigation_active /delivery/standby_state
+  /delivery/startup_state
   /power_status /vehicle_battery_status
   /vision/semantic_info /visual_glass /semantic/speed_multiplier
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health

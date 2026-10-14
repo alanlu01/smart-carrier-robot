@@ -13,6 +13,7 @@ def prepare(runtime):
     manager._safe=manager._stationary=lambda:True
     manager._pose=lambda *args:dict(manager.config['people']['observation_pose'])
     manager.home=None
+    manager.mark_parked(manager.config['people']['standby_points'][0])
     scan=LaserScan()
     scan.header.stamp.sec=100
     manager.last_scan=(100.,scan)
@@ -27,7 +28,9 @@ def test_idle_clock_begins_only_at_verified_standby(runtime):
     moment[0]+=100.
     assert not manager.idle(parked=True)
     assert manager.idle_since==200.
-    moment[0]+=59.
+    for _ in range(59):
+        moment[0]+=1.
+        assert not manager.idle(parked=True)
     assert not manager.idle(parked=True) and not navigator.sent
     moment[0]+=1.
     assert manager.idle(parked=True) and len(navigator.sent)==1
@@ -212,3 +215,38 @@ def test_unknown_guard_report_does_not_reclassify_inf_as_clear(runtime):
     assert not manager._clear_to_spin(False)
     assert manager.guard_report['reason']=='unknown_scan_coverage'
     assert manager.guard_report['unknown_arc_deg']==pytest.approx(20.)
+
+
+def test_history_guard_cache_expires_and_new_near_scan_overrides_it(runtime,monkeypatch):
+    from smart_delivery_core import optional_idle_runtime as module
+    manager,_,moment=prepare(runtime)
+    manager.state='observing'
+    for sec,nsec in ((99,800000000),(99,900000000),(100,0)):
+        scan=LaserScan()
+        scan.header.stamp.sec,scan.header.stamp.nanosec=sec,nsec
+        scan.header.frame_id='laser'
+        scan.angle_min=-math.pi
+        scan.angle_increment=2*math.pi/360
+        scan.range_min,scan.range_max=.05,10.
+        scan.ranges=[3.]*360
+        moment[0]=sec+nsec/1e9
+        manager._scan(scan)
+    real=module.aligned_spin_report
+    calls=[]
+    def counted(*args):
+        calls.append(1)
+        return real(*args)
+    monkeypatch.setattr(module,'aligned_spin_report',counted)
+    assert manager._clear_to_spin(False) and len(calls)==1
+    moment[0]+= .02
+    assert manager._clear_to_spin(False) and len(calls)==1
+    moment[0]+= .03
+    assert manager._clear_to_spin(False) and len(calls)==2
+    scan.header.stamp.nanosec=50000000
+    scan.ranges[0]=.2
+    manager._scan(scan)
+    assert not manager._clear_to_spin(False)
+    assert manager.guard_report['reason']=='near_obstacle'
+    moment[0]+=1.
+    assert not manager._clear_to_spin(False)
+    assert manager.guard_report['reason']=='scan_stale_or_absent'
