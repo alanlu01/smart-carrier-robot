@@ -1,6 +1,7 @@
 """Short-lived, token-scoped permission for automatic recovery translation."""
 
 import math
+from collections import deque
 
 
 class LocalizationSpeedLimit:
@@ -27,6 +28,8 @@ class RecoveryLease:
         self.enabled = False
         self.permit = False
         self.faulted = False
+        self.owner = None
+        self.closed_tokens = deque(maxlen=64)
 
     def receive(self, payload, now):
         # Evaluate expiry BEFORE accepting a delayed heartbeat. Expired permission
@@ -35,16 +38,32 @@ class RecoveryLease:
         token = str(payload.get('token', ''))
         if not token:
             return False
+        if payload.get('active') is True and token in self.closed_tokens:
+            return False
+        owner = payload.get('owner')
+        if (payload.get('handoff') is True and payload.get('active') is True
+                and payload.get('permit') is False and token == self.token
+                and self.faulted and self.received_at is not None
+                and now - self.received_at > self.timeout
+                and isinstance(owner, str) and owner):
+            # Adoption transfers STOP ownership only. Expiry stays latched.
+            self.owner, self.received_at, self.permit = owner, now, False
+            return True
+        if self.enabled and self.owner is not None and owner != self.owner:
+            return False
         if payload.get('active') is True:
             if self.token is not None and token != self.token:
                 return False
             self.token, self.received_at, self.enabled = token, now, True
+            self.owner = owner
             self.permit = payload.get('permit') is True
             return True
         if token == self.token and payload.get('active') is False:
+            self.closed_tokens.append(token)
             self.token, self.received_at, self.enabled = None, None, False
             self.permit = False
             self.faulted = False
+            self.owner = None
             return True
         return False
 

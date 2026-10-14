@@ -7,7 +7,11 @@ from collections import deque
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
+from action_msgs.msg import GoalStatusArray
+from action_msgs.srv import CancelGoal
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import Float32, Header, String
 
@@ -20,6 +24,7 @@ from hailo_vision.semantic_protocol import (
 )
 from hailo_vision.pipeline_metrics import PipelineMetrics
 from hailo_vision.recovery_lease import LocalizationSpeedLimit, RecoveryLease
+from smart_delivery_core.wheel_feedback import WheelStopEvidence
 
 class SensorFusionNode(Node):
     def __init__(self):
@@ -43,6 +48,17 @@ class SensorFusionNode(Node):
         self.last_pipeline_report_at = time.monotonic()
         self.semantic_sequence = None
         self.recovery_lease = RecoveryLease()
+        self.recovery_stop = WheelStopEvidence(time.monotonic())
+        self.recovery_odom_at = None
+        self.recovery_odom_stamp_ns = None
+        self.recovery_odom_stopped = False
+        self.recovery_last_nonzero_cmd_at = time.monotonic()
+        self.recovery_handoff = False
+        self.recovery_last_release = {}
+        self.recovery_action_status = {}
+        self.recovery_cancel_pending = {}
+        self.recovery_cancel_confirmed = {}
+        self.recovery_cancel_probe_at = 0.0
         self.localization_speed_limit = LocalizationSpeedLimit()
 
         self.declare_parameter('semantic_timeout_sec', 0.80)
@@ -117,6 +133,19 @@ class SensorFusionNode(Node):
         self.create_subscription(
             String, '/localization/recovery_motion_lease', self.recovery_lease_callback, 1
         )
+        self.create_subscription(String, '/stm32_data', self.recovery_feedback_callback, 50)
+        self.create_subscription(Odometry, '/odom', self.recovery_odom_callback, 20)
+        status_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                reliability=ReliabilityPolicy.RELIABLE)
+        for action in ('navigate_to_pose', 'navigate_through_poses', 'spin'):
+            self.create_subscription(
+                GoalStatusArray, f'/{action}/_action/status',
+                self.recovery_status_callback(action), status_qos
+            )
+        self.recovery_cancel_clients = {
+            name: self.create_client(CancelGoal, f'/{name}/_action/cancel_goal')
+            for name in ('navigate_to_pose', 'navigate_through_poses', 'spin')
+        }
         self.pub_speed_multiplier = self.create_publisher(
             Float32, '/semantic/speed_multiplier', 10
         )
@@ -220,6 +249,7 @@ class SensorFusionNode(Node):
         if self.recovery_lease.enabled:
             if self.recovery_lease.blocked(now):
                 self.pub_safe_cmd.publish(Twist())
+            self.recovery_handoff_probe(now)
             self.publish_recovery_guard(now)
         self.pipeline_metrics.observe('watchdog', now)
         if now - self.last_pipeline_report_at >= 1.0:
@@ -231,6 +261,9 @@ class SensorFusionNode(Node):
                 self.localization_speed_limit.limit(now),
             )
             payload['localization_speed_limit'] = self.localization_speed_limit.limit(now)
+            payload['recovery_guard_blocked'] = self.recovery_lease.blocked(now)
+            if payload['recovery_guard_blocked']:
+                payload['effective_speed_multiplier'] = 0.0
             message = String()
             message.data = json.dumps(payload)
             self.pipeline_pub.publish(message)
@@ -260,6 +293,12 @@ class SensorFusionNode(Node):
         self.semantic_health_state = next_state
 
     def cmd_vel_callback(self, msg):
+        values = (msg.linear.x, msg.linear.y, msg.angular.z)
+        if any(not math.isfinite(v) or abs(v) > 1e-6 for v in values):
+            self.recovery_last_nonzero_cmd_at = time.monotonic()
+        if not all(math.isfinite(v) for v in values):
+            self.pub_safe_cmd.publish(Twist())
+            return
         lease = self.recovery_lease
         if lease.blocked(time.monotonic()):
             self.pub_safe_cmd.publish(Twist())
@@ -288,11 +327,32 @@ class SensorFusionNode(Node):
     def recovery_lease_callback(self, message):
         try:
             payload = json.loads(message.data)
+            now = time.monotonic()
+            if payload.get('active') is False and self.recovery_lease.enabled:
+                if self.recovery_disarm_blockers(now):
+                    self.pub_safe_cmd.publish(Twist())
+                    self.publish_recovery_guard(now)
+                    return
             was_enabled = self.recovery_lease.enabled
-            if self.recovery_lease.receive(payload, time.monotonic()):
+            previous_owner = self.recovery_lease.owner
+            if self.recovery_lease.receive(payload, now):
                 # Flush any preceding spin/navigation velocity before arming.
                 if payload.get('active') is True and not was_enabled:
                     self.pub_safe_cmd.publish(Twist())
+                    self.recovery_stop.reset()
+                    self.recovery_last_nonzero_cmd_at = now
+                if (payload.get('handoff') is True
+                        and previous_owner != self.recovery_lease.owner):
+                    self.recovery_handoff = True
+                    self.recovery_cancel_confirmed = {}
+                    self.recovery_stop.reset()
+                    self.recovery_last_nonzero_cmd_at = now
+                    self.pub_safe_cmd.publish(Twist())
+                    self.recovery_handoff_probe(now)
+                if not self.recovery_lease.enabled:
+                    self.recovery_handoff = False
+                    self.recovery_last_release = {'released_token': payload.get('token'),
+                                                  'released_owner': payload.get('owner')}
                 self.publish_recovery_guard(time.monotonic())
         except (ValueError, TypeError, AttributeError):
             self.pub_safe_cmd.publish(Twist())
@@ -303,8 +363,120 @@ class SensorFusionNode(Node):
             'token': self.recovery_lease.token,
             'active': self.recovery_lease.enabled,
             'blocked': self.recovery_lease.blocked(now),
+            'faulted': self.recovery_lease.faulted,
+            'owner': self.recovery_lease.owner,
+            'producer_age_sec': (None if self.recovery_lease.received_at is None
+                                 else round(now - self.recovery_lease.received_at, 3)),
+            'zero_wheel_groups': self.recovery_stop.zero_groups,
+            'disarm_blockers': self.recovery_disarm_blockers(now),
+            **self.recovery_last_release,
+            'handoff_action_confirmations': {
+                name: round(now - item[1], 3)
+                for name, item in self.recovery_cancel_confirmed.items()},
         })
         self.recovery_guard_pub.publish(message)
+
+    def recovery_feedback_callback(self, message):
+        self.recovery_stop.observe(message.data, time.monotonic())
+
+    def recovery_odom_callback(self, message):
+        self.recovery_odom_at = time.monotonic()
+        self.recovery_odom_stamp_ns = (message.header.stamp.sec * 1_000_000_000
+                                      + message.header.stamp.nanosec)
+        t = message.twist.twist
+        values = (t.linear.x, t.linear.y, t.angular.z)
+        self.recovery_odom_stopped = (all(math.isfinite(v) for v in values)
+                                     and math.hypot(*values[:2]) <= .01
+                                     and abs(values[2]) <= .02)
+        if not self.recovery_odom_stopped:
+            self.recovery_stop.reset()
+
+    def recovery_status_callback(self, name):
+        def callback(message, info):
+            publishers = self.get_publishers_info_by_topic(f'/{name}/_action/status')
+            if len(publishers) != 1:
+                self.recovery_action_status.pop(name, None)
+                return
+            gid = tuple(publishers[0].endpoint_gid)
+            # Jazzy MessageInfo is a dictionary without publisher_gid. Capture
+            # graph generation and reject out-of-order status source timestamps.
+            stamp = info.get('source_timestamp', 0)
+            previous = self.recovery_action_status.get(name)
+            if previous and previous[1] == gid and len(previous) > 2 and stamp < previous[2]:
+                return
+            self.recovery_action_status[name] = (
+                any(s.status in (1, 2, 3) for s in message.status_list),
+                gid, stamp,
+            )
+        return callback
+
+    def recovery_handoff_probe(self, now):
+        """Confirm cancel-all independently; an unused action may have no status.
+
+        Nav2 SimpleActionServer accepts cancellation of every active goal.
+        A fresh empty cancel response is required even with cached idle status;
+        a known CANCELING goal still waits for its terminal status event.
+        """
+        if not self.recovery_handoff or now - self.recovery_cancel_probe_at < .5:
+            return
+        self.recovery_cancel_probe_at = now
+        for name, client in self.recovery_cancel_clients.items():
+            pending = self.recovery_cancel_pending.get(name)
+            if pending:
+                if now - pending[1] <= 2.0:
+                    continue
+                client.remove_pending_request(pending[0])
+                self.recovery_cancel_pending.pop(name, None)
+            publishers = self.get_publishers_info_by_topic(f'/{name}/_action/status')
+            if not client.service_is_ready() or len(publishers) != 1:
+                self.recovery_cancel_confirmed.pop(name, None)
+                continue
+            gid = tuple(publishers[0].endpoint_gid)
+            future = client.call_async(CancelGoal.Request())
+            self.recovery_cancel_pending[name] = (future, now)
+            future.add_done_callback(self.recovery_cancel_callback(name, gid, self.recovery_lease.owner))
+
+    def recovery_cancel_callback(self, name, gid, owner):
+        def callback(future):
+            pending = self.recovery_cancel_pending.get(name)
+            if pending is None or pending[0] is not future:
+                return
+            self.recovery_cancel_pending.pop(name, None)
+            if not self.recovery_handoff or self.recovery_lease.owner != owner:
+                return
+            try:
+                response = future.result()
+                if response.return_code == 0 and not response.goals_canceling:
+                    self.recovery_cancel_confirmed[name] = (gid, time.monotonic())
+                else:
+                    self.recovery_cancel_confirmed.pop(name, None)
+            except Exception:
+                self.recovery_cancel_confirmed.pop(name, None)
+        return callback
+
+    def recovery_disarm_blockers(self, now):
+        blockers = []
+        stamp = self.recovery_odom_stamp_ns
+        age = None if stamp is None else (self.get_clock().now().nanoseconds - stamp) / 1e9
+        if (self.recovery_odom_at is None or not 0 <= now - self.recovery_odom_at <= .25
+                or age is None or not -.1 <= age <= .25 or not self.recovery_odom_stopped):
+            blockers.append('odom_not_fresh_stopped')
+            self.recovery_stop.reset()
+        if not self.recovery_stop.ready(now):
+            blockers.append('need_three_independent_zero_wheel_groups_over_1s')
+        if now - self.recovery_last_nonzero_cmd_at < 1.0:
+            blockers.append('input_velocity_not_quiet_for_1s')
+        if self.recovery_handoff:
+            for name in ('navigate_to_pose', 'navigate_through_poses', 'spin'):
+                status = self.recovery_action_status.get(name)
+                publishers = self.get_publishers_info_by_topic(f'/{name}/_action/status')
+                confirmation = self.recovery_cancel_confirmed.get(name)
+                gid = tuple(publishers[0].endpoint_gid) if len(publishers) == 1 else None
+                active = status is not None and status[1] == gid and status[0]
+                if (gid is None or confirmation is None or confirmation[0] != gid
+                        or not 0 <= now - confirmation[1] <= 2.0 or active):
+                    blockers.append(f'{name}_not_confirmed_idle')
+        return blockers
 
     def scan_callback(self, scan_msg):
         self.pipeline_metrics.observe('scan_filtered', time.monotonic())

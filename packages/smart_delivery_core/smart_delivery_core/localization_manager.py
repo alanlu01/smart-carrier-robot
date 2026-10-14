@@ -61,10 +61,10 @@ from smart_delivery_core.localization_persistence import (
 )
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics
 from smart_delivery_core.recovery_translation import (
-    lateral_progress, lateral_speed, load_self_mask, spin_scan_clear, swept_scan_report,
+    lateral_progress, lateral_speed, load_self_mask, spin_scan_report, swept_scan_report,
 )
 from smart_delivery_core.degraded_localization import MildMapGuard, convergence_is_stalled
-from smart_delivery_core.wheel_feedback import WheelSampleAssembler
+from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEvidence
 
 
 STATE_QOS = QoSProfile(
@@ -357,6 +357,14 @@ class LocalizationManager(Node):
         self.lateral_guard = {}
         self.lateral_guard_at = 0.0
         self.recovery_feedback = WheelSampleAssembler(0.25, time.monotonic())
+        self.recovery_stop = WheelStopEvidence(time.monotonic())
+        self.latest_odom_valid = False
+        self.recovery_owner = str(uuid.uuid4())
+        self.lateral_handoff = False
+        self.handoff_cancel_at = 0.0
+        self.second_guard_report = {}
+        self.second_guard_reason = ''
+        self.second_guard_started_at = 0.0
         self.latest_map_score = None
         self.latest_map_score_raw = None
         self.latest_map_score_at = 0.0
@@ -449,6 +457,7 @@ class LocalizationManager(Node):
         self.poses_cancel_client = self.create_client(
             CancelGoal, "/navigate_through_poses/_action/cancel_goal"
         )
+        self.spin_cancel_client = self.create_client(CancelGoal, '/spin/_action/cancel_goal')
         self.spin_client = ActionClient(self, Spin, "/spin")
         # Upstream of velocity smoothing, collision monitoring and semantic safety.
         self.recovery_cmd_pub = self.create_publisher(Twist, "/cmd_vel_nav", 1)
@@ -666,6 +675,9 @@ class LocalizationManager(Node):
             "recovery_step": self.recovery_step,
             "lateral_attempted": self.lateral_attempted,
             "lateral_phase": self.lateral_phase,
+            "lateral_handoff": self.lateral_handoff,
+            "recovery_guard": self.lateral_guard,
+            "second_guard_report": self.second_guard_report,
             "lateral_direction": self.lateral_direction,
             "lateral_abort_reason": self.lateral_abort_reason,
             "amcl_pose_age_sec": freshness["amcl_pose_age_sec"],
@@ -897,6 +909,8 @@ class LocalizationManager(Node):
             quaternion_to_yaw(pose.orientation),
         )
         twist = message.twist.twist
+        self.latest_odom_valid = all(math.isfinite(v) for v in (
+            *current, twist.linear.x, twist.linear.y, twist.angular.z))
         self.odom_motion = (
             math.hypot(float(twist.linear.x), float(twist.linear.y)) > 0.01
             or abs(float(twist.angular.z)) > 0.02
@@ -1225,6 +1239,9 @@ class LocalizationManager(Node):
         if self.lateral_phase is not None:
             # Local raw-sensor safety is checked by the independent 20 Hz loop.
             # AMCL/map evidence must not abort or accept localization mid-sidestep.
+            return
+        if self.recovery_step == 'second_guard_wait':
+            self._tick_second_guard_wait(now)
             return
         observing = self.state in {
             "VERIFYING", "SUSPECT", "RECOVERING_LOCAL", "RECOVERING_GLOBAL"
@@ -1884,7 +1901,10 @@ class LocalizationManager(Node):
             if not self._motion_pipeline_is_ready():
                 return
             if self.global_attempts >= 2 and not self._recovery_spin_clear(now):
-                self._require_manual('第二輪自旋前安全視野／回授不足，維持停車')
+                if now - self.recovery_step_started < 3.0:
+                    return
+                self._require_manual('第二輪自旋前安全檢查拒絕：'
+                                     +json.dumps(self.second_guard_report, ensure_ascii=False))
                 return
             if not self.spin_client.server_is_ready():
                 self._require_manual("Spin 行為伺服器未就緒")
@@ -1932,37 +1952,64 @@ class LocalizationManager(Node):
 
     def _global_recovery_failed(self, now, reason):
         if self.global_attempts < 2:
-            if self._try_lateral_recovery(now):
-                return
-            if self._recovery_spin_clear(now):
-                self.get_logger().warning(reason+'；橫移不可用，但旋轉安全，嘗試第二輪原地全域定位')
-                self._start_global_recovery()
-                return
+            self.second_guard_reason = reason
+            self.second_guard_started_at = now
+            self.recovery_step = 'second_guard_wait'
+            self._tick_second_guard_wait(now)
+            return
         self._require_manual(reason+'；'+self._recovery_failure_reason())
 
+    def _tick_second_guard_wait(self, now):
+        self.recovery_cmd_pub.publish(Twist())
+        # Do not consume the one sidestep on a transient callback-phase gap.
+        if self._lateral_sensors_ready(now) and self._try_lateral_recovery(now):
+            return
+        if self._recovery_spin_clear(now):
+            self.get_logger().warning(
+                self.second_guard_reason+'；橫移不可用，但旋轉安全，嘗試第二輪原地全域定位')
+            self._start_global_recovery()
+            return
+        if now - self.second_guard_started_at >= 2.0:
+            detail = json.dumps(self.second_guard_report, ensure_ascii=False)
+            self.get_logger().warning('第二輪安全檢查拒絕：'+detail)
+            self._require_manual(self.second_guard_reason+'；'+self._recovery_failure_reason()
+                                 +'；第二輪安全檢查：'+detail)
+
     def _recovery_spin_clear(self, now):
+        self.second_guard_report = {'sensor_blockers': self._lateral_sensor_blockers(now),
+                                    'scans': {}, 'reason': 'checking'}
         if (not self.auto_motion_recovery or self.commanded_motion or self.odom_motion
-                or not self._lateral_sensors_ready(now)):
+                or self.second_guard_report['sensor_blockers']):
+            self.second_guard_report['reason'] = 'motion_disabled_moving_or_sensor_gap'
             return False
         try:
             tf = self.tf_buffer.lookup_transform('odom', 'base_footprint', Time())
             stamp = tf.header.stamp
             age = (self.get_clock().now().nanoseconds-stamp.sec*1_000_000_000-stamp.nanosec)/1e9
             if not -.1 <= age <= .30:
+                self.second_guard_report.update(reason='odom_tf_stale', odom_tf_age_sec=age)
                 return False
-            for scan in (self.latest_raw_scan, self.latest_scan):
+            for name, scan in (('scan', self.latest_raw_scan), ('scan_filtered', self.latest_scan)):
                 tf = self.tf_buffer.lookup_transform('base_footprint', scan.header.frame_id, Time()).transform
                 if abs(tf.rotation.x)>1e-4 or abs(tf.rotation.y)>1e-4:
+                    self.second_guard_report['reason'] = name+'_unsupported_laser_tilt'
                     return False
-                if not spin_scan_clear(scan, (tf.translation.x, tf.translation.y,
-                    quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z):
+                report = spin_scan_report(scan, (tf.translation.x, tf.translation.y,
+                    quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z)
+                self.second_guard_report['scans'][name] = report
+                if not report['clear']:
+                    self.second_guard_report['reason'] = name+'_'+report['reason']
                     return False
-        except (TransformException, AttributeError, TypeError, ValueError):
+        except (TransformException, AttributeError, TypeError, ValueError) as exc:
+            self.second_guard_report['reason'] = 'transform_or_geometry_error: '+str(exc)
             return False
+        self.second_guard_report['reason'] = 'clear'
         return True
 
     def _recovery_feedback_callback(self, message):
-        self.recovery_feedback.add_line(message.data, time.monotonic())
+        now = time.monotonic()
+        self.recovery_feedback.add_line(message.data, now)
+        self.recovery_stop.observe(message.data, now)
 
     def _recovery_guard_callback(self, message):
         try:
@@ -1970,6 +2017,26 @@ class LocalizationManager(Node):
             if isinstance(payload, dict):
                 self.lateral_guard = payload
                 self.lateral_guard_at = time.monotonic()
+                if (self.lateral_phase is None and payload.get('active') is True
+                        and payload.get('faulted') is True and payload.get('token')
+                        and payload.get('owner') != self.recovery_owner
+                        and isinstance(payload.get('producer_age_sec'), (int, float))
+                        and payload['producer_age_sec'] > .25):
+                    # Adopt an orphan into STOP only; never grant a new motion lease.
+                    self.lateral_token = payload['token']
+                    self.lateral_handoff = True
+                    self.lateral_anchor = None
+                    self.lateral_abort_reason = None
+                    self.recovery_stop.reset()
+                    self._cancel_navigation()
+                    self.handoff_cancel_at = time.monotonic()
+                    if self.spin_cancel_client.service_is_ready():
+                        self.spin_cancel_client.call_async(CancelGoal.Request())
+                    self.spin_sequence = []
+                    self._set_state('VERIFYING', '舊橫移安全租約交接：等待停妥與導航／旋轉取消確認')
+                    self.stable_samples = 0
+                    self._stop_lateral()
+                    self.get_logger().warning('發現失聯定位程序的安全鎖，僅接管停止確認；不允許移動')
         except (ValueError, TypeError):
             pass
 
@@ -1977,27 +2044,46 @@ class LocalizationManager(Node):
         message = String()
         message.data = json.dumps({
             "token": self.lateral_token, "active": active, "permit": permit,
+            "owner": self.recovery_owner, "handoff": self.lateral_handoff,
         })
         self.recovery_lease_pub.publish(message)
 
     def _lateral_sensors_ready(self, now):
-        if self.motion_inhibited or self.last_odom_pose is None:
-            return False
+        return not self._lateral_sensor_blockers(now)
+
+    def _lateral_sensor_blockers(self, now):
+        blockers = []
+        if self.motion_inhibited or self.last_odom_pose is None or not self.latest_odom_valid:
+            blockers.append('slot_inhibited_or_no_odom_pose')
         if self.recovery_feedback.last_complete_at is None:
-            return False
-        if self.recovery_feedback.is_stale(now, 0.30):
-            return False
-        for scan, at in ((self.latest_raw_scan, self.latest_raw_scan_at),
-                         (self.latest_scan, self.latest_scan_at)):
+            blockers.append('no_complete_four_wheel_sample')
+        elif self.recovery_feedback.is_stale(now, WheelStopEvidence.MAX_AGE):
+            blockers.append(f'four_wheel_age={self.recovery_feedback.sample_age(now):.3f}s')
+        for name, scan, at in (('scan', self.latest_raw_scan, self.latest_raw_scan_at),
+                               ('scan_filtered', self.latest_scan, self.latest_scan_at)):
             if scan is None or not 0 <= now - at <= 0.30:
-                return False
+                blockers.append(f'{name}_receipt_age={now-at:.3f}s')
+                continue
             stamp = scan.header.stamp.sec * 1_000_000_000 + scan.header.stamp.nanosec
             age = (self.get_clock().now().nanoseconds - stamp) / 1e9
             if stamp <= 0 or not -0.1 <= age <= 0.30:
-                return False
+                blockers.append(f'{name}_source_age={age:.3f}s')
         age = (self.get_clock().now().nanoseconds - self.latest_odom_stamp_ns) / 1e9
-        return (self.latest_odom_stamp_ns > 0 and -0.1 <= age <= 0.25
-                and 0 <= now - self.latest_odom_at <= 0.25)
+        if not (self.latest_odom_stamp_ns > 0 and -0.1 <= age <= 0.25
+                and 0 <= now - self.latest_odom_at <= 0.25):
+            blockers.append(f'odom_source_age={age:.3f}s/receipt={now-self.latest_odom_at:.3f}s')
+        return blockers
+
+    def _lateral_stop_ready(self, now):
+        age = (self.get_clock().now().nanoseconds - self.latest_odom_stamp_ns) / 1e9
+        stopped = (not self.commanded_motion and not self.odom_motion
+                   and self.latest_odom_valid
+                   and self.latest_odom_stamp_ns > 0 and -.1 <= age <= .25
+                   and 0 <= now-self.latest_odom_at <= .25
+                   and 0 <= now-self.latest_cmd_at <= .25)
+        if not stopped:
+            self.recovery_stop.reset()
+        return stopped and self.recovery_stop.ready(now)
 
     def _lateral_path_clear(self, direction, distance):
         reports = {}
@@ -2058,6 +2144,8 @@ class LocalizationManager(Node):
         self.lateral_stopped_since = None
         self.lateral_abort_reason = None
         self.lateral_token = str(uuid.uuid4())
+        self.lateral_handoff = False
+        self.recovery_stop.reset()
         self.lateral_phase = "arming"
         self.recovery_step = "lateral_move"
         self.stable_samples = 0
@@ -2071,6 +2159,7 @@ class LocalizationManager(Node):
     def _stop_lateral(self, reason=None):
         if self.lateral_phase != "stopping":
             self.lateral_stop_started_at = time.monotonic()
+            self.recovery_stop.reset()
         if reason:
             self.lateral_abort_reason = reason
         self.lateral_phase = "stopping"
@@ -2083,24 +2172,42 @@ class LocalizationManager(Node):
             return
         now = time.monotonic()
         phase = self.lateral_phase
+        if self.lateral_handoff and now - self.handoff_cancel_at >= 1.0:
+            self.handoff_cancel_at = now
+            self._cancel_navigation()
+            if self.spin_cancel_client.service_is_ready():
+                self.spin_cancel_client.call_async(CancelGoal.Request())
         guard_fresh = now - self.lateral_guard_at <= 0.25
         guard_matches = (guard_fresh and self.lateral_guard.get("active") is True
-                         and self.lateral_guard.get("token") == self.lateral_token)
+                         and self.lateral_guard.get("token") == self.lateral_token
+                         and self.lateral_guard.get('owner') == self.recovery_owner)
         if phase == "disarming":
             self._publish_lateral_lease(active=False)
             self.recovery_cmd_pub.publish(Twist())
-            if guard_fresh and self.lateral_guard.get("active") is False:
+            if (guard_fresh and self.lateral_guard.get("active") is False
+                    and self.lateral_guard.get('released_token') == self.lateral_token
+                    and self.lateral_guard.get('released_owner') == self.recovery_owner):
                 self.lateral_phase = None
                 self.lateral_token = None
-                if self.lateral_abort_reason:
+                if self.lateral_handoff:
+                    self.lateral_handoff = False
+                    self._reset_map_match_history()
+                    self.stable_samples = 0
+                    self.initial_pose_last_published = now
+                    self._set_state('VERIFYING', '舊安全租約已安全解除，重新驗證定位')
+                    self.get_logger().info('舊橫移安全鎖交接完成；尚未授權導航，先重新驗證定位')
+                elif self.lateral_abort_reason:
                     self._require_manual("橫移已停止：" + self.lateral_abort_reason)
                 else:
                     self._start_global_recovery()
+            elif now - self.lateral_stop_started_at > 4.0 and self.state != 'MANUAL_REQUIRED':
+                self._require_manual('融合節點尚未確認安全解除：'
+                                     +json.dumps(self.lateral_guard, ensure_ascii=False))
             return
         self._publish_lateral_lease(permit=phase in {"authorize", "moving"})
         if phase == "stopping":
             self.recovery_cmd_pub.publish(Twist())
-            if self.last_odom_pose is not None:
+            if self.last_odom_pose is not None and self.lateral_anchor is not None:
                 travelled, cross, angle = lateral_progress(
                     self.lateral_anchor, self.last_odom_pose, self.lateral_direction
                 )
@@ -2108,20 +2215,19 @@ class LocalizationManager(Node):
                         or travelled > self.lateral_distance + 0.03
                         or abs(cross) > 0.05 or abs(angle) > math.radians(5)):
                     self.lateral_abort_reason = "橫移煞停距離／角度偏差超限"
-            stopped = (self._lateral_sensors_ready(now) and not self.commanded_motion
-                       and not self.odom_motion and now - self.latest_cmd_at <= 0.25)
-            self.lateral_stopped_since = (
-                (self.lateral_stopped_since or now) if stopped else None
-            )
-            if self.lateral_stopped_since and now - self.lateral_stopped_since >= 1.0:
+            if self._lateral_stop_ready(now):
                 self.lateral_phase = "disarming"
             elif now - self.lateral_stop_started_at > 3.0 and self.state != "MANUAL_REQUIRED":
                 # Report the fault, but KEEP the stop lease latched until fresh
                 # physical feedback proves a stop. Do not unlock on a timer.
                 self._require_manual(self.lateral_abort_reason or "無新鮮回授確認橫移已停妥")
             return  # Missing feedback latches STOP, never grants new motion.
-        if now - self.lateral_started_at > 8.0 or not self._lateral_sensors_ready(now):
-            self._stop_lateral("動作逾時或感測資料逾時／取還中")
+        if now - self.lateral_started_at > 8.0:
+            self._stop_lateral('橫移动作超過 8 秒安全上限')
+            return
+        if not self._lateral_sensors_ready(now):
+            self._stop_lateral('橫移感測／取還安全檢查拒絕：'
+                               +json.dumps(self._lateral_sensor_blockers(now), ensure_ascii=False))
             return
         if phase == "arming":
             self.recovery_cmd_pub.publish(Twist())
@@ -2166,6 +2272,17 @@ class LocalizationManager(Node):
         command = Twist()
         command.linear.y = self.lateral_direction * speed
         self.recovery_cmd_pub.publish(command)
+
+    def _shutdown_recovery_stop(self):
+        """Bounded best effort; unavailable feedback leaves fusion STOP latched."""
+        if self.lateral_phase is None:
+            return
+        self._stop_lateral('定位管理器關閉')
+        deadline = time.monotonic() + 4.0
+        while rclpy.ok() and self.lateral_phase is not None and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=.05)
+        if self.lateral_phase is not None:
+            self.get_logger().warning('關閉時未取得安全解除確認，融合節點維持停車鎖；下次須安全交接')
 
     def _send_next_spin(self):
         if self.spin_in_progress:
@@ -2409,8 +2526,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if node.lateral_phase is not None:
-            node._stop_lateral("定位管理器關閉")
+        if rclpy.ok():
+            node._shutdown_recovery_stop()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

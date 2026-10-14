@@ -1,3 +1,4 @@
+import math
 import re
 
 
@@ -68,3 +69,50 @@ class WheelSampleAssembler:
         if timeout_sec <= 0:
             raise ValueError("timeout_sec must be greater than zero")
         return self.sample_age(now) > float(timeout_sec)
+
+
+class WheelStopEvidence:
+    """Require three independent zero groups spanning one second, not held values.
+
+    The 0.65 s evidence limit remains below the chassis' 0.80 s watchdog.
+    A repeated timer tick can never create another wheel sample. Any individual
+    moving wheel, expired group, or interruption invalidates the whole proof.
+    """
+
+    MAX_AGE = 0.65
+
+    def __init__(self, started_at):
+        self.assembler = WheelSampleAssembler(0.25, started_at)
+        self.reset()
+
+    def reset(self):
+        self.first_zero_at = None
+        self.last_zero_at = None
+        self.zero_groups = 0
+
+    def observe(self, line, now):
+        report = parse_wheel_report(line)
+        if report is not None:
+            if not math.isfinite(report[1]) or abs(report[1]) > 1.0:
+                self.reset()
+        elif '_RT:' in line:
+            self.reset()
+        sample = self.assembler.add_line(line, now)
+        if sample is None:
+            return
+        if not all(math.isfinite(v) and abs(v) <= 1.0 for v in sample.values()):
+            self.reset()
+            return
+        if self.last_zero_at is None or now - self.last_zero_at > self.MAX_AGE:
+            self.reset()
+        if self.first_zero_at is None:
+            self.first_zero_at = now
+        self.last_zero_at = now
+        self.zero_groups += 1
+
+    def ready(self, now):
+        if self.last_zero_at is None or not 0 <= now - self.last_zero_at <= self.MAX_AGE:
+            self.reset()
+            return False
+        return (self.zero_groups >= 3
+                and self.last_zero_at - self.first_zero_at >= 1.0 - 1e-9)

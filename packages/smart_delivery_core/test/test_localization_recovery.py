@@ -62,6 +62,9 @@ def manager(monkeypatch):
         scan_pair_metrics=ScanPairMetrics(), lateral_path_reports={}, lateral_self_mask=None,
         enable_small_sweep=True, pre_global_wait=4.0, lateral_phase=None,
         lateral_enabled=False, lateral_attempted=False,
+        lateral_handoff=False, recovery_owner='test-owner', latest_odom_valid=True,
+        handoff_cancel_at=0.0,
+        second_guard_report={}, second_guard_reason='', second_guard_started_at=0.0,
         latest_scan=None, last_pipeline_diagnostic_at=0.0,
         global_grace_announced=False, cancel_grace=2.0,
         suspect_since=100.0, suspect_hold=5.0, suspect_max=12.0,
@@ -99,6 +102,8 @@ def manager(monkeypatch):
     node._start_global_recovery = lambda: node.started_spins.append('global')
     node._begin_recovery = lambda reason, **_: node.started_spins.append(reason)
     node._recovery_spin_clear = lambda _now: False
+    node._lateral_sensors_ready = lambda _now: False
+    node.recovery_cmd_pub = SimpleNamespace(publish=lambda _: None)
     return node, clock
 
 
@@ -391,16 +396,23 @@ def lateral_harness(manager):
     node.lateral_guard, node.lateral_guard_at = {}, 0.0
     node._cancel_navigation = lambda: None
     node._lateral_sensors_ready = lambda _now: True
+    node._lateral_stop_ready = lambda _now: True
+    node.recovery_stop = SimpleNamespace(reset=lambda: None)
     node._lateral_path_clear = lambda *_: True
+    node._lateral_sensor_blockers = lambda _: ['synthetic_sensor_gap']
     node._reset_map_match_history = lambda: None
     node.lateral_commands = []
     node.recovery_cmd_pub = SimpleNamespace(publish=node.lateral_commands.append)
     lease = RecoveryLease()
 
     def lease_publish(message):
-        lease.receive(json.loads(message.data), clock.now)
+        payload = json.loads(message.data)
+        lease.receive(payload, clock.now)
         node.lateral_guard = {'token': lease.token, 'active': lease.enabled,
-                              'blocked': lease.blocked(clock.now)}
+                              'owner': lease.owner,
+                              'blocked': lease.blocked(clock.now),
+                              'released_token': payload['token'] if not lease.enabled else None,
+                              'released_owner': payload['owner'] if not lease.enabled else None}
         node.lateral_guard_at = clock.now
 
     node.recovery_lease_pub = SimpleNamespace(publish=lease_publish)
@@ -484,6 +496,7 @@ def test_no_feedback_during_stop_requests_help_but_keeps_zero_lease(manager):
     node._try_lateral_recovery(clock.now)
     node._stop_lateral('test sensor loss')
     node._lateral_sensors_ready = lambda _: False
+    node._lateral_stop_ready = lambda _: False
     clock.now += 3.1
     node._tick_lateral_motion()
     assert node.state == 'MANUAL_REQUIRED'
@@ -517,6 +530,7 @@ def test_post_global_grace_expires_and_only_then_attempts_lateral(manager):
     node.stable_samples = 2
     attempts = []
     node._try_lateral_recovery = lambda now: attempts.append(now) or True
+    node._lateral_sensors_ready = lambda _: True
     node._tick_global_recovery(clock.now)
     assert not attempts and not node.ready
     node.observation_clock.elapsed = 40.0
@@ -543,7 +557,182 @@ def test_post_global_does_not_extend_unsafe_solution(manager, fault):
     else:
         clock.now = 110.0
     node._tick_global_recovery(clock.now)
+    if node.recovery_step == 'second_guard_wait':
+        clock.now += 2.0
+        node._tick_second_guard_wait(clock.now)
     assert node.manual_reasons and not node.ready
+
+
+def test_two_hz_independent_wheel_groups_can_confirm_real_stop(manager):
+    from smart_delivery_core.wheel_feedback import WheelStopEvidence
+    node, clock, lease = lateral_harness(manager)
+    node.recovery_stop = WheelStopEvidence(clock.now)
+    node.recovery_feedback = node.recovery_stop.assembler
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+        nanoseconds=int(clock.now*1e9)))
+    node._lateral_stop_ready = lambda at: module.LocalizationManager._lateral_stop_ready(node, at)
+    node._try_lateral_recovery(clock.now)
+    node._stop_lateral()
+    for index in range(24):
+        clock.now = 100.0 + index*.05
+        node.latest_cmd_at = node.latest_odom_at = clock.now
+        node.latest_odom_stamp_ns = int(clock.now*1e9)
+        if index % 10 == 0:
+            for letter in 'ABCD':
+                node.recovery_stop.observe(letter+'_RT: 0', clock.now)
+        node._tick_lateral_motion()
+    assert node.lateral_phase is None
+    assert not lease.enabled
+    assert node.started_spins == ['global']
+
+
+def test_stop_does_not_require_clear_laser_but_does_require_physical_wheels(manager):
+    from smart_delivery_core.wheel_feedback import WheelStopEvidence
+    node, clock = manager
+    node.recovery_stop = WheelStopEvidence(100.)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(clock.now*1e9)))
+    node.latest_odom_stamp_ns = int(clock.now*1e9)
+    node.latest_cmd_at = node.latest_odom_at = clock.now
+    for at in (99., 99.5, 100.):
+        for letter in 'ABCD':
+            node.recovery_stop.observe(letter+'_RT: 0', at)
+    assert node._lateral_stop_ready(clock.now)
+    node.recovery_stop.observe('A_RT: 100', clock.now)
+    assert not node._lateral_stop_ready(clock.now)
+
+
+def test_second_guard_wait_is_bounded_and_does_not_consume_lateral_on_stale_data(manager):
+    node, clock = manager
+    calls = []
+    node._try_lateral_recovery = lambda _: calls.append('translate') or True
+    node._global_recovery_failed(clock.now, 'stall')
+    assert node.recovery_step == 'second_guard_wait'
+    assert not calls and not node.manual_reasons
+    clock.now += 1.0
+    node._tick_state_machine()
+    assert not node.manual_reasons
+    node._lateral_sensors_ready = lambda _: True
+    node._tick_state_machine()
+    assert calls == ['translate']
+
+
+def test_second_guard_rejection_reports_details_after_two_seconds(manager):
+    node, clock = manager
+    node.second_guard_report = {'reason': 'scan_filtered_unknown_coverage'}
+    node._global_recovery_failed(clock.now, 'stall')
+    clock.now += 2.0
+    node._tick_state_machine()
+    assert 'scan_filtered_unknown_coverage' in node.manual_reasons[-1]
+    assert not node.started_spins
+
+
+def test_manager_only_adopts_expired_orphan_for_stop_not_live_other_owner(manager):
+    import json
+    from smart_delivery_core.wheel_feedback import WheelStopEvidence
+    node, clock, _ = lateral_harness(manager)
+    node.recovery_stop = WheelStopEvidence(clock.now)
+    node._set_state = lambda state, reason: setattr(node, 'state', state)
+    cancel = []
+    node.spin_cancel_client = SimpleNamespace(service_is_ready=lambda: True, call_async=cancel.append)
+    guard = {'active': True, 'faulted': True, 'token': 'orphan', 'owner': 'old',
+             'producer_age_sec': .1}
+    node._recovery_guard_callback(SimpleNamespace(data=json.dumps(guard)))
+    assert node.lateral_phase is None
+    guard['producer_age_sec'] = .3
+    node._recovery_guard_callback(SimpleNamespace(data=json.dumps(guard)))
+    assert node.lateral_phase == 'stopping' and node.lateral_handoff
+    assert node.lateral_token == 'orphan' and cancel
+    assert node.lateral_commands[-1].linear.y == 0
+
+
+def test_complete_feedback_freshness_is_below_hardware_watchdog(manager):
+    from smart_delivery_core.wheel_feedback import WheelSampleAssembler
+    node, clock = manager
+    node.recovery_feedback = WheelSampleAssembler(.25, 99.5)
+    for letter in 'ABCD':
+        node.recovery_feedback.add_line(letter+'_RT: 0', 99.5)
+    node.last_odom_pose = (0., 0., 0.)
+    header = SimpleNamespace(stamp=SimpleNamespace(sec=100, nanosec=0))
+    node.latest_raw_scan = node.latest_scan = SimpleNamespace(header=header)
+    node.latest_odom_stamp_ns = int(clock.now*1e9)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(clock.now*1e9)))
+    assert not node._lateral_sensor_blockers(clock.now)
+    clock.now += .16
+    assert any('four_wheel_age' in reason for reason in node._lateral_sensor_blockers(clock.now))
+
+
+def test_real_manager_and_fusion_orphan_handshake_never_publishes_motion(manager):
+    from geometry_msgs.msg import Twist
+    from hailo_vision.fusion_node import SensorFusionNode
+    from hailo_vision.recovery_lease import RecoveryLease, LocalizationSpeedLimit
+    from smart_delivery_core.wheel_feedback import WheelStopEvidence, WheelSampleAssembler
+    node, clock, _ = lateral_harness(manager)
+    node.recovery_stop = WheelStopEvidence(clock.now)
+    node.recovery_feedback = WheelSampleAssembler(.25, clock.now)
+    node._lateral_stop_ready = lambda at: module.LocalizationManager._lateral_stop_ready(node, at)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(clock.now*1e9)))
+    node._set_state = lambda state, reason: (setattr(node, 'state', state), setattr(node, 'ready', False))
+    node.spin_cancel_client = SimpleNamespace(service_is_ready=lambda: True, call_async=lambda _: None)
+    fusion = object.__new__(SensorFusionNode)
+    fusion.recovery_lease = RecoveryLease()
+    fusion.recovery_lease.receive({'token': 'orphan', 'owner': 'old', 'active': True,
+                                  'permit': True}, 99.)
+    fusion.recovery_stop = WheelStopEvidence(clock.now)
+    fusion.recovery_odom_at = None
+    fusion.recovery_odom_stamp_ns = None
+    fusion.recovery_odom_stopped = False
+    fusion.recovery_last_nonzero_cmd_at = 99.
+    fusion.recovery_handoff = False
+    fusion.recovery_last_release = {}
+    fusion.recovery_cancel_pending = {}
+    fusion.recovery_cancel_confirmed = {}
+    fusion.recovery_cancel_probe_at = 0.
+    from rclpy.task import Future
+    def cancel_probe(_request):
+        future = Future()
+        future.set_result(SimpleNamespace(return_code=0, goals_canceling=[]))
+        return future
+    fusion.recovery_cancel_clients = {
+        name: SimpleNamespace(service_is_ready=lambda: True, call_async=cancel_probe)
+        for name in ('navigate_to_pose', 'navigate_through_poses', 'spin')}
+    fusion.recovery_action_status = {name: (False, (1,))
+                                    for name in ('navigate_to_pose', 'navigate_through_poses', 'spin')}
+    fusion.get_publishers_info_by_topic = lambda _: [SimpleNamespace(endpoint_gid=(1,))]
+    fusion.get_clock = node.get_clock
+    fusion.localization_speed_limit = LocalizationSpeedLimit()
+    fusion.speed_multiplier = 1.
+    fusion.semantic_speed_limit = lambda *_: 1.
+    commands = []
+
+    def physical_command(command):
+        commands.append(command)
+        node._cmd_vel_callback(command)
+
+    fusion.pub_safe_cmd = SimpleNamespace(publish=physical_command)
+    fusion.recovery_guard_pub = SimpleNamespace(publish=node._recovery_guard_callback)
+    node.recovery_lease_pub = SimpleNamespace(publish=fusion.recovery_lease_callback)
+    node.recovery_cmd_pub = SimpleNamespace(publish=fusion.cmd_vel_callback)
+    fusion.publish_recovery_guard(clock.now)
+    assert node.lateral_handoff and node.lateral_phase == 'stopping'
+    assert fusion.recovery_lease.owner == node.recovery_owner
+    assert fusion.recovery_lease.blocked(clock.now)
+    for index in range(26):
+        clock.now = 100.05 + index*.05
+        node.latest_cmd_at = node.latest_odom_at = clock.now
+        node.latest_odom_stamp_ns = int(clock.now*1e9)
+        fusion.recovery_odom_at = clock.now
+        fusion.recovery_odom_stamp_ns = node.latest_odom_stamp_ns
+        fusion.recovery_odom_stopped = True
+        if index % 10 == 0:
+            for letter in 'ABCD':
+                packet = SimpleNamespace(data=letter+'_RT: 0')
+                node._recovery_feedback_callback(packet)
+                fusion.recovery_feedback_callback(packet)
+        node._tick_lateral_motion()
+    assert node.lateral_phase is None and not fusion.recovery_lease.enabled
+    assert node.state == 'VERIFYING' and not node.ready
+    assert not node.started_spins
+    assert commands and all(c.linear.x == c.linear.y == c.angular.z == 0 for c in commands)
 
 
 @pytest.mark.parametrize('fault', [None, 'obstacle', 'tilt', 'stale_tf'])

@@ -132,11 +132,19 @@ def lateral_speed(progress, distance=0.30, cap=0.25):
 def spin_scan_clear(scan, sensor_pose, self_mask=None, sensor_z=0.0,
                     radius=math.hypot(.22, .16)+.10, max_unknown_deg=15.0):
     """Require local full-circle evidence; unknown is never presumed free."""
+    return spin_scan_report(scan, sensor_pose, self_mask, sensor_z,
+                            radius, max_unknown_deg)['clear']
+
+
+def spin_scan_report(scan, sensor_pose, self_mask=None, sensor_z=0.0,
+                     radius=math.hypot(.22, .16)+.10, max_unknown_deg=15.0):
+    """Explain the unchanged rotation safety gate for logs and rosbag."""
+    report = {'clear': False, 'reason': 'invalid_scan_geometry'}
     sx, sy, yaw = sensor_pose
     if (not scan.ranges or not all(math.isfinite(v) for v in
             (sx, sy, yaw, sensor_z, scan.angle_min, scan.angle_increment, radius))
             or not 6.0 <= abs(scan.angle_increment)*len(scan.ranges) <= 2*math.pi+.1):
-        return False
+        return report
     known = []
     for index, value in enumerate(scan.ranges):
         valid = math.isfinite(value) and scan.range_min <= value <= scan.range_max
@@ -147,11 +155,17 @@ def spin_scan_clear(scan, sensor_pose, self_mask=None, sensor_z=0.0,
                     and self_mask[2]<y<self_mask[3] and self_mask[4]<sensor_z<self_mask[5]):
                 valid = False
             elif math.hypot(x, y) <= radius:
-                return False
+                report.update(reason='obstacle_in_rotation_sweep',
+                              obstacle_x=round(x, 4), obstacle_y=round(y, 4))
+                return report
         known.append(valid)
     run = longest = 0
     for valid in known+known:
         run = 0 if valid else run+1
         longest = max(longest, run)
     gap = min(longest, len(known))*abs(scan.angle_increment)*180/math.pi
-    return sum(known)/len(known) >= .75 and gap <= max_unknown_deg
+    fraction = sum(known)/len(known)
+    clear = fraction >= .75 and gap <= max_unknown_deg
+    report.update(clear=clear, reason='clear' if clear else 'unknown_coverage',
+                  valid_fraction=round(fraction, 4), missing_arc_deg=round(gap, 3))
+    return report
