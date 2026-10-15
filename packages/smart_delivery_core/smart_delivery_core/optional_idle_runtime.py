@@ -69,7 +69,11 @@ class OptionalIdleRuntime:
         self.safe_scan_count = 0
         self.safe_scan_stamp = None
         self.safe_stop_since = None
+        self.safe_scan_since = None
         self.spin_resumes = 0
+        self.spin_resume_requests = 0
+        self.spin_resume_pending = False
+        self.spin_resume_anchor = 0.
         self.people_failures = 0
         self.observation_collecting = False
         self.observation_session_deadline = None
@@ -169,6 +173,10 @@ class OptionalIdleRuntime:
             old = yaw_of(previous[1].pose.pose.orientation)
             new = yaw_of(message.pose.pose.orientation)
             self.spin_travel += math.atan2(math.sin(new - old), math.cos(new - old))
+            if (self.spin_resume_pending and self.state=='observing' and not self.cancel_requested
+                    and self.spin_travel-self.spin_resume_anchor >= .05):
+                self.spin_resumes += 1
+                self.spin_resume_pending = False
 
     def _battery(self, message):
         try:
@@ -232,6 +240,10 @@ class OptionalIdleRuntime:
                                    'accepting_tasks': self.accepting_tasks,
                                    'spin_progress_deg': round(math.degrees(self.spin_travel), 1),
                                    'spin_resume_count': self.spin_resumes,
+                                   'spin_resume_requests': self.spin_resume_requests,
+                                   'spin_resume_pending': self.spin_resume_pending,
+                                   'continuous_safe_scan_sec': (0. if self.safe_scan_since is None
+                                       else max(0.,time.monotonic()-self.safe_scan_since)),
                                    'consecutive_observation_failures': self.people_failures,
                                    'cooldown_remaining_sec': round(max(0., self.next_people_at-time.monotonic()), 1),
                                    'idle_remaining_sec': None if self.idle_since is None else round(max(0.,
@@ -408,18 +420,22 @@ class OptionalIdleRuntime:
         if not self._stationary():
             self.safe_scan_count = 0
             self.safe_scan_stamp = self.safe_stop_since = None
+            self.safe_scan_since = None
             return False
         self.safe_stop_since = self.safe_stop_since if self.safe_stop_since is not None else now
         if not clear:
+            self.safe_scan_since = None
             self.safe_scan_count = 0
             self.safe_scan_stamp = None
             return False
+        self.safe_scan_since = self.safe_scan_since if self.safe_scan_since is not None else now
         scan = self.last_scan[1]
         stamp = (scan.header.stamp.sec, scan.header.stamp.nanosec)
         if stamp != self.safe_scan_stamp:
             self.safe_scan_count += 1
             self.safe_scan_stamp = stamp
         return (self.safe_scan_count >= self.config['people']['safe_scan_samples']
+                and now-self.safe_scan_since >= .75
                 and now-self.safe_stop_since >= self.config['people']['stopped_before_spin_sec'])
 
     def _vision(self, message):
@@ -438,7 +454,7 @@ class OptionalIdleRuntime:
         except (ValueError, KeyError, TypeError, OverflowError):
             return
 
-    def _start(self, point, state, tree, timeout):
+    def _start(self, point, state, tree, timeout, resume=False):
         if not self._safe() or not self.navigator.nav_to_pose_client.server_is_ready():
             self.reason = 'waiting_for_safe_nav2'
             return False
@@ -465,9 +481,15 @@ class OptionalIdleRuntime:
         self.cancel_future, self.last_cancel_at = None, 0.0
         self.reason = ''
         self.interrupt_reason = None
+        if state=='observing':
+            self.spin_resume_pending = resume
+            self.spin_resume_anchor = self.spin_travel
+            if resume:
+                self.spin_resume_requests += 1
         if state == 'going_observation':
             self.spin_travel = 0.0
             self.spin_resumes = 0
+            self.spin_resume_requests = 0
             self.people = None
             self.guard_report = {}
         if state == 'observing' and self.observation_session_deadline is not None:
@@ -490,6 +512,7 @@ class OptionalIdleRuntime:
         self.scan_history.clear()
         self.spin_cache = None
         self.observation_collecting = False
+        self.spin_resume_pending = False
         self.observation_session_deadline = None
         self._remove_spin_tree()
         self._log_people_state()
@@ -613,11 +636,14 @@ class OptionalIdleRuntime:
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
             elif (self.state == 'observing' and self.interrupt_reason == 'unknown_scan_coverage'
                   and self.spin_resumes < self.config['people']['max_spin_resumes']
+                  and self.spin_resume_requests < 4
                   and self.observation_session_deadline is not None
                   and time.monotonic() < self.observation_session_deadline):
                 self.state, self.reason = 'waiting_observation_retry', self.interrupt_reason
                 self.safe_scan_count = 0
                 self.safe_scan_stamp = self.safe_stop_since = None
+                self.safe_scan_since = None
+                self.spin_resume_pending = False
                 self.deadline = min(time.monotonic()+self.config['people']['spin_ready_wait_sec'],
                                     self.observation_session_deadline)
                 self._log_people_state()
@@ -631,6 +657,7 @@ class OptionalIdleRuntime:
             self.deadline = time.monotonic() + self.config['people']['spin_ready_wait_sec']
             self.safe_scan_count = 0
             self.safe_scan_stamp = self.safe_stop_since = None
+            self.safe_scan_since = None
         elif self.state == 'observing':
             self.settling_after_cancel = True
             self.stop_since = None
@@ -714,8 +741,7 @@ class OptionalIdleRuntime:
             if self._spin_start_ready():
                 if retry:
                     tree = self._resume_spin_tree()
-                    if self._start(point, 'observing', tree, people['observation_timeout_sec']):
-                        self.spin_resumes += 1
+                    self._start(point, 'observing', tree, people['observation_timeout_sec'],resume=True)
                     return True
                 self.people = DirectionalPeople(people)
                 self.spin_travel = 0.0

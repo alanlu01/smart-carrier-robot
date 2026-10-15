@@ -104,7 +104,8 @@ def test_unknown_scan_cancels_and_drains_before_any_resume(runtime):
     assert not manager.poll(False)
     manager._spin_start_ready=lambda:True
     manager.idle()
-    assert manager.state=='observing' and manager.spin_resumes==1
+    assert manager.state=='observing' and manager.spin_resumes==0
+    assert manager.spin_resume_requests==1 and manager.spin_resume_pending
     assert len(navigator.sent)==2
     spin=ElementTree.parse(navigator.sent[-1].behavior_tree).find('.//Spin')
     assert float(spin.get('spin_dist'))==pytest.approx(2*math.pi-.6)
@@ -250,3 +251,40 @@ def test_history_guard_cache_expires_and_new_near_scan_overrides_it(runtime,monk
     moment[0]+=1.
     assert not manager._clear_to_spin(False)
     assert manager.guard_report['reason']=='scan_stale_or_absent'
+
+
+def test_permission_must_stay_clear_for_750ms_not_just_three_scans(runtime):
+    manager,_,moment=prepare(runtime)
+    manager._clear_to_spin=lambda *_:True
+    for i in range(5):
+        moment[0]=100.+.1*i
+        manager.last_scan[1].header.stamp.nanosec=i
+        assert not manager._spin_start_ready()
+    moment[0]=101.1
+    assert manager._spin_start_ready()
+    manager._clear_to_spin=lambda *_:False
+    assert not manager._spin_start_ready() and manager.safe_scan_since is None
+    manager._clear_to_spin=lambda *_:True
+    moment[0]=101.2
+    assert not manager._spin_start_ready()
+
+
+def test_resumed_request_only_counts_after_real_progress_and_has_request_cap(runtime):
+    from nav_msgs.msg import Odometry
+    manager,navigator,moment=prepare(runtime)
+    manager.observation_collecting=True
+    manager._start(manager.config['people']['observation_pose'],'observing','people.xml',35.,resume=True)
+    assert manager.spin_resume_requests==1 and manager.spin_resumes==0
+    data=Odometry();data.pose.pose.orientation.w=1.;manager._odom(data)
+    data=Odometry();data.pose.pose.orientation.w=math.cos(.03/2);data.pose.pose.orientation.z=math.sin(.03/2)
+    manager._odom(data);assert manager.spin_resumes==0
+    data=Odometry();data.pose.pose.orientation.w=math.cos(.06/2);data.pose.pose.orientation.z=math.sin(.06/2)
+    manager._odom(data);assert manager.spin_resumes==1
+    manager._odom(data);assert manager.spin_resumes==1
+    manager.spin_resume_requests=4
+    manager._clear_to_spin=lambda *_:False
+    manager.guard_report={'clear':False,'reason':'unknown_scan_coverage'}
+    manager.observation_session_deadline=190.
+    navigator.complete=True;navigator.result=TaskResult.CANCELED
+    manager.poll(False)
+    assert manager.state=='idle'  # no fifth transport request

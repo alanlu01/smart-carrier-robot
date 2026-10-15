@@ -65,6 +65,7 @@ from smart_delivery_core.recovery_translation import (
 )
 from smart_delivery_core.degraded_localization import MildMapGuard, convergence_is_stalled
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEvidence
+from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 
 
 STATE_QOS = QoSProfile(
@@ -87,6 +88,9 @@ class LocalizationManager(Node):
         self._declare_parameters()
         self.mild_map_enabled = bool(self.get_parameter('mild_map_observation_enabled').value)
         self.mild_map_guard = MildMapGuard()
+        self.stationary_map_guard = StationaryMapGuard()
+        self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
+        self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
         self.restore_heading = bool(self.get_parameter('restore_heading_after_recovery').value)
         self.global_attempts = 0
@@ -539,6 +543,7 @@ class LocalizationManager(Node):
             "global_recovery_max_wait_sec": 30.0,
             "global_convergence_max_wait_sec": 40.0,
             "global_stall_window_sec": 8.0,
+            "second_guard_wait_sec": 8.0,
             "restore_heading_after_recovery": False,
             "mild_map_observation_enabled": True,
             "small_spin_angle": math.radians(20.0),
@@ -697,6 +702,15 @@ class LocalizationManager(Node):
             "lateral_self_mask": self.lateral_self_mask,
             "mild_map_observation": self.mild_map_active,
             "global_attempts": self.global_attempts,
+            'dispatch_allowed': self.ready and not self.stationary_map_guard.active,
+            'stationary_map_observation': {
+                'active': self.stationary_map_guard.active,
+                'elapsed_sec': round(self.stationary_map_guard.elapsed,3),
+                'independent_samples': self.stationary_map_guard.count,
+                'confirmed': self.stationary_map_guard.confirmed,
+            },
+            'second_guard_wait_elapsed_sec': (max(0.,now-self.second_guard_started_at)
+                if self.recovery_step=='second_guard_wait' else None),
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -857,6 +871,7 @@ class LocalizationManager(Node):
         return True
 
     def _reset_map_match_history(self):
+        self.stationary_map_guard.reset()
         self.map_score_window.clear()
         self.latest_map_score = None
         self.latest_map_score_raw = None
@@ -1375,13 +1390,20 @@ class LocalizationManager(Node):
                 and now - self.map_match_unknown_since >= self.map_match_stale_grace
             )
             map_match_bad = match_status in {"critical", "degraded"} or map_match_stale
+            stationary_mismatch = self.stationary_map_guard.observe(now,self.latest_map_score_at,
+                match_status=='critical' and self.latest_quality.healthy
+                and not self.commanded_motion and not self.odom_motion
+                and not self._verification_data_blockers(now)
+                and self.latest_map_sector_count>=self.map_match_min_sectors
+                and self.latest_map_near_fraction<=.60
+                and self._mild_map_sources_fresh())
             suspicion_required = localization_suspicion_required(
                 "unknown" if map_match_stale else match_status,
                 self.latest_quality.healthy,
                 self.latest_quality.critical,
                 self.commanded_motion,
                 self.odom_motion,
-            )
+            ) or stationary_mismatch
             if match_status != 'degraded':
                 self.mild_map_guard.reset()
             if (self.mild_map_enabled and match_status == 'degraded'
@@ -1665,6 +1687,7 @@ class LocalizationManager(Node):
         ):
             return
         self.suspect_since = None
+        self.stationary_map_guard.reset()
         self.map_match_unknown_since = None
         self.recovery_step = None
         self.spin_sequence = []
@@ -1962,14 +1985,16 @@ class LocalizationManager(Node):
     def _tick_second_guard_wait(self, now):
         self.recovery_cmd_pub.publish(Twist())
         # Do not consume the one sidestep on a transient callback-phase gap.
-        if self._lateral_sensors_ready(now) and self._try_lateral_recovery(now):
-            return
+        if self._lateral_sensors_ready(now) and now-self.last_lateral_probe_at>=1.0:
+            self.last_lateral_probe_at=now
+            if self._try_lateral_recovery(now):
+                return
         if self._recovery_spin_clear(now):
             self.get_logger().warning(
                 self.second_guard_reason+'；橫移不可用，但旋轉安全，嘗試第二輪原地全域定位')
             self._start_global_recovery()
             return
-        if now - self.second_guard_started_at >= 2.0:
+        if now - self.second_guard_started_at >= self.second_guard_wait:
             detail = json.dumps(self.second_guard_report, ensure_ascii=False)
             self.get_logger().warning('第二輪安全檢查拒絕：'+detail)
             self._require_manual(self.second_guard_reason+'；'+self._recovery_failure_reason()
@@ -2125,8 +2150,8 @@ class LocalizationManager(Node):
                 or self.spin_in_progress or self.spin_waiting_for_stop
                 or self.commanded_motion or self.odom_motion):
             return False
-        # Count even a rejected attempt, so missing data cannot create a retry loop.
-        self.lateral_attempted = True
+        # Rejections consume time, not the one actual movement. The parent
+        # second_guard_wait deadline bounds repeated visibility checks.
         if not self._lateral_sensors_ready(now):
             self.get_logger().warning("橫移拒絕：即時雷達／完整四輪回授／里程計不足")
             return False
@@ -2138,6 +2163,7 @@ class LocalizationManager(Node):
             )
             return False
         self._cancel_navigation()
+        self.lateral_attempted = True
         self.lateral_direction = directions[0]
         self.lateral_anchor = self.last_odom_pose
         self.lateral_started_at = now

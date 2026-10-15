@@ -32,6 +32,11 @@ def generate_launch_description():
         package='laser_filters',
         executable='scan_to_scan_filter_chain',
         name='scan_to_scan_filter_chain',  # 🌟 關鍵修改：明確指定名字，確保吃到 yaml 設定
+        additional_env={
+            'FASTRTPS_DEFAULT_PROFILES_FILE': os.path.join(pkg_dir,'config','fastdds_sensor_publish.xml'),
+            'FASTDDS_DEFAULT_PROFILES_FILE': os.path.join(pkg_dir,'config','fastdds_sensor_publish.xml'),
+            'RMW_FASTRTPS_USE_QOS_FROM_XML': '1',
+        },
         parameters=[filter_config],
         remappings=[
             ('scan', '/scan'),                  

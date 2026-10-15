@@ -10,6 +10,7 @@ import json
 
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics
+from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
 
 class MecanumOdomReal(Node):
     def __init__(self):
@@ -23,8 +24,8 @@ class MecanumOdomReal(Node):
             10)
             
         # 2. 初始化發布器 (Publisher) 與 TF 廣播器
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        # No public reliable writer in the feedback/integration process.
+        self.odom_pub = self.create_publisher(Odometry, '/chassis/odom_local', LOCAL_ODOM_QOS)
         
         # 3. 機器人物理座標變數
         self.x = 0.0
@@ -60,10 +61,11 @@ class MecanumOdomReal(Node):
             started_at=time.monotonic(),
         )
         self.feedback_state = 'waiting'
+        self.local_write_errors = 0
         self.receipt_metrics = ReceiptMetrics()
         self.duration_metrics = DurationMetrics()
         self.feedback_health_pub = self.create_publisher(
-            String, '/chassis/feedback_health', 1
+            String, '/chassis/feedback_health', LOCAL_ODOM_QOS
         )
         self.feedback_health_timer = self.create_timer(1.0, self.publish_feedback_health)
         
@@ -194,8 +196,6 @@ class MecanumOdomReal(Node):
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0
         t.transform.rotation = self.euler_to_quaternion(self.th)
-        with self.duration_metrics.measure('tf_publish'):
-            self.tf_broadcaster.sendTransform(t)
         
         # 5. 發布標準 Odometry 話題
         odom = Odometry()
@@ -208,17 +208,29 @@ class MecanumOdomReal(Node):
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = vth
-        with self.duration_metrics.measure('odom_publish'):
-            self.odom_pub.publish(odom)
+        with self.duration_metrics.measure('local_odom_publish'):
+            try:
+                self.odom_pub.publish(odom)
+            except Exception as exc:
+                self.local_write_errors += 1
+                if self.local_write_errors==1 or self.local_write_errors%100==0:
+                    self.get_logger().error('Local odometry write failed; feedback remains active: '+str(exc))
 
     def publish_feedback_health(self):
         """Report receipt/group/timer timing without altering odometry control."""
         now = time.monotonic()
+        age = self.feedback_assembler.sample_age(now)
+        state = 'stale' if age > self.wheel_state_timeout_sec else self.feedback_state
+        timer_age = self.receipt_metrics.snapshot(now).get('odom_timer',{}).get('receive_age_sec')
+        if timer_age is not None and timer_age > .25:
+            state = 'executor_delayed'
         payload = {
             'sample_ros_stamp_ns': self.get_clock().now().nanoseconds,
-            'state': self.feedback_state,
+            'state': state,
+            'last_callback_state': self.feedback_state,
+            'local_write_errors': self.local_write_errors,
             'complete_sample_count': self.feedback_assembler.complete_sample_count,
-            'complete_sample_age_sec': round(self.feedback_assembler.sample_age(now), 3),
+            'complete_sample_age_sec': round(age, 3),
             'receipts': self.receipt_metrics.snapshot(now),
             'wall_durations': self.duration_metrics.snapshot(now),
         }
@@ -236,7 +248,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

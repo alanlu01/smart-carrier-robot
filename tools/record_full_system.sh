@@ -49,6 +49,7 @@ TOPICS=(
   /vehicle_battery/verified_status
   /smart_carrier/delivery_navigation_active /delivery/standby_state
   /delivery/startup_state
+  /chassis/odom_local /chassis/odometry_transport_health
   /power_status /vehicle_battery_status
   /vision/semantic_info /visual_glass /semantic/speed_multiplier
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health
@@ -63,7 +64,7 @@ printf '%s\n' "$RECORD_HELP" > "$RECORD_DIR/recorder_help.txt"
 cp "$QOS_FILE" "$RECORD_DIR/recording_qos.yaml"
 mkdir -p "$RECORD_DIR/config_snapshot"
 # Explicit whitelist; never copy robot.env or dump API credentials.
-for CONFIG in my_nav2_params.yaml slam_mapping.yaml my_laser_filter.yaml optional_idle_features.yaml; do
+for CONFIG in my_nav2_params.yaml slam_mapping.yaml my_laser_filter.yaml optional_idle_features.yaml fastdds_sensor_publish.xml; do
   if [[ -f "$CORE_SHARE/config/$CONFIG" ]]; then
     cp "$CORE_SHARE/config/$CONFIG" "$RECORD_DIR/config_snapshot/"
   fi
@@ -75,11 +76,12 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261012-idle-and-localization\n'
+  printf 'diagnostic_schema=20261015-transport-and-recovery\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \
-      ROS_AUTOMATIC_DISCOVERY_RANGE ROS_STATIC_PEERS CYCLONEDDS_URI; do
+      ROS_AUTOMATIC_DISCOVERY_RANGE ROS_STATIC_PEERS CYCLONEDDS_URI \
+      FASTRTPS_DEFAULT_PROFILES_FILE RMW_FASTRTPS_PUBLICATION_MODE RMW_FASTRTPS_USE_QOS_FROM_XML; do
     printf '%s=%s\n' "$KEY" "${!KEY-}"
   done
   df -h "$RECORD_ROOT"

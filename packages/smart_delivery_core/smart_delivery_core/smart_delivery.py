@@ -12,6 +12,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from nav2_simple_commander.robot_navigator import TaskResult
 from smart_delivery_core.delivery_navigator import DeliveryNavigator, Nav2StartupUnavailable
+from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
 from rclpy.duration import Duration
@@ -584,6 +585,7 @@ def main():
     localization_ready_since = None
     localization_state = "UNINITIALIZED"
     localization_state_received = False
+    localization_dispatch_allowed = False
     localization_ready_received = False
     localization_interrupt_generation = 0
     localization_wait_started_at = time.monotonic()
@@ -713,7 +715,7 @@ def main():
             )
 
     def localization_can_resume():
-        return localization_ready_for_resume(
+        return localization_dispatch_allowed and localization_ready_for_resume(
             localization_ready is True,
             localization_ready_since,
             time.monotonic(),
@@ -721,12 +723,15 @@ def main():
         )
 
     def localization_state_callback(message):
-        nonlocal localization_state, localization_state_received
+        nonlocal localization_state, localization_state_received, localization_dispatch_allowed
         try:
-            localization_state = json.loads(message.data).get("state", "UNKNOWN")
+            snapshot = json.loads(message.data)
+            localization_state = snapshot.get("state", "UNKNOWN")
+            localization_dispatch_allowed = dispatch_permitted(snapshot)
             localization_state_received = True
         except (AttributeError, TypeError, json.JSONDecodeError):
             localization_state = "UNKNOWN"
+            localization_dispatch_allowed = False
             localization_state_received = True
 
     navigator.create_subscription(
@@ -1301,7 +1306,8 @@ def main():
                 else:
                     wait_reason = localization_state
                 if localization_ready is True:
-                    wait_reason = "STABILIZING_BEFORE_RESUME"
+                    wait_reason = ("等待定位品質確認，暫緩派發"
+                                   if not localization_dispatch_allowed else "STABILIZING_BEFORE_RESUME")
                 navigator.get_logger().warning(
                     f"定位暫停（{wait_reason}），保留訂單並等待恢復"
                 )
@@ -1491,7 +1497,7 @@ def main():
                 cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
-                    f"定位進入 {localization_state}，取消導航並保留任務等待重送"
+                    f"定位 ready=false（最近狀態 {localization_state}），取消導航並保留任務等待重送"
                 )
                 navigator.cancelTask()
                 cancel_sent = True

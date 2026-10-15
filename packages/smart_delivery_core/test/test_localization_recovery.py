@@ -11,6 +11,7 @@ from smart_delivery_core import localization_manager as module
 from smart_delivery_core.localization_health import EvidenceWaitClock, pose_quality
 from smart_delivery_core.pipeline_health import ReceiptMetrics, ScanPairMetrics
 from smart_delivery_core.degraded_localization import MildMapGuard
+from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 
 
 @pytest.fixture
@@ -54,6 +55,7 @@ def manager(monkeypatch):
         transient_recovery_samples_required=2, pipeline_wait_timeout=30.0,
         diagnostic_log_period=5.0, last_diagnostic_log_at=0.0,
         amcl_nomotion_refresh=3.0, verification_nomotion_refresh=1.0,
+        amcl_stationary_grace=2.0, map_match_stale_grace=5.0,
         last_nomotion_request_at=0.0, sensor_waiting_for_pipeline=False,
         local_wait=12.0, global_wait=12.0, global_max_wait=30.0,
         global_convergence_max_wait=40.0,
@@ -65,6 +67,8 @@ def manager(monkeypatch):
         lateral_handoff=False, recovery_owner='test-owner', latest_odom_valid=True,
         handoff_cancel_at=0.0,
         second_guard_report={}, second_guard_reason='', second_guard_started_at=0.0,
+        stationary_map_guard=StationaryMapGuard(), second_guard_wait=8., last_lateral_probe_at=-float('inf'),
+        map_match_min_sectors=4,
         latest_scan=None, last_pipeline_diagnostic_at=0.0,
         global_grace_announced=False, cancel_grace=2.0,
         suspect_since=100.0, suspect_hold=5.0, suspect_max=12.0,
@@ -558,7 +562,7 @@ def test_post_global_does_not_extend_unsafe_solution(manager, fault):
         clock.now = 110.0
     node._tick_global_recovery(clock.now)
     if node.recovery_step == 'second_guard_wait':
-        clock.now += 2.0
+        clock.now += node.second_guard_wait
         node._tick_second_guard_wait(clock.now)
     assert node.manual_reasons and not node.ready
 
@@ -616,14 +620,60 @@ def test_second_guard_wait_is_bounded_and_does_not_consume_lateral_on_stale_data
     assert calls == ['translate']
 
 
-def test_second_guard_rejection_reports_details_after_two_seconds(manager):
+def test_second_guard_rejection_reports_details_after_eight_seconds(manager):
     node, clock = manager
     node.second_guard_report = {'reason': 'scan_filtered_unknown_coverage'}
     node._global_recovery_failed(clock.now, 'stall')
-    clock.now += 2.0
+    clock.now += 8.0
     node._tick_state_machine()
     assert 'scan_filtered_unknown_coverage' in node.manual_reasons[-1]
     assert not node.started_spins
+
+
+def test_stationary_critical_mismatch_is_bounded_and_requires_valid_broad_fresh_evidence(manager):
+    node,clock=manager
+    node.state='LOCALIZED';node.recovery_step=None
+    node.latest_map_score=.10;node.map_score_window=deque([.10]*5)
+    node.map_match_unknown_since=None;node.last_map_only_warning_at=0.
+    node._mild_map_sources_fresh=lambda:True
+    node._set_state=lambda state,reason:(setattr(node,'state',state),setattr(node,'ready',False))
+    for at in range(100,110):
+        fresh(node,clock,float(at));node.last_amcl_at=clock.now
+        node._tick_state_machine()
+        assert node.state=='LOCALIZED'
+    assert node.stationary_map_guard.active
+    fresh(node,clock,110.);node.last_amcl_at=clock.now
+    node._tick_state_machine()
+    assert node.state=='SUSPECT'
+
+
+def test_lateral_rejection_does_not_consume_attempt_and_safe_space_can_recover_at_five_seconds(manager):
+    node,clock,_=lateral_harness(manager)
+    node._lateral_path_clear=lambda *_:False
+    node._global_recovery_failed(clock.now,'stall')
+    assert not node.lateral_attempted and not node.manual_reasons
+    for at in (101.,102.,103.,104.):
+        clock.now=at;node._tick_second_guard_wait(at)
+    assert not node.manual_reasons and not node.lateral_attempted
+    clock.now=105.;node._lateral_path_clear=lambda *_:True
+    node._tick_second_guard_wait(clock.now)
+    assert node.lateral_attempted and node.lateral_phase=='arming'
+
+
+@pytest.mark.parametrize('fault',['near_occlusion','narrow_view','stale_source','brief'])
+def test_stationary_map_guard_preserves_occlusion_and_outage_debounce(manager,fault):
+    node,clock=manager
+    node.state='LOCALIZED';node.recovery_step=None
+    node.latest_map_score=.10;node.map_score_window=deque([.10]*5)
+    node.map_match_unknown_since=None;node.last_map_only_warning_at=0.
+    node._mild_map_sources_fresh=lambda:fault!='stale_source'
+    if fault=='near_occlusion':node.latest_map_near_fraction=.9
+    if fault=='narrow_view':node.latest_map_sector_count=2
+    for at in range(100,115):
+        fresh(node,clock,float(at));node.last_amcl_at=clock.now
+        if fault=='brief' and at>=103:node.latest_map_score=.8;node.map_score_window=deque([.8]*5)
+        node._tick_state_machine()
+    assert node.state=='LOCALIZED' and not node.stationary_map_guard.active
 
 
 def test_manager_only_adopts_expired_orphan_for_stop_not_live_other_owner(manager):

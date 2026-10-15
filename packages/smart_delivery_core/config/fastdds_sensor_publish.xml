@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Only odometry integration/relay and laser-filter processes use this file.
+     External reliability is still set explicitly by ROS, not overridden here. -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor><transport_id>robot_shm</transport_id><type>SHM</type></transport_descriptor>
+      <transport_descriptor><transport_id>robot_udp</transport_id><type>UDPv4</type></transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="robot_sensor_transport" is_default_profile="true">
+      <rtps><userTransports><transport_id>robot_shm</transport_id><transport_id>robot_udp</transport_id></userTransports><useBuiltinTransports>false</useBuiltinTransports></rtps>
+    </participant>
+    <publisher profile_name="robot_sensor_writer" is_default_profile="true">
+      <qos>
+        <publishMode><kind>ASYNCHRONOUS</kind></publishMode>
+        <reliability><max_blocking_time><sec>0</sec><nanosec>100000000</nanosec></max_blocking_time></reliability>
+      </qos>
+      <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+    </publisher>
+    <subscriber profile_name="robot_sensor_reader" is_default_profile="true">
+      <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+    </subscriber>
+  </profiles>
+</dds>

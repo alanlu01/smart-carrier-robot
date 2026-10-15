@@ -10,6 +10,11 @@ from launch_ros.actions import Node
 def generate_launch_description():
     core_package_path = get_package_share_directory("smart_delivery_core")
     model_package_path = get_package_share_directory("vm_robot_model")
+    sensor_env = {
+        'FASTRTPS_DEFAULT_PROFILES_FILE': os.path.join(core_package_path,'config','fastdds_sensor_publish.xml'),
+        'FASTDDS_DEFAULT_PROFILES_FILE': os.path.join(core_package_path,'config','fastdds_sensor_publish.xml'),
+        'RMW_FASTRTPS_USE_QOS_FROM_XML': '1',
+    }
 
     lidar_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -46,7 +51,10 @@ def generate_launch_description():
         executable="mecanum_odom_real",
         name="mecanum_odom_real",
         output="screen",
+        additional_env=sensor_env,
     )
+    odom_transport = Node(package='smart_delivery_core', executable='odom_transport',
+                          name='odom_transport', output='screen', additional_env=sensor_env)
 
     return LaunchDescription([
         lidar_launch,
@@ -54,4 +62,5 @@ def generate_launch_description():
         cmd_to_vel_node,
         stm_to_ros_node,
         odom_node,
+        odom_transport,
     ])
