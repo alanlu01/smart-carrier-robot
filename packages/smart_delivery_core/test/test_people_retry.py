@@ -113,7 +113,8 @@ def test_unknown_scan_cancels_and_drains_before_any_resume(runtime):
     manager._people_finished('nav2_failed')  # remove test temporary BT
 
 
-@pytest.mark.parametrize('reason',['near_obstacle','scan_stale_or_absent','invalid_laser_geometry'])
+@pytest.mark.parametrize('reason',['scan_stale_or_absent','invalid_laser_geometry',
+                                   'laser_tf_unavailable','unsafe_localization_or_odom'])
 def test_hard_sensor_or_obstacle_rejection_never_enters_unknown_retry(runtime,reason):
     manager,navigator,_=begin_spin(runtime)
     manager.guard_report['reason']=reason

@@ -17,7 +17,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
-from tf2_ros import TransformException
+from tf2_ros import ExtrapolationException, TransformException
 
 from smart_delivery_core.optional_idle import DirectionalPeople, HomeVoltageLatch, occupancy_fingerprint
 from smart_delivery_core.standby_idle_clock import StandbyIdleClock
@@ -25,6 +25,14 @@ from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
 
 STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+# Pair only the latest scan, without blocking the executor that receives TF.
+# The original 0.30 s source/receipt freshness budget still applies.
+SPIN_TF_PAIR_WAIT_SEC = 0.20
+RETRYABLE_SPIN_STOPS = frozenset({
+    'unknown_scan_coverage', 'near_obstacle', 'recent_near_obstacle',
+    'laser_tf_pending', 'laser_tf_wait_timeout',
+})
 
 
 def yaw_of(quaternion):
@@ -58,6 +66,8 @@ class OptionalIdleRuntime:
         self.scan_history = deque(maxlen=5)
         self.spin_cache = None
         self.scan_evidence_error = ''
+        self.scan_evidence_reason = ''
+        self.pending_scan = None
         self.next_people_at = 0.0
         self.people = None
         self.spin_yaw = None
@@ -70,6 +80,7 @@ class OptionalIdleRuntime:
         self.safe_scan_stamp = None
         self.safe_stop_since = None
         self.safe_scan_since = None
+        self.spin_ready_blocker = 'not_waiting'
         self.spin_resumes = 0
         self.spin_resume_requests = 0
         self.spin_resume_pending = False
@@ -108,6 +119,8 @@ class OptionalIdleRuntime:
             navigator.create_subscription(LaserScan, '/scan_filtered', self._scan, qos_profile_sensor_data)
             navigator.create_subscription(String, '/vision/semantic_info', self._vision, 10)
         navigator.create_timer(0.5, self._heartbeat)
+        if config['people']['enabled']:
+            navigator.create_timer(0.02, self._retry_scan_transform)
 
     @property
     def home_requested(self):
@@ -142,7 +155,18 @@ class OptionalIdleRuntime:
         now = time.monotonic()
         self.last_scan = (now, message)
         self.spin_cache = None
+        # New evidence always supersedes an older pending scan. Never retain an
+        # old clear scan as permission while the latest one lacks its TF.
+        self.pending_scan = None
         if self.state not in ('waiting_observation_stop', 'waiting_observation_retry', 'observing'):
+            return
+        self._transform_scan(message, now)
+
+    def _transform_scan(self, message, received_at):
+        if not self._stamp_fresh(received_at, message.header.stamp):
+            self.pending_scan = None
+            self.scan_evidence_reason = 'scan_stale_or_absent'
+            self.scan_evidence_error = 'Scan expired before its timestamped TF was available'
             return
         stamp = Time(nanoseconds=message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec)
         try:
@@ -152,13 +176,45 @@ class OptionalIdleRuntime:
                 if (abs(q.x)>1e-4 or abs(q.y)>1e-4
                         or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
                     raise ValueError('unsupported laser/base tilt or invalid quaternion')
-            evidence = ScanEvidence.from_scan(message, now,
+            evidence = ScanEvidence.from_scan(message, received_at,
                 (sensor.translation.x,sensor.translation.y,yaw_of(sensor.rotation)),
                 (base.translation.x,base.translation.y,yaw_of(base.rotation)))
             self.scan_history.append(evidence)
             self.scan_evidence_error = ''
-        except (TransformException, ValueError, TypeError, AttributeError) as exc:
+            self.scan_evidence_reason = ''
+            self.pending_scan = None
+            self.spin_cache = None
+        except ExtrapolationException as exc:
             self.scan_evidence_error = str(exc)
+            if 'extrapolation into the future' in str(exc).lower():
+                if time.monotonic()-received_at < SPIN_TF_PAIR_WAIT_SEC:
+                    self.pending_scan = (received_at, message)
+                    self.scan_evidence_reason = 'laser_tf_pending'
+                else:
+                    self.pending_scan = None
+                    self.scan_evidence_reason = 'laser_tf_wait_timeout'
+            else:
+                self.pending_scan = None
+                self.scan_evidence_reason = 'laser_tf_unavailable'
+        except (TransformException, ValueError, TypeError, AttributeError) as exc:
+            self.pending_scan = None
+            self.scan_evidence_error = str(exc)
+            self.scan_evidence_reason = 'laser_tf_unavailable'
+
+    def _retry_scan_transform(self):
+        """Retry a future-TF pairing briefly, never restamp or extrapolate."""
+        if self.pending_scan is None:
+            return
+        if self.state not in ('waiting_observation_stop', 'waiting_observation_retry', 'observing'):
+            self.pending_scan = None
+            return
+        received_at, message = self.pending_scan
+        if time.monotonic()-received_at >= SPIN_TF_PAIR_WAIT_SEC:
+            self.pending_scan = None
+            self.scan_evidence_reason = 'laser_tf_wait_timeout'
+            self.scan_evidence_error = 'Timed out waiting for the scan timestamp TF'
+            return
+        self._transform_scan(message, received_at)
 
     def mark_parked(self, point):
         """Only the existing successful arrival flow grants this parking proof."""
@@ -243,7 +299,11 @@ class OptionalIdleRuntime:
                                    'spin_resume_requests': self.spin_resume_requests,
                                    'spin_resume_pending': self.spin_resume_pending,
                                    'continuous_safe_scan_sec': (0. if self.safe_scan_since is None
+                                       or self.state not in ('waiting_observation_stop', 'waiting_observation_retry')
                                        else max(0.,time.monotonic()-self.safe_scan_since)),
+                                   'spin_ready_blocker': self.spin_ready_blocker,
+                                   'pending_scan_age_sec': (None if self.pending_scan is None else
+                                       round(max(0.,time.monotonic()-self.pending_scan[0]),3)),
                                    'consecutive_observation_failures': self.people_failures,
                                    'cooldown_remaining_sec': round(max(0., self.next_people_at-time.monotonic()), 1),
                                    'idle_remaining_sec': None if self.idle_since is None else round(max(0.,
@@ -329,7 +389,8 @@ class OptionalIdleRuntime:
         if self.last_scan is None or not self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp):
             return {'clear':False,'reason':'scan_stale_or_absent'}
         if self.scan_evidence_error:
-            return {'clear':False,'reason':'laser_tf_unavailable','detail':self.scan_evidence_error}
+            return {'clear':False,'reason':self.scan_evidence_reason or 'laser_tf_unavailable',
+                    'detail':self.scan_evidence_error}
         if not self.scan_history:
             # No historical permission: retain original conservative single scan.
             return self._single_spin_guard_report(require_stationary)
@@ -413,6 +474,11 @@ class OptionalIdleRuntime:
         return {'clear': clear, 'reason': 'clear' if clear else 'unknown_scan_coverage',
                 'valid_fraction': round(valid/len(scan.ranges), 4), 'unknown_arc_deg': round(unknown_arc, 3)}
 
+    def _reset_spin_ready(self):
+        self.safe_scan_count = 0
+        self.safe_scan_stamp = self.safe_stop_since = self.safe_scan_since = None
+        self.spin_ready_blocker = 'not_waiting'
+
     def _spin_start_ready(self):
         """Require independent safe scans AND continuously stopped feedback."""
         now = time.monotonic()
@@ -421,12 +487,14 @@ class OptionalIdleRuntime:
             self.safe_scan_count = 0
             self.safe_scan_stamp = self.safe_stop_since = None
             self.safe_scan_since = None
+            self.spin_ready_blocker = 'vehicle_not_stopped'
             return False
         self.safe_stop_since = self.safe_stop_since if self.safe_stop_since is not None else now
         if not clear:
             self.safe_scan_since = None
             self.safe_scan_count = 0
             self.safe_scan_stamp = None
+            self.spin_ready_blocker = self.guard_report.get('reason', 'scan_not_clear')
             return False
         self.safe_scan_since = self.safe_scan_since if self.safe_scan_since is not None else now
         scan = self.last_scan[1]
@@ -434,9 +502,16 @@ class OptionalIdleRuntime:
         if stamp != self.safe_scan_stamp:
             self.safe_scan_count += 1
             self.safe_scan_stamp = stamp
-        return (self.safe_scan_count >= self.config['people']['safe_scan_samples']
-                and now-self.safe_scan_since >= .75
-                and now-self.safe_stop_since >= self.config['people']['stopped_before_spin_sec'])
+        if self.safe_scan_count < self.config['people']['safe_scan_samples']:
+            self.spin_ready_blocker = 'insufficient_independent_scans'
+        elif now-self.safe_stop_since < self.config['people']['stopped_before_spin_sec']:
+            self.spin_ready_blocker = 'stopped_duration_insufficient'
+        elif now-self.safe_scan_since < .75:
+            self.spin_ready_blocker = 'continuous_safe_duration_insufficient'
+        else:
+            self.spin_ready_blocker = 'ready'
+            return True
+        return False
 
     def _vision(self, message):
         if not self.observation_collecting or self.people is None:
@@ -482,6 +557,7 @@ class OptionalIdleRuntime:
         self.reason = ''
         self.interrupt_reason = None
         if state=='observing':
+            self._reset_spin_ready()
             self.spin_resume_pending = resume
             self.spin_resume_anchor = self.spin_travel
             if resume:
@@ -510,7 +586,10 @@ class OptionalIdleRuntime:
         self.idle_since = None
         self.idle_clock.reset()
         self.scan_history.clear()
+        self.pending_scan = None
+        self.scan_evidence_error = self.scan_evidence_reason = ''
         self.spin_cache = None
+        self._reset_spin_ready()
         self.observation_collecting = False
         self.spin_resume_pending = False
         self.observation_session_deadline = None
@@ -539,6 +618,7 @@ class OptionalIdleRuntime:
 
     def _finish_people_scan(self):
         self.observation_collecting = False
+        self._reset_spin_ready()
         self._remove_spin_tree()
         selected = self.people.select(self.config['people']['observation_pose']) if self.people else None
         if selected is None:
@@ -634,15 +714,13 @@ class OptionalIdleRuntime:
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
-            elif (self.state == 'observing' and self.interrupt_reason == 'unknown_scan_coverage'
+            elif (self.state == 'observing' and self.interrupt_reason in RETRYABLE_SPIN_STOPS
                   and self.spin_resumes < self.config['people']['max_spin_resumes']
                   and self.spin_resume_requests < 4
                   and self.observation_session_deadline is not None
                   and time.monotonic() < self.observation_session_deadline):
                 self.state, self.reason = 'waiting_observation_retry', self.interrupt_reason
-                self.safe_scan_count = 0
-                self.safe_scan_stamp = self.safe_stop_since = None
-                self.safe_scan_since = None
+                self._reset_spin_ready()
                 self.spin_resume_pending = False
                 self.deadline = min(time.monotonic()+self.config['people']['spin_ready_wait_sec'],
                                     self.observation_session_deadline)
@@ -655,9 +733,7 @@ class OptionalIdleRuntime:
         elif self.state == 'going_observation':
             self.state = 'waiting_observation_stop'
             self.deadline = time.monotonic() + self.config['people']['spin_ready_wait_sec']
-            self.safe_scan_count = 0
-            self.safe_scan_stamp = self.safe_stop_since = None
-            self.safe_scan_since = None
+            self._reset_spin_ready()
         elif self.state == 'observing':
             self.settling_after_cancel = True
             self.stop_since = None
@@ -727,11 +803,12 @@ class OptionalIdleRuntime:
                 self._people_finished('retry_localization_or_session_unavailable')
                 return True
             if now >= self.deadline:
-                self._people_finished('spin_ready_timeout:'+self.guard_report.get('reason','unknown'))
+                self._people_finished('spin_ready_timeout:'+self.spin_ready_blocker)
                 return True
             pose = self._pose()
             point = people['observation_pose']
             if pose is None or math.hypot(pose['x']-point['x'],pose['y']-point['y']) > .10:
+                self.spin_ready_blocker = 'observation_position_not_verified'
                 if now >= self.deadline:
                     self._people_finished('observation_position_not_verified')
                 return True
@@ -741,16 +818,18 @@ class OptionalIdleRuntime:
             if self._spin_start_ready():
                 if retry:
                     tree = self._resume_spin_tree()
-                    self._start(point, 'observing', tree, people['observation_timeout_sec'],resume=True)
+                    if not self._start(point, 'observing', tree, people['observation_timeout_sec'],resume=True):
+                        self.spin_ready_blocker = 'nav2_not_ready'
                     return True
                 self.people = DirectionalPeople(people)
                 self.spin_travel = 0.0
                 self.spin_resumes = 0
                 self.observation_session_deadline = now+people['observation_session_timeout_sec']
                 self.observation_collecting = True
-                self._start(people['observation_pose'], 'observing',
-                            str(self.share / 'behavior_trees/people_observe.xml'),
-                            people['observation_timeout_sec'])
+                if not self._start(people['observation_pose'], 'observing',
+                                  str(self.share / 'behavior_trees/people_observe.xml'),
+                                  people['observation_timeout_sec']):
+                    self.spin_ready_blocker = 'nav2_not_ready'
             return True
         if self.state == 'people_destination_selected':
             self._start(self.goal, 'going_people_standby', '', people['navigation_timeout_sec'])

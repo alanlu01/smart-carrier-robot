@@ -25,7 +25,7 @@ home:
   navigation_timeout_sec: 180.0
 people:
   enabled: true
-  observation_pose: {name: PEOPLE_OBSERVATION, x: 1.5, y: 3.0, yaw: 0.0}
+  observation_pose: {name: PEOPLE_OBSERVATION, x: 0.5, y: 3.5, yaw: 0.0}
   standby_points:
     - {name: CYCU EE, x: 2.0, y: 5.18, yaw: 0.0}
     - {name: 座位燈, x: 1.4, y: -5.3, yaw: 0.0}
