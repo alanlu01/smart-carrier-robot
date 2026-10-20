@@ -36,6 +36,7 @@ setup(
             'serial_to_ros = smart_delivery_core.serial_to_ros:main',
             'mecanum_odom_real = smart_delivery_core.mecanum_odom_real:main',
             'odom_transport = smart_delivery_core.odom_transport:main',
+            'scan_pipeline_monitor = smart_delivery_core.scan_pipeline_monitor:main',
             'serial_bridge = smart_delivery_core.serial_bridge:main',
             'localization_manager = smart_delivery_core.localization_manager:main',
             'delivery_goal_guard = smart_delivery_core.delivery_goal_guard:main',

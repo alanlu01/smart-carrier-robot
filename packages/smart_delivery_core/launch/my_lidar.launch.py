@@ -60,5 +60,8 @@ def generate_launch_description():
     # 5. 打包發射 (🌟 把 filter_node 一併加入啟動清單)
     return LaunchDescription([
         rplidar_node,
-        filter_node
+        filter_node,
+        # Independent, best-effort observer only; never processes/forwards scans.
+        Node(package='smart_delivery_core', executable='scan_pipeline_monitor',
+             name='scan_pipeline_monitor', output='screen'),
     ])

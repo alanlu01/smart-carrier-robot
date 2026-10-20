@@ -66,6 +66,7 @@ from smart_delivery_core.recovery_translation import (
 from smart_delivery_core.degraded_localization import MildMapGuard, convergence_is_stalled
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEvidence
 from smart_delivery_core.stationary_map_guard import StationaryMapGuard
+from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
 
 
 STATE_QOS = QoSProfile(
@@ -89,6 +90,7 @@ class LocalizationManager(Node):
         self.mild_map_enabled = bool(self.get_parameter('mild_map_observation_enabled').value)
         self.mild_map_guard = MildMapGuard()
         self.stationary_map_guard = StationaryMapGuard()
+        self.quality_history = LocalizationQualityHistory()
         self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
         self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
@@ -698,6 +700,7 @@ class LocalizationManager(Node):
             "pipeline_receipts": self.receipt_metrics.snapshot(now),
             "scan_pair_timing": self.scan_pair_metrics.snapshot(now),
             "wall_durations": self.duration_metrics.snapshot(now),
+            'quality_history': self.quality_history.snapshot(now),
             "lateral_path_reports": self.lateral_path_reports,
             "lateral_self_mask": self.lateral_self_mask,
             "mild_map_observation": self.mild_map_active,
@@ -965,6 +968,9 @@ class LocalizationManager(Node):
         self.latest_pose = current
         self.latest_quality = quality
         self.last_amcl_at = now
+        self.quality_history.observe(
+            message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec,
+            now, current, quality, self.latest_map_score)
 
         if (
             self.state == "LOCALIZED"

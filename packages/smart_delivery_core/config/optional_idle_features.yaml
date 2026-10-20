@@ -44,7 +44,11 @@ people:
   minimum_confidence: 0.65
   bin_width_deg: 15.0
   minimum_frames_per_bin: 3
+  minimum_positive_frames: 3
+  minimum_positive_fraction: 0.15
   minimum_heading_coverage: 0.75
+  # Stop/drain first; wait only for brief SUSPECT, never move while unready.
+  localization_wait_sec: 20.0
   camera_yaw_offset_rad: 0.0
   scan_clearance_m: 0.10
   max_unknown_arc_deg: 15.0

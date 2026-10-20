@@ -53,6 +53,7 @@ TOPICS=(
   /power_status /vehicle_battery_status
   /vision/semantic_info /visual_glass /semantic/speed_multiplier
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health
+  /lidar/pipeline_health
   /order /smart_carrier/task_state
   /smart_carrier/task_result /smart_carrier/task_result_ack
   /smart_carrier/task_cancel /diagnostics /rosout
@@ -76,7 +77,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261015-transport-and-recovery\n'
+  printf 'diagnostic_schema=20261020-people-quality-and-lidar-timing\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \

@@ -21,6 +21,19 @@ def valid_pose(pose):
             and all(finite_number(pose.get(key)) for key in ('x', 'y', 'yaw')))
 
 
+def map_alignment_correction(previous, current, odom_x, odom_y):
+    """Evaluate map-frame changes at the SAME odom point, not at map origins."""
+    if not all(finite_number(v) for v in (*previous, *current, odom_x, odom_y)):
+        raise ValueError('Alignment comparison requires finite planar transforms')
+    def project(transform):
+        x, y, angle = transform
+        return (x+math.cos(angle)*odom_x-math.sin(angle)*odom_y,
+                y+math.sin(angle)*odom_x+math.cos(angle)*odom_y)
+    old, new = project(previous), project(current)
+    return (math.hypot(new[0]-old[0], new[1]-old[1]),
+            abs(math.atan2(math.sin(current[2]-previous[2]), math.cos(current[2]-previous[2]))))
+
+
 def load_idle_config(path):
     """Fail closed on incomplete enabled features; disabled needs no poses."""
     data = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
@@ -89,6 +102,15 @@ def load_idle_config(path):
         for key in ('minimum_confidence', 'minimum_heading_coverage'):
             if not finite_number(people.get(key)) or not 0 < people[key] <= 1:
                 raise ValueError(f'people.{key} must be in (0,1]')
+        fraction = people.get('minimum_positive_fraction', .15)
+        if not finite_number(fraction) or not .10 <= fraction <= 1:
+            raise ValueError('People positive-frame fraction must be in [0.10,1]')
+        positive_frames = people.get('minimum_positive_frames', 3)
+        if isinstance(positive_frames, bool) or not isinstance(positive_frames, int) or positive_frames < 3:
+            raise ValueError('At least three independent positive frames are required')
+        wait = people.get('localization_wait_sec', 20.)
+        if not finite_number(wait) or not 5 <= wait <= 30:
+            raise ValueError('People localization wait must be between 5 and 30 seconds')
         width = people.get('bin_width_deg')
         if not finite_number(width) or width < 5 or width > 30 or 360 % width:
             raise ValueError('Bin width must divide 360 and be between 5 and 30 degrees')
@@ -214,12 +236,16 @@ class DirectionalPeople:
         self.frames = [[] for _ in range(self.count)]
         self.headings = set()
         self.last_stamp = None
+        self.received_frames = 0
+        self.person_frames = 0
+        self.qualified_detections = 0
 
     def observe(self, detections, heading, stamp):
         """Use median per-frame counts to reduce repeated sightings/noise."""
         if self.last_stamp is not None and stamp <= self.last_stamp:
             return
         self.last_stamp = stamp
+        self.received_frames += 1
         heading += self.config['camera_yaw_offset_rad']
         self.headings.add(int((heading % (2 * math.pi)) / self.width) % self.count)
         counts = [0] * self.count
@@ -232,6 +258,8 @@ class DirectionalPeople:
             # The detector uses image-right positive; ROS yaw is left positive.
             bearing = heading - math.radians(target['angle'])
             counts[int((bearing % (2 * math.pi)) / self.width) % self.count] += 1
+        self.person_frames += int(any(counts))
+        self.qualified_detections += sum(counts)
         for index in range(self.count):
             middle = (index + 0.5) * self.width
             difference = math.atan2(math.sin(middle - heading), math.cos(middle - heading))
@@ -239,12 +267,25 @@ class DirectionalPeople:
                 self.frames[index].append(counts[index])
                 self.frames[index] = self.frames[index][-60:]
 
-    def select(self, observation_pose):
-        """Prefer the strongest measured direction, then the nearest safe stop."""
-        if len(self.headings) / self.count < self.config['minimum_heading_coverage']:
-            return None
-        demand = [statistics.median(values) if len(values) >= self.config['minimum_frames_per_bin']
-                  else 0.0 for values in self.frames]
+    def summary(self, observation_pose):
+        """Keep intermittent positives without accepting one-frame false demand."""
+        positive = [sum(value > 0 for value in values) for values in self.frames]
+        demand = []
+        for values, count in zip(self.frames, positive):
+            eligible = (len(values) >= self.config['minimum_frames_per_bin']
+                        and count >= self.config.get('minimum_positive_frames', 3)
+                        and count / len(values) >= self.config.get('minimum_positive_fraction', .15))
+            if eligible:
+                # Clip isolated large counts, not intermittent zeros. This is
+                # an expected directional count, never a sum of sightings.
+                cap = statistics.median(value for value in values if value > 0)
+                demand.append(sum(min(value, cap) for value in values)/len(values))
+            else:
+                demand.append(0.)
+        # Smooth only bins with qualified multi-frame evidence. The weights
+        # sum to one, so a boundary sighting is not counted as three people.
+        smoothed = [(.25*demand[(i-1) % self.count] + .5*demand[i]
+                     + .25*demand[(i+1) % self.count]) for i in range(self.count)]
         directions = {p['name']: math.atan2(p['y']-observation_pose['y'],
                                            p['x']-observation_pose['x'])
                       for p in self.config['standby_points']}
@@ -252,22 +293,36 @@ class DirectionalPeople:
         distances = {p['name']: math.hypot(p['x']-observation_pose['x'],
                                           p['y']-observation_pose['y'])
                      for p in self.config['standby_points']}
-        for index, value in enumerate(demand):
+        for index, value in enumerate(smoothed):
             bearing = (index+.5)*self.width
             name = min(directions, key=lambda name: (
                 abs(math.atan2(math.sin(bearing-directions[name]), math.cos(bearing-directions[name]))),
                 distances[name], name))
             assigned[name].append(value)
-        # Per-angle-bin frame medians, never summed per-frame sightings.
-        # Averaging compensates for unequal angular widths of the real sectors.
         candidates = []
+        scores = {}
         for point in self.config['standby_points']:
             dx, dy = point['x'] - observation_pose['x'], point['y'] - observation_pose['y']
             values = assigned[point['name']]
             score = sum(values)/len(values) if values else 0.0
+            scores[point['name']] = round(score, 5)
             candidates.append((-score, math.hypot(dx, dy), point['name'], point))
         best = min(candidates)
-        return dict(best[3]) if best[0] < 0 else None
+        coverage = len(self.headings)/self.count
+        reason = ('insufficient_heading_coverage' if coverage < self.config['minimum_heading_coverage']
+                  else 'no_person_detected' if not any(positive)
+                  else 'insufficient_positive_evidence' if not any(demand)
+                  else 'direction_selected')
+        return {'reason': reason, 'received_frames': self.received_frames,
+                'person_frames': self.person_frames, 'qualified_detections': self.qualified_detections,
+                'heading_coverage': round(coverage, 3),
+                'positive_frames_per_bin': positive, 'frames_per_bin': [len(v) for v in self.frames],
+                'qualified_bins': sum(value > 0 for value in demand), 'sector_scores': scores,
+                'selected': dict(best[3]) if reason == 'direction_selected' else None}
+
+    def select(self, observation_pose):
+        """Prefer the strongest supported direction, then the nearest safe stop."""
+        return self.summary(observation_pose)['selected']
 
 
 def home_nav_parameters(parameters, config):

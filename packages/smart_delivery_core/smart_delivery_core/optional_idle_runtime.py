@@ -19,7 +19,9 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf2_ros import ExtrapolationException, TransformException
 
-from smart_delivery_core.optional_idle import DirectionalPeople, HomeVoltageLatch, occupancy_fingerprint
+from smart_delivery_core.optional_idle import (
+    DirectionalPeople, HomeVoltageLatch, map_alignment_correction, occupancy_fingerprint,
+)
 from smart_delivery_core.standby_idle_clock import StandbyIdleClock
 from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
@@ -102,6 +104,13 @@ class OptionalIdleRuntime:
         self.interrupt_reason = None
         self.log_key = None
         self.last_progress_log = 0.0
+        self.localization_status = None
+        self.localization_pauses = 0
+        self.localization_restarts = 0
+        self.localization_resume_state = None
+        self.localization_resume_deadline = None
+        self.localization_wait_deadline = None
+        self.observation_alignment = None
         self.latch_path = Path.home() / '.ros/smart_carrier_home_latch.json'
         self.home = None
         if config['home']['enabled']:
@@ -128,6 +137,7 @@ class OptionalIdleRuntime:
         if config['people']['enabled']:
             navigator.create_subscription(LaserScan, '/scan_filtered', self._scan, qos_profile_sensor_data)
             navigator.create_subscription(String, '/vision/semantic_info', self._vision, 10)
+            navigator.create_subscription(String, '/localization/state', self._localization, STATE_QOS)
         navigator.create_timer(0.5, self._heartbeat)
         if config['people']['enabled']:
             navigator.create_timer(0.02, self._retry_scan_transform)
@@ -160,6 +170,114 @@ class OptionalIdleRuntime:
 
     def _inhibited(self, message):
         self.inhibited = bool(message.data)
+
+    def _localization(self, message):
+        """Observe phase only; never publish localization readiness ourselves."""
+        try:
+            payload = json.loads(message.data)
+            stamp = payload['sample_ros_stamp_ns']
+            age = (self.navigator.get_clock().now().nanoseconds-stamp)/1e9
+            if (not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0
+                    or not -.1 <= age <= 2. or not isinstance(payload.get('state'), str)):
+                return
+            if self.localization_status and stamp <= self.localization_status[1]:
+                return
+            self.localization_status = (time.monotonic(), stamp, payload['state'])
+        except (ValueError, KeyError, TypeError, OverflowError):
+            return
+
+    def _localization_phase(self):
+        if self.localization_status is None:
+            return None
+        at, stamp, phase = self.localization_status
+        age = (self.navigator.get_clock().now().nanoseconds-stamp)/1e9
+        return phase if 0 <= time.monotonic()-at <= 2. and -.1 <= age <= 2. else None
+
+    def _map_alignment(self):
+        """Compare map-to-odom correction, not physical tail rotation while stopping."""
+        try:
+            tr = self.buffer.lookup_transform('map', 'odom', Time()).transform
+            value = (tr.translation.x, tr.translation.y, yaw_of(tr.rotation))
+            return value if all(math.isfinite(v) for v in value) else None
+        except TransformException:
+            return None
+
+    def _can_wait_localization(self):
+        """Only brief SUSPECT can wait; stale sensors, manual/global recovery cannot."""
+        return (not self.ready() and self._localization_phase() in ('SUSPECT', 'LOCALIZED')
+                and self.map_matches and not self.inhibited
+                and (self.home is None or (self.home.healthy and not self.home.cutoff))
+                and self.last_odom is not None
+                and self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp)
+                and self.last_scan is not None
+                and self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp)
+                and self._pose() is not None)
+
+    def _begin_localization_wait(self, resume_state, deadline):
+        self.localization_pauses += 1
+        self.localization_resume_state = resume_state
+        self.localization_resume_deadline = deadline
+        limit = time.monotonic()+self.config['people'].get('localization_wait_sec', 20.)
+        self.localization_wait_deadline = min(limit, deadline)
+        if self.observation_session_deadline is not None:
+            self.localization_wait_deadline = min(self.localization_wait_deadline,
+                                                  self.observation_session_deadline)
+
+    def _poll_localization_wait(self):
+        """Own a bounded safe stop even while Delivery waits for readiness."""
+        now = time.monotonic()
+        if now >= self.localization_wait_deadline:
+            self._people_finished('people_localization_wait_timeout')
+            return True
+        phase = self._localization_phase()
+        if phase not in (None, 'SUSPECT', 'LOCALIZED'):
+            self._people_finished('people_localization_escalated:'+phase)
+            return True
+        if (phase != 'LOCALIZED' or not self._safe() or not self._stationary()
+                or self.last_scan is None
+                or not self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp)):
+            return True
+        target = self.localization_resume_state
+        changed = False
+        if target == 'going_observation':
+            self._start(self.config['people']['observation_pose'], target, '',
+                        self.localization_resume_deadline-now, resume=True)
+            return True
+        if target == 'observing':
+            alignment = self._map_alignment()
+            if alignment is None or self.observation_alignment is None:
+                self._people_finished('people_localization_alignment_unavailable')
+                return True
+            old = self.observation_alignment
+            position = self.last_odom[1].pose.pose.position
+            try:
+                distance, angle = map_alignment_correction(old, alignment, position.x, position.y)
+            except ValueError:
+                self._people_finished('people_localization_alignment_invalid')
+                return True
+            changed = distance > .10 or angle > .10
+            if changed:
+                if self.localization_restarts >= 1:
+                    self._people_finished('people_localization_repeated_alignment_change')
+                    return True
+                self.people = DirectionalPeople(self.config['people'])
+                self.spin_travel = 0.
+                self.localization_restarts += 1
+                self.observation_alignment = alignment
+            self.state = 'waiting_observation_retry'
+        else:
+            self.state = 'waiting_observation_stop'
+        self.reason = 'localization_recovered_recollecting' if target == 'observing' and changed else 'localization_recovered'
+        self.scan_history.clear()
+        self.pending_scan = None
+        self.scan_evidence_error = self.scan_evidence_reason = ''
+        self.spin_cache = None
+        self._reset_spin_ready()
+        self.deadline = now+self.config['people']['spin_ready_wait_sec']
+        if self.observation_session_deadline is not None:
+            self.deadline = min(self.deadline, self.observation_session_deadline)
+        self._log_people_state()
+        return True
 
     def _scan(self, message):
         now = time.monotonic()
@@ -332,6 +450,12 @@ class OptionalIdleRuntime:
         payload = json.loads(message.data)
         payload['observed_heading_coverage'] = None if self.people is None else round(
             len(self.people.headings)/self.people.count, 3)
+        payload['people_demand'] = (self.people.summary(self.config['people']['observation_pose'])
+            if self.people is not None and hasattr(self.people, 'summary') else None)
+        payload['localization_pauses'] = self.localization_pauses
+        payload['localization_restarts'] = self.localization_restarts
+        payload['localization_wait_remaining_sec'] = (None if self.state != 'waiting_people_localization'
+            else round(max(0., self.localization_wait_deadline-time.monotonic()), 2))
         message.data = json.dumps(payload)
         self.status_pub.publish(message)
         self._log_people_state()
@@ -343,6 +467,7 @@ class OptionalIdleRuntime:
         labels = {'idle': '待機／冷卻', 'going_observation': '前往人流分析點',
                   'waiting_observation_stop': '已到分析點，等待停妥及連續安全雷達',
                   'observing': '人流自旋分析', 'waiting_observation_retry': '自旋已取消，停妥後等待安全續轉',
+                  'waiting_people_localization': '人流安全暫停，有限等待定位恢復',
                   'people_destination_selected': '分析完成，已選出人流待機點',
                   'going_people_standby': '分析完成，前往／補停選定待機點',
                   'people_arrival_check': '分析完成，確認待機點抵達',
@@ -351,7 +476,7 @@ class OptionalIdleRuntime:
         key = (self.state, self.reason, self.parking_attempts, self.parking_outcome)
         now = time.monotonic()
         transition = key != self.log_key
-        progress = self.state in ('observing', 'waiting_observation_retry') and now-self.last_progress_log >= 5.
+        progress = self.state in ('observing', 'waiting_observation_retry', 'waiting_people_localization') and now-self.last_progress_log >= 5.
         if not transition and not progress:
             return
         self.log_key, self.last_progress_log = key, now
@@ -536,7 +661,8 @@ class OptionalIdleRuntime:
         return False
 
     def _vision(self, message):
-        if not self.observation_collecting or self.people is None:
+        if (not self.observation_collecting or self.people is None
+                or self.state != 'observing' or self.cancel_requested or not self._safe()):
             return
         try:
             payload = json.loads(message.data)
@@ -584,7 +710,7 @@ class OptionalIdleRuntime:
             self.spin_resume_anchor = self.spin_travel
             if resume:
                 self.spin_resume_requests += 1
-        if state == 'going_observation':
+        if state == 'going_observation' and not resume:
             self.analysis_completed, self.analysis_completed_at = False, None
             self.selected_standby = None
             self.parking_retry.reset()
@@ -595,6 +721,9 @@ class OptionalIdleRuntime:
             self.spin_resume_requests = 0
             self.people = None
             self.guard_report = {}
+            self.localization_pauses = self.localization_restarts = 0
+            self.localization_wait_deadline = self.localization_resume_deadline = None
+            self.observation_alignment = None
         if state == 'observing' and self.observation_session_deadline is not None:
             self.deadline = min(self.deadline, self.observation_session_deadline)
         self._log_people_state()
@@ -667,6 +796,9 @@ class OptionalIdleRuntime:
         self._reset_spin_ready()
         self._remove_spin_tree()
         selected = self.people.select(self.config['people']['observation_pose']) if self.people else None
+        if self.people is not None and hasattr(self.people, 'summary'):
+            self.navigator.get_logger().info('人流分析結果：'+json.dumps(
+                self.people.summary(self.config['people']['observation_pose']), ensure_ascii=False))
         if selected is None:
             self._people_finished('insufficient_directional_demand')
         else:
@@ -703,12 +835,40 @@ class OptionalIdleRuntime:
             self.idle_clock.reset()
         if (not self.motion and self.state in (
                 'waiting_observation_stop', 'waiting_observation_retry',
+                'waiting_people_localization',
                 'people_destination_selected', 'people_arrival_check', 'people_parking_retry_wait',
                 'people_parking_blocked')
                 and (has_work or self.stop_accepting)):
             # A service can start between auxiliary actions. Never resume an
             # old observation/parking decision from a different position.
             self._people_finished('observation_preempted_between_actions')
+        if not self.motion and self.state == 'waiting_people_localization':
+            phase = self._localization_phase()
+            if (time.monotonic() >= self.localization_wait_deadline
+                    or phase not in (None, 'SUSPECT', 'LOCALIZED')):
+                # Expiration/escalation is not paused by an external recovery
+                # spin. Still keep the independent stop proof before service.
+                reason = ('people_localization_wait_timeout' if time.monotonic() >= self.localization_wait_deadline
+                          else 'people_localization_escalated:'+phase)
+                self._people_finished(reason)
+                return True
+            if self.settling_after_cancel:
+                pass  # Keep the existing stop/drain proof below before resuming.
+            else:
+                return self._poll_localization_wait()
+        if (not self.motion and self.state in ('waiting_observation_stop', 'waiting_observation_retry')
+                and self.localization_pauses < 2 and self._can_wait_localization()):
+            self._begin_localization_wait('observing' if self.people else 'waiting_observation_stop',
+                self.observation_session_deadline or time.monotonic()+self.config['people'].get('localization_wait_sec', 20.))
+            self.state, self.reason = 'waiting_people_localization', 'localization_suspect'
+            return True
+        if (not self.motion and self.state in ('waiting_observation_stop', 'waiting_observation_retry')
+                and not self._safe()):
+            # Do not retain directional data through an unrelated global spin,
+            # missing sensors or manual recovery while Delivery's outer gate waits.
+            self._people_finished('observation_wait_unsafe')
+            self.settling_after_cancel, self.stop_since = True, None
+            return True
         if not self.motion:
             if self.settling_after_cancel:
                 if self._stationary():
@@ -725,12 +885,19 @@ class OptionalIdleRuntime:
         if self.state != 'going_home' and (has_work or self.stop_accepting):
             reason = 'observation_preempted_by_service_or_battery'
         elif not self._safe():
-            reason = 'unsafe_localization_or_odom_or_battery'
+            if (self.state in ('going_observation', 'observing') and self.localization_pauses < 2
+                    and self._can_wait_localization()):
+                reason = 'localization_suspect'
+            else:
+                reason = 'unsafe_localization_or_odom_or_battery'
         elif time.monotonic() >= self.deadline:
             reason = 'observation_or_navigation_timeout'
         elif self.state == 'observing' and not self._clear_to_spin(False):
             reason = self.guard_report.get('reason', 'spin_safety_rejected')
         if reason and not self.cancel_requested:
+            if reason == 'localization_suspect':
+                self._begin_localization_wait(self.state, self.deadline if self.state == 'going_observation'
+                    else self.observation_session_deadline or self.deadline)
             self.cancel_requested = True
             self.cancel_started = time.monotonic()
             self.interrupt_reason = reason
@@ -785,6 +952,11 @@ class OptionalIdleRuntime:
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
+            elif self.interrupt_reason == 'localization_suspect':
+                self.state, self.reason = 'waiting_people_localization', 'localization_suspect'
+                self._reset_spin_ready()
+                self.spin_resume_pending = False
+                self._log_people_state()
             elif (self.state == 'going_people_standby' and self.interrupt_reason in (
                     None, 'observation_or_navigation_timeout')):
                 self._parking_failed(self.interrupt_reason or 'parking_nav2_failed')
@@ -870,6 +1042,8 @@ class OptionalIdleRuntime:
         people = self.config['people']
         if self.motion:
             return True
+        if self.state == 'waiting_people_localization':
+            return self._poll_localization_wait()
         if self.state in ('waiting_observation_stop', 'waiting_observation_retry'):
             if self.settling_after_cancel:
                 return True
@@ -891,6 +1065,9 @@ class OptionalIdleRuntime:
             if retry and self.spin_travel >= 5.8 and self._stationary():
                 self._finish_people_scan()
                 return True
+            if retry and (self.spin_resumes >= people['max_spin_resumes'] or self.spin_resume_requests >= 4):
+                self._people_finished('spin_resume_budget_exhausted')
+                return True
             if self._spin_start_ready():
                 if retry:
                     tree = self._resume_spin_tree()
@@ -898,6 +1075,7 @@ class OptionalIdleRuntime:
                         self.spin_ready_blocker = 'nav2_not_ready'
                     return True
                 self.people = DirectionalPeople(people)
+                self.observation_alignment = self._map_alignment()
                 self.spin_travel = 0.0
                 self.spin_resumes = 0
                 self.observation_session_deadline = now+people['observation_session_timeout_sec']

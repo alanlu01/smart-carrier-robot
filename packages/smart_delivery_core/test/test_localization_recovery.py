@@ -12,6 +12,7 @@ from smart_delivery_core.localization_health import EvidenceWaitClock, pose_qual
 from smart_delivery_core.pipeline_health import ReceiptMetrics, ScanPairMetrics
 from smart_delivery_core.degraded_localization import MildMapGuard
 from smart_delivery_core.stationary_map_guard import StationaryMapGuard
+from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
 
 
 @pytest.fixture
@@ -74,6 +75,7 @@ def manager(monkeypatch):
         suspect_since=100.0, suspect_hold=5.0, suspect_max=12.0,
         suspect_promising_max=30.0,
         last_state_publish_at=100.0,
+        quality_history=LocalizationQualityHistory(),
     )
     cov = [0.0] * 36
     cov[0] = cov[7] = 0.20 ** 2
