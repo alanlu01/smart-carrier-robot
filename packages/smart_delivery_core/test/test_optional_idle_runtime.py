@@ -143,7 +143,8 @@ def test_home_finishes_instead_of_being_preempted_by_new_unstarted_orders(runtim
 
 
 @pytest.mark.parametrize('state', [
-    'waiting_observation_stop', 'people_destination_selected', 'people_arrival_check'])
+    'waiting_observation_stop', 'people_destination_selected', 'people_arrival_check',
+    'people_parking_retry_wait', 'people_parking_blocked'])
 def test_new_service_discards_an_observation_between_actions(runtime, state):
     manager, navigator, _ = runtime
     manager.state = state

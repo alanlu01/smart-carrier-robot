@@ -190,6 +190,8 @@ def test_successful_spin_stops_before_selected_parking_goal(runtime):
     moment[0]+=1.1
     assert not manager.poll(False)
     manager.idle()
+    moment[0]+=1.1
+    manager.idle()
     assert manager.state=='going_people_standby' and len(navigator.sent)==2
 
 

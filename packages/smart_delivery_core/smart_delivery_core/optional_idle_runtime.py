@@ -22,6 +22,7 @@ from tf2_ros import ExtrapolationException, TransformException
 from smart_delivery_core.optional_idle import DirectionalPeople, HomeVoltageLatch, occupancy_fingerprint
 from smart_delivery_core.standby_idle_clock import StandbyIdleClock
 from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
+from smart_delivery_core.standby_retry import StandbyRetryPolicy
 
 STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -86,6 +87,15 @@ class OptionalIdleRuntime:
         self.spin_resume_pending = False
         self.spin_resume_anchor = 0.
         self.people_failures = 0
+        self.analysis_completed = False
+        self.analysis_completed_at = None
+        self.selected_standby = None
+        self.parking_retry = StandbyRetryPolicy(retry_delay=2.)
+        self.parking_attempts = 0
+        self.parking_outcome = 'not_started'
+        self.parking_last_failure = ''
+        self.parking_deadline = 0.
+        self.parking_stop_since = None
         self.observation_collecting = False
         self.observation_session_deadline = None
         self.observation_tree_path = None
@@ -294,6 +304,14 @@ class OptionalIdleRuntime:
                                    'home_latched': self.home_requested, 'map_matches': self.map_matches,
                                    'stop_claim_latched': self.stop_accepting,
                                    'accepting_tasks': self.accepting_tasks,
+                                   'analysis_completed': self.analysis_completed,
+                                   'selected_standby': self.selected_standby,
+                                   'parking_outcome': self.parking_outcome,
+                                   'parking_attempts': self.parking_attempts,
+                                   'parking_max_attempts': self.parking_retry.max_attempts,
+                                   'parking_last_failure': self.parking_last_failure,
+                                   'parking_retry_in_sec': (max(0.,self.parking_retry.retry_at-time.monotonic())
+                                       if self.state=='people_parking_retry_wait' else None),
                                    'spin_progress_deg': round(math.degrees(self.spin_travel), 1),
                                    'spin_resume_count': self.spin_resumes,
                                    'spin_resume_requests': self.spin_resume_requests,
@@ -325,9 +343,12 @@ class OptionalIdleRuntime:
         labels = {'idle': '待機／冷卻', 'going_observation': '前往人流分析點',
                   'waiting_observation_stop': '已到分析點，等待停妥及連續安全雷達',
                   'observing': '人流自旋分析', 'waiting_observation_retry': '自旋已取消，停妥後等待安全續轉',
-                  'people_destination_selected': '已選出人流待機點',
-                  'going_people_standby': '前往選定待機點', 'people_arrival_check': '確認待機點抵達'}
-        key = (self.state, self.reason)
+                  'people_destination_selected': '分析完成，已選出人流待機點',
+                  'going_people_standby': '分析完成，前往／補停選定待機點',
+                  'people_arrival_check': '分析完成，確認待機點抵達',
+                  'people_parking_retry_wait': '分析完成，等待停妥後有限補停',
+                  'people_parking_blocked': '分析完成，補停額度用盡；未確認抵達，原地等候新任務'}
+        key = (self.state, self.reason, self.parking_attempts, self.parking_outcome)
         now = time.monotonic()
         transition = key != self.log_key
         progress = self.state in ('observing', 'waiting_observation_retry') and now-self.last_progress_log >= 5.
@@ -336,9 +357,10 @@ class OptionalIdleRuntime:
         self.log_key, self.last_progress_log = key, now
         point = self.goal or {}
         self.navigator.get_logger().info(
-            '人流｜%s；原因=%s；目標=%s；進度=%.1f°；續轉=%d/%d；冷卻剩餘=%.0fs；安全=%s' %
+            '人流｜%s；原因=%s；目標=%s；進度=%.1f°；續轉=%d/%d；分析完成=%s；停靠=%s(%d/%d)；冷卻剩餘=%.0fs；安全=%s' %
             (labels.get(self.state, self.state), self.reason or '正常', point.get('name', '-'),
              math.degrees(self.spin_travel), self.spin_resumes, self.config['people']['max_spin_resumes'],
+             self.analysis_completed, self.parking_outcome, self.parking_attempts, self.parking_retry.max_attempts,
              max(0., self.next_people_at-now), json.dumps(self.guard_report, ensure_ascii=False)))
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
@@ -563,6 +585,11 @@ class OptionalIdleRuntime:
             if resume:
                 self.spin_resume_requests += 1
         if state == 'going_observation':
+            self.analysis_completed, self.analysis_completed_at = False, None
+            self.selected_standby = None
+            self.parking_retry.reset()
+            self.parking_attempts, self.parking_outcome = 0, 'not_started'
+            self.parking_last_failure, self.parking_stop_since = '', None
             self.spin_travel = 0.0
             self.spin_resumes = 0
             self.spin_resume_requests = 0
@@ -573,14 +600,30 @@ class OptionalIdleRuntime:
         self._log_people_state()
         return True
 
-    def _people_finished(self, reason):
-        successful = reason in ('parked_at_selected_standby', 'insufficient_directional_demand')
+    def _people_finished(self, reason, terminal_state='idle'):
+        successful = self.analysis_completed or reason in (
+            'parked_at_selected_standby', 'insufficient_directional_demand')
         preempted = reason.startswith('observation_preempted')
+        if reason == 'parked_at_selected_standby':
+            self.parking_outcome = 'parked'
+        elif reason == 'insufficient_directional_demand':
+            self.parking_outcome = 'not_needed'
+        elif self.analysis_completed and preempted:
+            self.parking_outcome = 'preempted'
+        elif self.analysis_completed and self.parking_outcome not in ('parked','not_needed','failed'):
+            self.parking_outcome = 'interrupted'
+        self.parking_stop_since = None
         self.people_failures = 0 if successful else self.people_failures if preempted else self.people_failures+1
-        self.state, self.reason = 'idle', reason
+        self.state, self.reason = terminal_state, reason
         long_wait = successful or self.people_failures >= self.config['people']['max_consecutive_failures']
-        self.next_people_at = time.monotonic() + self.config['people'][
-            'cooldown_sec' if long_wait else 'failure_cooldown_sec']
+        if self.analysis_completed and self.analysis_completed_at is not None:
+            # A later parking failure/preemption must not turn a completed
+            # scan into a 30-second failure cycle, nor keep extending its age.
+            self.next_people_at = max(self.next_people_at,
+                self.analysis_completed_at+self.config['people']['cooldown_sec'])
+        else:
+            self.next_people_at = time.monotonic() + self.config['people'][
+                'cooldown_sec' if long_wait else 'failure_cooldown_sec']
         if long_wait:
             self.people_failures = 0
         self.idle_since = None
@@ -618,15 +661,40 @@ class OptionalIdleRuntime:
 
     def _finish_people_scan(self):
         self.observation_collecting = False
+        self.analysis_completed, self.analysis_completed_at = True, time.monotonic()
+        self.people_failures = 0
+        self.next_people_at = self.analysis_completed_at+self.config['people']['cooldown_sec']
         self._reset_spin_ready()
         self._remove_spin_tree()
         selected = self.people.select(self.config['people']['observation_pose']) if self.people else None
         if selected is None:
             self._people_finished('insufficient_directional_demand')
         else:
-            self.goal, self.state = selected, 'people_destination_selected'
+            self.selected_standby = dict(selected)
+            self.goal, self.state = dict(selected), 'people_destination_selected'
+            self.parking_retry.select_goal(selected)
+            self.parking_attempts, self.parking_outcome = 0, 'selected'
+            self.parking_stop_since = None
+            # First route retains its normal timeout; at most two 30s
+            # corrections, verification/backoff and stop checks fit in +90s.
+            self.parking_deadline = time.monotonic()+self.config['people']['navigation_timeout_sec']+90.
             self.reason = 'full_scan_completed'
             self._log_people_state()
+
+    def _parking_failed(self, reason):
+        """Retry only the selected parking pose, never redo a completed scan."""
+        self.parking_last_failure = reason
+        self.parking_stop_since = None
+        self.parking_retry.failed(time.monotonic())
+        if (self.parking_retry.failures >= self.parking_retry.max_attempts
+                or time.monotonic() >= self.parking_deadline):
+            self.parking_outcome = 'failed'
+            self._people_finished('selected_standby_parking_failed:'+reason,
+                                  terminal_state='people_parking_blocked')
+            return
+        self.state, self.reason = 'people_parking_retry_wait', reason
+        self.parking_outcome = 'retry_wait'
+        self._log_people_state()
 
     def poll(self, has_work):
         """Cancel on unsafe data/new service work and drain before any new goal."""
@@ -635,7 +703,8 @@ class OptionalIdleRuntime:
             self.idle_clock.reset()
         if (not self.motion and self.state in (
                 'waiting_observation_stop', 'waiting_observation_retry',
-                'people_destination_selected', 'people_arrival_check')
+                'people_destination_selected', 'people_arrival_check', 'people_parking_retry_wait',
+                'people_parking_blocked')
                 and (has_work or self.stop_accepting)):
             # A service can start between auxiliary actions. Never resume an
             # old observation/parking decision from a different position.
@@ -685,6 +754,8 @@ class OptionalIdleRuntime:
                 self.navigation_active(False)
                 if self.state == 'going_home':
                     self.state, self.reason = 'home_failed', 'goal_rejected'
+                elif self.state == 'going_people_standby':
+                    self._parking_failed('goal_rejected')
                 else:
                     self._people_finished('goal_rejected')
                 return False
@@ -714,6 +785,9 @@ class OptionalIdleRuntime:
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
+            elif (self.state == 'going_people_standby' and self.interrupt_reason in (
+                    None, 'observation_or_navigation_timeout')):
+                self._parking_failed(self.interrupt_reason or 'parking_nav2_failed')
             elif (self.state == 'observing' and self.interrupt_reason in RETRYABLE_SPIN_STOPS
                   and self.spin_resumes < self.config['people']['max_spin_resumes']
                   and self.spin_resume_requests < 4
@@ -743,6 +817,8 @@ class OptionalIdleRuntime:
                 self._finish_people_scan()
         elif self.state == 'going_people_standby':
             self.state = 'people_arrival_check'
+            self.parking_outcome = 'verifying'
+            self.parking_stop_since = None
             self.deadline = time.monotonic() + 5.0
         return self.settling_after_cancel
 
@@ -831,17 +907,42 @@ class OptionalIdleRuntime:
                                   people['observation_timeout_sec']):
                     self.spin_ready_blocker = 'nav2_not_ready'
             return True
-        if self.state == 'people_destination_selected':
-            self._start(self.goal, 'going_people_standby', '', people['navigation_timeout_sec'])
-            return True
-        if self.state == 'people_arrival_check':
-            if self._safe() and self._stationary() and self._at_goal(self.goal, 0.10, 0.10):
-                self.parked_point = dict(self.goal)
-                self._people_finished('parked_at_selected_standby')
-                # Let the ordinary delivery flow know that parking is complete.
+        if self.state in ('people_destination_selected', 'people_parking_retry_wait'):
+            if now >= self.parking_deadline:
+                self.parking_outcome = 'failed'
+                self._people_finished('selected_standby_parking_timeout',
+                                      terminal_state='people_parking_blocked')
                 return True
-            if now >= self.deadline:
-                self._people_finished('standby_arrival_not_verified')
+            if not self._safe():
+                self._people_finished('selected_standby_parking_unsafe')
+                return True
+            if not self._stationary():
+                self.parking_stop_since = None
+                return True
+            self.parking_stop_since = self.parking_stop_since if self.parking_stop_since is not None else now
+            if now-self.parking_stop_since < 1. or not self.parking_retry.can_attempt(now):
+                return True
+            timeout = people['navigation_timeout_sec'] if self.parking_attempts==0 else 30.
+            if self._start(self.selected_standby, 'going_people_standby', '',
+                           min(timeout,self.parking_deadline-now)):
+                self.parking_attempts += 1
+                self.parking_outcome = 'navigating' if self.parking_attempts==1 else 'correcting'
+                self.parking_stop_since = None
+                self._log_people_state()
+            return True
+        if self.state in ('people_arrival_check', 'people_parking_blocked'):
+            if self._safe() and self._stationary() and self._at_goal(self.goal, 0.10, 0.10):
+                self.parking_stop_since = self.parking_stop_since if self.parking_stop_since is not None else now
+                if now-self.parking_stop_since >= 1.:
+                    self.parked_point = dict(self.goal)
+                    self._people_finished('parked_at_selected_standby')
+                    # Let ordinary delivery know parking is verified, not just
+                    # that Nav2 returned SUCCEEDED a few milliseconds earlier.
+                    return True
+            else:
+                self.parking_stop_since = None
+            if self.state == 'people_arrival_check' and now >= self.deadline:
+                self._parking_failed('standby_arrival_not_verified')
             return True
         pose = self._pose()
         odom = None if self.last_odom is None else self.last_odom[1].pose.pose
