@@ -161,23 +161,23 @@ def test_service_preempts_inflight_parking_but_drains_cancel_first(runtime):
     assert len(navigator.sent) == 1
 
 
-def test_localization_loss_does_not_start_a_parking_correction(runtime):
+def test_localization_loss_waits_without_starting_a_parking_correction(runtime):
     manager,navigator,moment,_ = completed_analysis(runtime)
     manager.state = 'people_parking_retry_wait'
     manager._safe = lambda: False
     manager.idle()
-    assert manager.state == 'idle' and manager.parking_outcome == 'interrupted'
+    assert manager.state == 'waiting_people_parking_recovery' and manager.parking_outcome == 'waiting_recovery'
     assert manager.next_people_at == 700. and not navigator.sent
 
 
-def test_localization_loss_during_parking_cancels_without_retry(runtime):
+def test_localization_loss_during_parking_cancels_before_waiting(runtime):
     manager,navigator,moment,_ = completed_analysis(runtime)
     start_parking(manager,navigator,moment)
     manager._safe = lambda: False
     manager.poll(False)
     navigator.complete,navigator.result = True,TaskResult.CANCELED
     manager.poll(False)
-    assert manager.state == 'idle' and manager.parking_outcome == 'interrupted'
+    assert manager.state == 'waiting_people_parking_recovery' and manager.parking_outcome == 'waiting_recovery'
     assert manager.parking_retry.failures == 0 and manager.next_people_at == 700.
 
 

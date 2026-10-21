@@ -33,9 +33,19 @@ class DeliveryNavigator(BasicNavigator):
         previous = None
         phase, error = 'waiting_service', ''
         service = f'{node_name}/get_state'
+        providers = None
+        graph_at = -float('inf')
         try:
             while rclpy.ok() and time.monotonic()-started < self.STARTUP_TIMEOUT:
                 now = time.monotonic()
+                if now-graph_at >= 2.:
+                    graph_at = now
+                    try:
+                        namespace, _, leaf = ('/'+node_name.strip('/')).rpartition('/')
+                        providers = sum(name == leaf and ns == (namespace or '/')
+                                        for name, ns in self.get_node_names_and_namespaces())
+                    except (AttributeError, RuntimeError):
+                        providers = None
                 if client is None and now >= retry_at:
                     try:
                         client = self.create_client(GetState, service)
@@ -54,7 +64,10 @@ class DeliveryNavigator(BasicNavigator):
                             response = future.result()
                             if response is None:
                                 raise RuntimeError('empty lifecycle response')
+                            if providers is not None and providers > 1:
+                                raise RuntimeError(f'duplicate Nav2 nodes: {node_name}, count={providers}')
                             if response.current_state.id == 3 and response.current_state.label == 'active':
+                                error = ''
                                 phase = 'ready'
                             else:
                                 error = f'lifecycle state={response.current_state.label}'
@@ -68,7 +81,12 @@ class DeliveryNavigator(BasicNavigator):
                 if key != previous or now-last_status_at >= 5.0:
                     payload = {'state': phase, 'service': service, 'attempts': attempts,
                                'elapsed_sec': round(now-started, 2),
-                               'timeout_sec': self.STARTUP_TIMEOUT, 'reason': error}
+                               'timeout_sec': self.STARTUP_TIMEOUT, 'reason': error,
+                               'matching_node_count': providers,
+                               'hint': ('Nav2 尚未 active；請檢查 start_nav，勿重複啟動'
+                                        if phase == 'waiting_activation' else
+                                        '若有重複 Nav2／同名服務，請先正常結束舊程序'
+                                        if providers and providers > 1 else '')}
                     message = String()
                     message.data = json.dumps(payload)
                     self.startup_pub.publish(message)

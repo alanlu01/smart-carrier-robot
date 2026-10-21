@@ -111,6 +111,13 @@ class OptionalIdleRuntime:
         self.localization_resume_deadline = None
         self.localization_wait_deadline = None
         self.observation_alignment = None
+        self.safety_report = {}
+        self.last_unsafe_report = None
+        self.pose_report = {}
+        self.safety_log_key = None
+        self.safety_log_at = -float('inf')
+        self.parking_recovery_deadline = None
+        self.parking_recovery_pauses = 0
         self.latch_path = Path.home() / '.ros/smart_carrier_home_latch.json'
         self.home = None
         if config['home']['enabled']:
@@ -456,6 +463,11 @@ class OptionalIdleRuntime:
         payload['localization_restarts'] = self.localization_restarts
         payload['localization_wait_remaining_sec'] = (None if self.state != 'waiting_people_localization'
             else round(max(0., self.localization_wait_deadline-time.monotonic()), 2))
+        payload['safety_check'] = self.safety_report
+        payload['last_unsafe_check'] = self.last_unsafe_report
+        payload['parking_recovery_pauses'] = self.parking_recovery_pauses
+        payload['parking_recovery_remaining_sec'] = (None if self.parking_recovery_deadline is None
+            else round(max(0.,self.parking_recovery_deadline-time.monotonic()),2))
         message.data = json.dumps(payload)
         self.status_pub.publish(message)
         self._log_people_state()
@@ -470,6 +482,7 @@ class OptionalIdleRuntime:
                   'waiting_people_localization': '人流安全暫停，有限等待定位恢復',
                   'people_destination_selected': '分析完成，已選出人流待機點',
                   'going_people_standby': '分析完成，前往／補停選定待機點',
+                  'waiting_people_parking_recovery': '保留人流待機選點，停妥並有限等待定位／感測恢復',
                   'people_arrival_check': '分析完成，確認待機點抵達',
                   'people_parking_retry_wait': '分析完成，等待停妥後有限補停',
                   'people_parking_blocked': '分析完成，補停額度用盡；未確認抵達，原地等候新任務'}
@@ -497,15 +510,20 @@ class OptionalIdleRuntime:
     def _pose(self, stamp=None):
         try:
             transform = self.buffer.lookup_transform('map', 'base_footprint', stamp or Time())
-        except TransformException:
+        except TransformException as exc:
+            self.pose_report = {'valid':False,'reason':'tf_lookup_failed','detail':str(exc)[:500]}
             return None
         now = self.navigator.get_clock().now().nanoseconds
         source = transform.header.stamp.sec * 1_000_000_000 + transform.header.stamp.nanosec
-        if not -0.1 <= (now - source) / 1e9 <= 0.30:
+        age = (now-source)/1e9
+        self.pose_report = {'valid':False,'reason':'tf_stale','source_age_sec':round(age,4)}
+        if not -0.1 <= age <= 0.30:
             return None
         pose = {'x': transform.transform.translation.x, 'y': transform.transform.translation.y,
                 'yaw': yaw_of(transform.transform.rotation)}
-        return pose if all(math.isfinite(value) for value in pose.values()) else None
+        valid = all(math.isfinite(value) for value in pose.values())
+        self.pose_report.update(valid=valid,reason='healthy' if valid else 'tf_nonfinite')
+        return pose if valid else None
 
     def _stationary(self):
         if not self.last_odom or not self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp):
@@ -516,14 +534,36 @@ class OptionalIdleRuntime:
                 and max(abs(values[0]),abs(values[1])) <= .02 and abs(values[2]) <= .03)
 
     def _safe(self):
+        battery_ok = True
         if self.home is not None:
             self.home.expire(time.monotonic())
-            if not self.home.healthy or self.home.cutoff:
-                return False
-        return (self.map_matches and self.ready() and not self.inhibited
-                and self.last_odom is not None
-                and self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp)
-                and self._pose() is not None)
+            battery_ok = self.home.healthy and not self.home.cutoff
+        ready = bool(self.ready())
+        odom_ok = (self.last_odom is not None
+                   and self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp))
+        pose_ok = self._pose() is not None
+        checks = {'map_matches':bool(self.map_matches),'delivery_ready':ready,
+                  'motion_allowed':not self.inhibited,'battery_healthy':bool(battery_ok),
+                  'odom_fresh':bool(odom_ok),'map_pose_valid':pose_ok}
+        failed = [key for key,value in checks.items() if not value]
+        now = time.monotonic()
+        self.safety_report = {'sample_ros_stamp_ns':self.navigator.get_clock().now().nanoseconds,
+            'safe':not failed,'failed_checks':failed,'checks':checks,
+            'localization_phase':self._localization_phase(),'tf':dict(self.pose_report),
+            'odom_receive_age_sec':None if self.last_odom is None else round(now-self.last_odom[0],4),
+            'odom_source_age_sec':None if self.last_odom is None else round(
+                (self.navigator.get_clock().now().nanoseconds-(self.last_odom[1].header.stamp.sec*1_000_000_000
+                 +self.last_odom[1].header.stamp.nanosec))/1e9,4)}
+        if failed:
+            self.last_unsafe_report = dict(self.safety_report)
+            key = tuple(failed)
+            if now-self.safety_log_at >= 5.:
+                self.navigator.get_logger().warning('人流安全檢查未通過：'+json.dumps(
+                    self.safety_report,ensure_ascii=False))
+                self.safety_log_key,self.safety_log_at = key,now
+        else:
+            self.safety_log_key = None
+        return not failed
 
     def _clear_to_spin(self, require_stationary=True):
         self.guard_report = self._spin_guard_report(require_stationary)
@@ -716,6 +756,8 @@ class OptionalIdleRuntime:
             self.parking_retry.reset()
             self.parking_attempts, self.parking_outcome = 0, 'not_started'
             self.parking_last_failure, self.parking_stop_since = '', None
+            self.parking_recovery_pauses = 0
+            self.parking_recovery_deadline = None
             self.spin_travel = 0.0
             self.spin_resumes = 0
             self.spin_resume_requests = 0
@@ -730,6 +772,7 @@ class OptionalIdleRuntime:
         return True
 
     def _people_finished(self, reason, terminal_state='idle'):
+        self.parking_recovery_deadline = None
         successful = self.analysis_completed or reason in (
             'parked_at_selected_standby', 'insufficient_directional_demand')
         preempted = reason.startswith('observation_preempted')
@@ -828,6 +871,54 @@ class OptionalIdleRuntime:
         self.parking_outcome = 'retry_wait'
         self._log_people_state()
 
+    def _parking_recovery_allowed(self):
+        """Retain only a completed map-bound destination, never old spin evidence."""
+        return (self.analysis_completed and self.selected_standby is not None
+                and self.selected_standby in self.config['people']['standby_points']
+                and self.map_matches and not self.inhibited and not self.stop_accepting
+                and (self.home is None or (self.home.healthy and not self.home.cutoff))
+                and self._localization_phase() not in ('MANUAL_REQUIRED','UNINITIALIZED','SEEDING'))
+
+    def _begin_parking_recovery(self, reason):
+        now = time.monotonic()
+        if (not self._parking_recovery_allowed() or self.parking_recovery_pauses >= 2
+                or now >= self.parking_deadline):
+            self._people_finished('selected_standby_recovery_unavailable:'+reason)
+            return False
+        self.parking_recovery_pauses += 1
+        self.parking_recovery_deadline = min(self.parking_deadline,now+90.)
+        self.state,self.reason = 'waiting_people_parking_recovery',reason
+        self.parking_outcome,self.parking_stop_since = 'waiting_recovery',None
+        self.observation_collecting = False
+        self._log_people_state()
+        return True
+
+    def _poll_parking_recovery(self):
+        now = time.monotonic()
+        if not self._parking_recovery_allowed():
+            self._people_finished('selected_standby_recovery_not_permitted')
+            return True
+        if now >= self.parking_recovery_deadline:
+            self._people_finished('selected_standby_recovery_timeout')
+            return True
+        if (self.settling_after_cancel or self._localization_phase() != 'LOCALIZED'
+                or not self._safe() or not self._stationary()
+                or self.last_scan is None
+                or not self._stamp_fresh(self.last_scan[0],self.last_scan[1].header.stamp)):
+            self.parking_stop_since = None
+            return True
+        # Independent stop proof after recovery, then a new goal in the SAME
+        # verified map. Never resume the canceled action or redo the crowd scan.
+        self.parking_stop_since = self.parking_stop_since if self.parking_stop_since is not None else now
+        if now-self.parking_stop_since < 1.:
+            return True
+        self.state,self.reason = 'people_parking_retry_wait','selected_standby_recovery_ready'
+        self.parking_outcome = 'retry_wait'
+        self.parking_recovery_deadline = None
+        self.parking_retry.retry_at = max(self.parking_retry.retry_at,now)
+        self._log_people_state()
+        return True
+
     def poll(self, has_work):
         """Cancel on unsafe data/new service work and drain before any new goal."""
         if has_work:
@@ -837,11 +928,19 @@ class OptionalIdleRuntime:
                 'waiting_observation_stop', 'waiting_observation_retry',
                 'waiting_people_localization',
                 'people_destination_selected', 'people_arrival_check', 'people_parking_retry_wait',
-                'people_parking_blocked')
+                'people_parking_blocked','waiting_people_parking_recovery')
                 and (has_work or self.stop_accepting)):
             # A service can start between auxiliary actions. Never resume an
             # old observation/parking decision from a different position.
             self._people_finished('observation_preempted_between_actions')
+        if not self.motion and self.state == 'waiting_people_parking_recovery':
+            # Cancellation/stop drainage below must still complete before any
+            # new motion, but the wait deadline must continue to expire.
+            if (time.monotonic() >= self.parking_recovery_deadline
+                    or not self._parking_recovery_allowed()):
+                self._poll_parking_recovery()
+            elif not self.settling_after_cancel:
+                return self._poll_parking_recovery()
         if not self.motion and self.state == 'waiting_people_localization':
             phase = self._localization_phase()
             if (time.monotonic() >= self.localization_wait_deadline
@@ -864,10 +963,21 @@ class OptionalIdleRuntime:
             return True
         if (not self.motion and self.state in ('waiting_observation_stop', 'waiting_observation_retry')
                 and not self._safe()):
-            # Do not retain directional data through an unrelated global spin,
-            # missing sensors or manual recovery while Delivery's outer gate waits.
-            self._people_finished('observation_wait_unsafe')
-            self.settling_after_cancel, self.stop_since = True, None
+            phase = self._localization_phase()
+            hard_failure = (phase not in (None,'SUSPECT','LOCALIZED')
+                or not self.map_matches or self.inhibited or self.stop_accepting
+                or (self.home is not None and (not self.home.healthy or self.home.cutoff)))
+            if hard_failure:
+                # Never preserve directional evidence through global/manual recovery.
+                self._people_finished('observation_wait_unsafe')
+                self.settling_after_cancel, self.stop_since = True, None
+            elif time.monotonic() >= self.deadline:
+                self._people_finished('spin_ready_timeout:unsafe_data')
+            else:
+                # No motion here: use the ORIGINAL 10s deadline for transient
+                # TF/receipt jitter; do not lengthen source freshness budgets.
+                self._reset_spin_ready()
+                self.spin_ready_blocker = 'waiting_fresh_safety_data'
             return True
         if not self.motion:
             if self.settling_after_cancel:
@@ -888,6 +998,8 @@ class OptionalIdleRuntime:
             if (self.state in ('going_observation', 'observing') and self.localization_pauses < 2
                     and self._can_wait_localization()):
                 reason = 'localization_suspect'
+            elif self.state == 'going_people_standby' and self._parking_recovery_allowed():
+                reason = 'selected_standby_safety_pause'
             else:
                 reason = 'unsafe_localization_or_odom_or_battery'
         elif time.monotonic() >= self.deadline:
@@ -957,6 +1069,8 @@ class OptionalIdleRuntime:
                 self._reset_spin_ready()
                 self.spin_resume_pending = False
                 self._log_people_state()
+            elif self.state == 'going_people_standby' and self.interrupt_reason == 'selected_standby_safety_pause':
+                self._begin_parking_recovery(self.interrupt_reason)
             elif (self.state == 'going_people_standby' and self.interrupt_reason in (
                     None, 'observation_or_navigation_timeout')):
                 self._parking_failed(self.interrupt_reason or 'parking_nav2_failed')
@@ -1044,13 +1158,27 @@ class OptionalIdleRuntime:
             return True
         if self.state == 'waiting_people_localization':
             return self._poll_localization_wait()
+        if self.state == 'waiting_people_parking_recovery':
+            return self._poll_parking_recovery()
         if self.state in ('waiting_observation_stop', 'waiting_observation_retry'):
             if self.settling_after_cancel:
                 return True
             retry = self.state == 'waiting_observation_retry'
-            if (retry and (not self._safe() or self.observation_session_deadline is None
+            if (retry and (self.observation_session_deadline is None
                           or now >= self.observation_session_deadline)):
                 self._people_finished('retry_localization_or_session_unavailable')
+                return True
+            if not self._safe():
+                phase = self._localization_phase()
+                if (phase not in (None,'SUSPECT','LOCALIZED') or not self.map_matches
+                        or self.inhibited or self.stop_accepting
+                        or (self.home is not None and (not self.home.healthy or self.home.cutoff))):
+                    self._people_finished('observation_wait_unsafe')
+                elif now >= self.deadline:
+                    self._people_finished('spin_ready_timeout:unsafe_data')
+                else:
+                    self._reset_spin_ready()
+                    self.spin_ready_blocker = 'waiting_fresh_safety_data'
                 return True
             if now >= self.deadline:
                 self._people_finished('spin_ready_timeout:'+self.spin_ready_blocker)
@@ -1086,13 +1214,13 @@ class OptionalIdleRuntime:
                     self.spin_ready_blocker = 'nav2_not_ready'
             return True
         if self.state in ('people_destination_selected', 'people_parking_retry_wait'):
-            if now >= self.parking_deadline:
+            if now >= self.parking_deadline or self.parking_attempts >= self.parking_retry.max_attempts:
                 self.parking_outcome = 'failed'
-                self._people_finished('selected_standby_parking_timeout',
+                self._people_finished('selected_standby_parking_timeout_or_attempt_limit',
                                       terminal_state='people_parking_blocked')
                 return True
             if not self._safe():
-                self._people_finished('selected_standby_parking_unsafe')
+                self._begin_parking_recovery('selected_standby_parking_unsafe')
                 return True
             if not self._stationary():
                 self.parking_stop_since = None

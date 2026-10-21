@@ -5,7 +5,10 @@
   <profiles>
     <transport_descriptors>
       <transport_descriptor><transport_id>robot_shm</transport_id><type>SHM</type></transport_descriptor>
-      <transport_descriptor><transport_id>robot_udp</transport_id><type>UDPv4</type></transport_descriptor>
+      <!-- A congested remote link must not hold the UDP sender in send_to().
+           A full socket may drop datagrams; normal DDS reliability/retry and
+           existing sensor freshness/stop guards remain in force. -->
+      <transport_descriptor><transport_id>robot_udp</transport_id><type>UDPv4</type><non_blocking_send>true</non_blocking_send></transport_descriptor>
     </transport_descriptors>
     <participant profile_name="robot_sensor_transport" is_default_profile="true">
       <rtps><userTransports><transport_id>robot_shm</transport_id><transport_id>robot_udp</transport_id></userTransports><useBuiltinTransports>false</useBuiltinTransports></rtps>

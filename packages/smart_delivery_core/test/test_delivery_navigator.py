@@ -80,3 +80,19 @@ def test_client_creation_failure_is_bounded_and_retried(monkeypatch):
     node._waitForNodeToActivate('bt_navigator')
     assert len(calls)==2 and 1. <= clock.now < 2.
     assert len(node.destroyed)==1
+
+
+def test_duplicate_target_nodes_never_grant_ready_even_if_one_replies_active(monkeypatch):
+    node,clock=harness(monkeypatch,['active'])
+    node.get_node_names_and_namespaces=lambda:[('bt_navigator','/'),('bt_navigator','/')]
+    with pytest.raises(module.Nav2StartupUnavailable,match='duplicate Nav2'):
+        node._waitForNodeToActivate('bt_navigator')
+    assert not any('"state": "ready"' in m.data for m in node.messages)
+    assert clock.now >= 30.
+
+
+def test_other_namespaces_do_not_look_like_duplicate_root_target(monkeypatch):
+    node,_=harness(monkeypatch,['active'])
+    node.get_node_names_and_namespaces=lambda:[('bt_navigator','/'),('bt_navigator','/other')]
+    node._waitForNodeToActivate('bt_navigator')
+    assert '"state": "ready"' in node.messages[-1].data

@@ -2,13 +2,15 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler
+from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
 from smart_delivery_core.optional_nav_profile import OptionalNavParameters
+from smart_delivery_core.navigation_launch_guard import NavigationLaunchLease
 
 
 def generate_launch_description():
@@ -91,6 +93,14 @@ def generate_launch_description():
         output="screen",
     )
 
+    def guarded_start(context):
+        lease = NavigationLaunchLease().acquire()
+        def release(context):
+            lease.close()
+            return []
+        return [RegisterEventHandler(OnShutdown(on_shutdown=[OpaqueFunction(function=release)])),
+                nav2, localization_manager, delivery_goal_guard]
+
     return LaunchDescription(
         [
             map_argument,
@@ -99,8 +109,6 @@ def generate_launch_description():
             behavior_tree_argument,
             use_sim_time_argument,
             auto_initialize_argument,
-            nav2,
-            localization_manager,
-            delivery_goal_guard,
+            OpaqueFunction(function=guarded_start),
         ]
     )

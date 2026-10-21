@@ -235,6 +235,7 @@ def test_service_or_localization_loss_still_preempts_retry(runtime):
     manager.state = 'waiting_observation_retry'
     manager.observation_session_deadline, manager.deadline = 190., 110.
     manager._safe = lambda: False
+    manager._localization_phase = lambda: 'RECOVERING_GLOBAL'
     manager.idle()
     assert manager.state == 'idle' and not navigator.sent
     manager.state = 'waiting_observation_retry'

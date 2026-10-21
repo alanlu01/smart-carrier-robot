@@ -77,7 +77,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261020-people-quality-and-lidar-timing\n'
+  printf 'diagnostic_schema=20261021-parking-recovery-and-transport-audit\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \
@@ -97,6 +97,7 @@ fi
   fi
   sha256sum "$RECORD_DIR/config_snapshot/"* "$RECORD_DIR/recording_qos.yaml" 2>/dev/null || true
 } > "$RECORD_DIR/environment.txt" 2>&1
+python3 "$(dirname "$0")/audit_sensor_transport.py" > "$RECORD_DIR/sensor_transport_audit_start.json" 2>&1 || true
 # New timing fields travel in EXISTING /localization/state and
 # /chassis/feedback_health; no old topic is removed and no raw images are added.
 
@@ -115,7 +116,7 @@ graph_snapshot > "$RECORD_DIR/graph_start.txt" 2>&1
 } > "$RECORD_DIR/topic_endpoints_start.txt" 2>&1
 
 system_monitor() {
-  local path iface
+  local path iface audit_sample=0
   while true; do
     printf '\n--- sample %s epoch=%s ---\n' "$(date --iso-8601=ns)" "$(date +%s.%N)"
     printf '[cpu_ticks]\n'; awk '/^cpu/ {print}' /proc/stat
@@ -141,6 +142,11 @@ system_monitor() {
     if command -v vcgencmd >/dev/null; then
       printf '[pi_throttling]\n'; timeout 2 vcgencmd get_throttled || true
     fi
+    if (( audit_sample % 6 == 0 )); then
+      printf '[sensor_transport_audit]\n'
+      timeout 3 python3 "$(dirname "$0")/audit_sensor_transport.py" || true
+    fi
+    audit_sample=$((audit_sample+1))
     sleep 5
   done
 }
@@ -168,6 +174,7 @@ printf '%s\t%s\n' "$END_TIME" recording_stop >> "$RECORD_DIR/events.tsv"
 cleanup
 MONITOR_PIDS=()
 graph_snapshot > "$RECORD_DIR/graph_end.txt" 2>&1
+python3 "$(dirname "$0")/audit_sensor_transport.py" > "$RECORD_DIR/sensor_transport_audit_end.json" 2>&1 || true
 timeout 20 ros2 bag info "$RECORD_DIR/rosbag" > "$RECORD_DIR/rosbag_info.txt" 2>&1
 INFO_EXIT="$?"
 printf '%s\n' "$INFO_EXIT" > "$RECORD_DIR/rosbag_info_exit_code.txt"

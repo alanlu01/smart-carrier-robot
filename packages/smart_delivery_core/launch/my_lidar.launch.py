@@ -36,6 +36,7 @@ def generate_launch_description():
             'FASTRTPS_DEFAULT_PROFILES_FILE': os.path.join(pkg_dir,'config','fastdds_sensor_publish.xml'),
             'FASTDDS_DEFAULT_PROFILES_FILE': os.path.join(pkg_dir,'config','fastdds_sensor_publish.xml'),
             'RMW_FASTRTPS_USE_QOS_FROM_XML': '1',
+            'RMW_FASTRTPS_PUBLICATION_MODE': 'ASYNCHRONOUS',
         },
         parameters=[filter_config],
         remappings=[

@@ -178,6 +178,7 @@ def test_unrelated_global_recovery_does_not_keep_old_pending_spin_evidence(runti
     manager.state = 'waiting_observation_retry'
     manager._safe = lambda: False
     manager._can_wait_localization = lambda: False
+    manager._localization_phase = lambda: 'RECOVERING_GLOBAL'
     assert manager.poll(False)
     assert manager.state == 'idle' and not manager.observation_collecting
     assert manager.settling_after_cancel and len(navigator.sent) == 1
