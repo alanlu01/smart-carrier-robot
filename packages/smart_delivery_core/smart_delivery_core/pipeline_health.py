@@ -2,7 +2,22 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from functools import wraps
 import time
+
+
+def timed_operation(name):
+    """Measure a node method without recording arguments or changing decisions."""
+    def decorate(function):
+        @wraps(function)
+        def measured(self, *args, **kwargs):
+            metrics = getattr(self, 'duration_metrics', None)
+            if metrics is None:
+                metrics = self.duration_metrics = DurationMetrics()
+            with metrics.measure(name):
+                return function(self, *args, **kwargs)
+        return measured
+    return decorate
 
 
 class ReceiptMetrics:

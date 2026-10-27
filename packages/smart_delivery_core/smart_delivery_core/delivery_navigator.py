@@ -6,6 +6,7 @@ from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
+from smart_delivery_core.delivery_console import startup_status
 
 
 class Nav2StartupUnavailable(RuntimeError):
@@ -35,6 +36,8 @@ class DeliveryNavigator(BasicNavigator):
         service = f'{node_name}/get_state'
         providers = None
         graph_at = -float('inf')
+        last_console_at = -float('inf')
+        previous_console = None
         try:
             while rclpy.ok() and time.monotonic()-started < self.STARTUP_TIMEOUT:
                 now = time.monotonic()
@@ -90,7 +93,10 @@ class DeliveryNavigator(BasicNavigator):
                     message = String()
                     message.data = json.dumps(payload)
                     self.startup_pub.publish(message)
-                    self.get_logger().info('Delivery啟動｜'+message.data)
+                    text = startup_status(phase,error,bool(providers and providers>1))
+                    if text != previous_console or now-last_console_at >= 5.:
+                        self.get_logger().info(text)
+                        previous_console,last_console_at = text,now
                     last_status_at, previous = now, key
                 if phase == 'ready':
                     return
@@ -111,6 +117,7 @@ class DeliveryNavigator(BasicNavigator):
                 'attempts': attempts, 'reason': reason, 'timeout_sec': self.STARTUP_TIMEOUT})
             if rclpy.ok():
                 self.startup_pub.publish(message)
+                self.get_logger().info(startup_status('failed',reason))
             raise Nav2StartupUnavailable(
                 f'{service} 啟動確認失敗：{reason}；保留訂單，請確認 start_nav 後重開 start_delivery')
         finally:

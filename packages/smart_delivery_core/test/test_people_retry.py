@@ -170,7 +170,8 @@ def test_diagnostics_heartbeat_does_not_spam_unchanged_states(runtime):
     manager.state='waiting_observation_retry'
     manager.reason='unknown_scan_coverage'
     manager._heartbeat()
-    assert len(logged)==2 and 'unknown_scan_coverage' in logged[-1]
+    assert len(logged)==2 and '雷達視野不足' in logged[-1]
+    assert manager.reason=='unknown_scan_coverage'  # machine code is unchanged
     moment[0]+=5.1
     manager._heartbeat()
     assert len(logged)==3

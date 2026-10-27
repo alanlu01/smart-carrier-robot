@@ -59,7 +59,7 @@ from smart_delivery_core.localization_persistence import (
     select_same_boot_pose,
     write_cache,
 )
-from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics
+from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics, timed_operation
 from smart_delivery_core.recovery_translation import (
     lateral_progress, lateral_speed, load_self_mask, spin_scan_report, swept_scan_report,
 )
@@ -67,6 +67,7 @@ from smart_delivery_core.degraded_localization import MildMapGuard, convergence_
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEvidence
 from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
+from smart_delivery_core.delivery_console import localization_label, brief, reason_label
 
 
 STATE_QOS = QoSProfile(
@@ -650,13 +651,15 @@ class LocalizationManager(Node):
             ready_message.data = self.ready
             self.ready_publisher.publish(ready_message)
         if changed:
-            message = f"定位狀態：{state}（{reason}）"
+            icon = '✅' if self.ready else '🙋' if state=='MANUAL_REQUIRED' else '🔄' if state.startswith('RECOVERING') else '⏳'
+            message = f"{icon} {localization_label(state)}"
             if self.ready:
                 self.get_logger().info(message)
             else:
                 self.get_logger().warning(message)
         self._publish_state()
 
+    @timed_operation('state_heartbeat')
     def _publish_state(self):
         now = time.monotonic()
         self.last_state_publish_at = now
@@ -714,6 +717,8 @@ class LocalizationManager(Node):
             },
             'second_guard_wait_elapsed_sec': (max(0.,now-self.second_guard_started_at)
                 if self.recovery_step=='second_guard_wait' else None),
+            'recovery_failure_checks': self._recovery_failure_checks(now),
+            'stationary_update_requests': getattr(self,'nomotion_request_count',0),
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -818,6 +823,7 @@ class LocalizationManager(Node):
             f"odom_motion={snapshot['odom_motion']}"
         )
 
+    @timed_operation('scan_callback')
     def _scan_callback(self, message):
         self.latest_scan_at = time.monotonic()
         self._record_receipt("scan_filtered", message, self.latest_scan_at)
@@ -833,6 +839,7 @@ class LocalizationManager(Node):
         else:
             self.latest_scan_stamp_age = None
 
+    @timed_operation('raw_scan_callback')
     def _raw_scan_callback(self, _message):
         self.latest_raw_scan = _message
         self.latest_raw_scan_at = time.monotonic()
@@ -913,6 +920,7 @@ class LocalizationManager(Node):
     def _motion_inhibited_callback(self, message):
         self.motion_inhibited = bool(message.data)
 
+    @timed_operation('odom_callback')
     def _odom_callback(self, message):
         now = time.monotonic()
         self.latest_odom_stamp_ns = (
@@ -949,6 +957,7 @@ class LocalizationManager(Node):
                 f"無速度命令但里程計移動 {distance:.2f} m / {math.degrees(angle):.1f} deg"
             )
 
+    @timed_operation('amcl_callback')
     def _amcl_pose_callback(self, message):
         now = time.monotonic()
         self._record_receipt("amcl_pose", message, now)
@@ -1025,6 +1034,18 @@ class LocalizationManager(Node):
                 and not self._verification_data_blockers(now)
                 and recovery_motion_complete
             )
+            if self.recovery_step == 'second_guard_wait':
+                # Same-stamp retransmission cannot supply another independent
+                # confidence sample while we refresh evidence without moving.
+                stamp = message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+                previous = getattr(self, 'second_guard_amcl_stamp_ns', 0)
+                source_age = (self.get_clock().now().nanoseconds-stamp)/1e9
+                qualified = (qualified and stamp > previous and stamp > 0
+                             and -.1 <= source_age <= self.amcl_pose_timeout
+                             and not self.commanded_motion and not self.odom_motion
+                             and not self.motion_inhibited)
+                if stamp > previous:
+                    self.second_guard_amcl_stamp_ns = stamp
             self.stable_samples, self.last_stable_map_score_at = (
                 update_stability_samples(
                     qualified,
@@ -1206,17 +1227,46 @@ class LocalizationManager(Node):
             )
         return extend
 
-    def _recovery_failure_reason(self):
+    def _recovery_failure_checks(self, now):
+        """Never describe a missing/expired score as a newly measured low score."""
+        age = None if self.latest_map_score_at <= 0 else now-self.latest_map_score_at
+        if self.latest_map_score is None or age is None:
+            match = 'unavailable'
+        elif age > 2.*self.map_match_period:
+            match = 'stale'
+        elif self.last_map_match_error:
+            match = 'update_failed'
+        elif self.latest_map_score < self.map_match_recovery_score:
+            match = 'low'
+        elif len(self.map_score_window) < self.map_match_window_min_samples:
+            match = 'insufficient_samples'
+        else:
+            match = 'recovered'
         quality = self.latest_quality
+        amcl_fresh = self.last_amcl_at > 0 and now-self.last_amcl_at <= self.amcl_pose_timeout
+        return {'map_status':match,'map_score':self.latest_map_score,
+                'map_age_sec':age,'map_update_error':self.last_map_match_error,
+                'amcl_status':'unavailable' if quality is None else 'stale' if not amcl_fresh
+                    else 'healthy' if quality.healthy else 'covariance_unhealthy',
+                'stable_samples':self.stable_samples,'required_samples':self.stable_samples_required,
+                'sensor_blockers':self._verification_data_blockers(now)}
+
+    def _recovery_failure_reason(self):
+        checks = self._recovery_failure_checks(time.monotonic())
         details = [f"穩定樣本 {self.stable_samples}/{self.stable_samples_required}"]
-        if quality is None or not quality.healthy:
-            details.append("AMCL covariance 未達健康門檻")
-        if not self._map_match_has_recovered(time.monotonic()):
-            details.append("雷達地圖吻合度未恢復")
+        if checks['amcl_status'] != 'healthy':
+            details.append({'unavailable':'尚無 AMCL 資料','stale':'AMCL 資料過期',
+                            'covariance_unhealthy':'AMCL covariance 未達健康門檻'}[checks['amcl_status']])
+        if checks['map_status'] != 'recovered':
+            details.append({'unavailable':'地圖評分尚未取得','stale':'地圖評分資料過期',
+                'update_failed':'地圖評分更新失敗','low':'雷達地圖吻合度偏低',
+                'insufficient_samples':'地圖評分樣本不足'}[checks['map_status']])
         return "；".join(details)
 
+    @timed_operation('tick_total')
     def _tick(self):
         started = time.monotonic()
+        self.receipt_metrics.observe('state_machine_tick', started)
         if self.tick_last_at is not None:
             self.tick_max_gap = max(self.tick_max_gap, started - self.tick_last_at)
         self.tick_last_at = started
@@ -1254,6 +1304,7 @@ class LocalizationManager(Node):
                 self.tick_max_gap = self.tick_max_duration = 0.0
                 self.last_tick_metrics_at = started
 
+    @timed_operation('state_machine_body')
     def _tick_state_machine(self):
         now = time.monotonic()
         self.mild_map_active = False
@@ -1547,6 +1598,7 @@ class LocalizationManager(Node):
         elif self.state == "RECOVERING_GLOBAL":
             self._tick_global_recovery(now)
 
+    @timed_operation('map_match_update')
     def _update_map_match_score(self, now):
         if self.map_message is None or self.latest_scan is None:
             return
@@ -1562,7 +1614,7 @@ class LocalizationManager(Node):
             self.map_match_tf_failures += 1
             self.last_map_match_error = f"雷達地圖 TF 失敗：{exc}"
             if now - self.last_diagnostic_log_at >= self.diagnostic_log_period:
-                self.get_logger().warning(self.last_map_match_error)
+                self.get_logger().warning('⏳ 等待雷達地圖座標更新')
                 self.last_diagnostic_log_at = now
             return
 
@@ -1749,11 +1801,7 @@ class LocalizationManager(Node):
         )
         self.transient_clock = EvidenceWaitClock()
         self.recovery_diagnostics = self._freshness_snapshot(now)
-        self.get_logger().warning(
-            "定位觸發快照："
-            f"reason={reason}; "
-            f"{self._diagnostic_snapshot_text(self.recovery_diagnostics)}"
-        )
+        self.get_logger().warning('📍 開始定位恢復：'+brief(reason))
         self._cancel_navigation()
         self.stable_samples = 0
         self._reset_map_match_history()
@@ -1783,14 +1831,15 @@ class LocalizationManager(Node):
                 "及地圖樣本一致，符合時將略過定位自旋"
             )
 
+    @timed_operation('amcl_stationary_request')
     def _request_nomotion_update(self):
         now = time.monotonic()
         self.last_nomotion_request_at = now
         if self.nomotion_client.service_is_ready():
             self.nomotion_client.call_async(Empty.Request())
-            self.get_logger().info("已要求 AMCL 執行靜止更新")
+            self.nomotion_request_count = getattr(self,'nomotion_request_count',0)+1
             return True
-        self.get_logger().warning("AMCL 靜止更新服務尚未就緒")
+        self.get_logger().warning("⏳ AMCL 靜止更新服務尚未就緒")
         return False
 
     def _request_nomotion_if_due(self, now):
@@ -1948,7 +1997,7 @@ class LocalizationManager(Node):
             self.spin_failure_reason = None
             self.spin_pending_failure_reason = None
             self.spin_sequence = [self.full_spin_angle]
-            self.get_logger().warning("開始碰撞檢查的 360 度低速定位自旋")
+            self.get_logger().warning(f"🔄 全域定位自旋（第 {self.global_attempts} 輪）")
             self._send_next_spin()
         elif self.recovery_step == "post_global":
             self._request_nomotion_if_due(now)
@@ -1983,6 +2032,8 @@ class LocalizationManager(Node):
         if self.global_attempts < 2:
             self.second_guard_reason = reason
             self.second_guard_started_at = now
+            self.second_guard_scan_stamp_ns = 0
+            self.second_guard_amcl_stamp_ns = 0
             self.recovery_step = 'second_guard_wait'
             self._tick_second_guard_wait(now)
             return
@@ -1990,22 +2041,36 @@ class LocalizationManager(Node):
 
     def _tick_second_guard_wait(self, now):
         self.recovery_cmd_pub.publish(Twist())
+        # Do not early-return past evidence refresh in this phase. The wall
+        # deadline is STILL the original 8s: fresh data must not extend it.
+        if (self.latest_scan is not None and self._scan_is_fresh(now)
+                and now-self.last_map_match_check_at >= self.map_match_period):
+            stamp = self.latest_scan.header.stamp.sec*1_000_000_000+self.latest_scan.header.stamp.nanosec
+            if stamp > getattr(self, 'second_guard_scan_stamp_ns', 0):
+                self.last_map_match_check_at = now
+                self._update_map_match_score(now)
+                if self.latest_map_score_at == now and not self.last_map_match_error:
+                    self.second_guard_scan_stamp_ns = stamp
+        self._request_nomotion_if_due(now)
+        # A subsequent independent AMCL callback can now satisfy the existing
+        # six-sample healthy rule and mark LOCALIZED without any new motion.
         # Do not consume the one sidestep on a transient callback-phase gap.
         if self._lateral_sensors_ready(now) and now-self.last_lateral_probe_at>=1.0:
             self.last_lateral_probe_at=now
             if self._try_lateral_recovery(now):
                 return
         if self._recovery_spin_clear(now):
-            self.get_logger().warning(
-                self.second_guard_reason+'；橫移不可用，但旋轉安全，嘗試第二輪原地全域定位')
+            self.get_logger().warning('🔄 橫移不可用，改用第二輪原地定位')
             self._start_global_recovery()
             return
         if now - self.second_guard_started_at >= self.second_guard_wait:
             detail = json.dumps(self.second_guard_report, ensure_ascii=False)
-            self.get_logger().warning('第二輪安全檢查拒絕：'+detail)
+            self.get_logger().warning('⚠️ 二次定位受阻：'+reason_label(
+                self.second_guard_report.get('reason','安全條件不足')))
             self._require_manual(self.second_guard_reason+'；'+self._recovery_failure_reason()
                                  +'；第二輪安全檢查：'+detail)
 
+    @timed_operation('second_spin_guard')
     def _recovery_spin_clear(self, now):
         self.second_guard_report = {'sensor_blockers': self._lateral_sensor_blockers(now),
                                     'scans': {}, 'reason': 'checking'}
@@ -2150,6 +2215,7 @@ class LocalizationManager(Node):
             return False
         return clear
 
+    @timed_operation('lateral_path_guard')
     def _try_lateral_recovery(self, now):
         if (not self.lateral_enabled or self.lateral_attempted
                 or not self.auto_motion_recovery or self.motion_inhibited
@@ -2159,14 +2225,11 @@ class LocalizationManager(Node):
         # Rejections consume time, not the one actual movement. The parent
         # second_guard_wait deadline bounds repeated visibility checks.
         if not self._lateral_sensors_ready(now):
-            self.get_logger().warning("橫移拒絕：即時雷達／完整四輪回授／里程計不足")
+            self.get_logger().warning("⏳ 橫移等待：感測／底盤回授不足")
             return False
         directions = [d for d in (1, -1) if self._lateral_path_clear(d, self.lateral_distance)]
         if not directions:
-            self.get_logger().warning(
-                '橫移拒絕：左右掃掠區域不具充分安全視野；'
-                + json.dumps(self.lateral_path_reports, ensure_ascii=False)
-            )
+            self.get_logger().warning('⏳ 橫移等待：雷達視野不足')
             return False
         self._cancel_navigation()
         self.lateral_attempted = True
@@ -2547,7 +2610,7 @@ class LocalizationManager(Node):
         self.recovery_step = None
         self._cancel_navigation()
         self._set_state("MANUAL_REQUIRED", reason)
-        self.get_logger().error("請在 RViz 使用 2D Pose Estimate 重新設定初始位置")
+        self.get_logger().error("🙋 請在 RViz 設定初始位置")
 
 
 def main(args=None):

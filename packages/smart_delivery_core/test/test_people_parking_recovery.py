@@ -128,7 +128,7 @@ def test_pre_spin_global_recovery_discards_directional_evidence(runtime):
 
 def test_safety_diagnostics_distinguish_tf_and_odom_and_are_rate_limited(runtime):
     m,n,t=runtime
-    messages=[];n.get_logger=lambda:SimpleNamespace(warning=messages.append,info=lambda _:None)
+    messages=[];n.get_logger=lambda:SimpleNamespace(warning=messages.append,info=messages.append)
     m._pose=lambda *_:None
     assert not OptionalIdleRuntime._safe(m)
     assert m.safety_report['failed_checks']==['map_pose_valid']

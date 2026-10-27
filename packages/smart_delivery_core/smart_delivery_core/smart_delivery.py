@@ -12,6 +12,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from nav2_simple_commander.robot_navigator import TaskResult
 from smart_delivery_core.delivery_navigator import DeliveryNavigator, Nav2StartupUnavailable
+from smart_delivery_core.delivery_console import localization_label, brief
 from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
@@ -485,7 +486,7 @@ def go_to_standby(
     optional_interrupt_requested=lambda: False,
 ):
     """尋找最近的待機點並前往避讓"""
-    print("\n💤 進入待機模式，尋找最近的靠牆避讓點...")
+    print("\n💤 準備返回待機點")
     closest_standby = standby_point or min(
         STANDBY_POINTS,
         key=lambda pt: math.hypot(pt["x"] - current_pos["x"], pt["y"] - current_pos["y"]),
@@ -514,14 +515,14 @@ def go_to_standby(
                 return None
             if new_task_waiting():
                 navigator.cancelTask()
-                navigator.get_logger().info("收到新任務，已中斷待機點導航")
+                navigator.get_logger().info("📥 新任務優先，取消返回待機點")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
                 on_outcome(closest_standby, "interrupted_by_order")
                 return None
             if not localization_is_ready():
                 navigator.cancelTask()
-                navigator.get_logger().warning("定位可信度不足，已取消前往待機點")
+                navigator.get_logger().warning("⏸️ 定位暫停，取消前往待機點")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
                 on_outcome(closest_standby, "interrupted_by_localization")
@@ -541,12 +542,11 @@ def go_to_standby(
     if result != TaskResult.SUCCEEDED:
         on_outcome(closest_standby, "failed")
         navigator.get_logger().warning(
-            f"前往待機點 {closest_standby['name']} 未成功（result={result}）；"
-            "保留實際位置並稍後重試"
+            f"⚠️ 尚未停妥：{closest_standby['name']}，稍後重試"
         )
         return None
 
-    print(f"✅ 已靠牆停妥於 {closest_standby['name']}，等待新任務。")
+    print(f"💤 已停妥：{closest_standby['name']}，等待新任務")
     on_outcome(closest_standby, "arrived")
     return {"x": closest_standby["x"], "y": closest_standby["y"]}
 
@@ -666,7 +666,7 @@ def main():
             standby_retry.failed(now)
             state = standby_retry.status(now)
             navigator.get_logger().warning(
-                f"待機導航失敗 {standby_retry.failures}/{standby_retry.max_attempts}；"
+                f"⚠️ 停靠未完成（{standby_retry.failures}/{standby_retry.max_attempts}）；"
                 + ("停止自動重試，新訂單仍可執行"
                    if state == "blocked" else
                    f"{standby_retry.retry_at - now:.0f} 秒後才可重試")
@@ -711,7 +711,7 @@ def main():
             # localization or an external move is detected.
             is_standby = False
             navigator.get_logger().warning(
-                "定位可信度下降，已取消既有待機位置記錄"
+                "⏸️ 定位待確認，撤銷原停靠記錄"
             )
 
     def localization_can_resume():
@@ -747,7 +747,7 @@ def main():
                 "map", "base_footprint", Time(), timeout=Duration(seconds=0.2)
             )
         except TransformException as exc:
-            navigator.get_logger().warning(f"無法取得即時 map 位姿，暫用上次位置：{exc}")
+            navigator.get_logger().warning("⏳ 即時位置更新中，暫用上次位置")
             return fallback
         return {
             "x": float(transform.transform.translation.x),
@@ -761,13 +761,13 @@ def main():
     try:
         navigator.waitUntilNav2Active(localizer="robot_localization")
     except (Nav2StartupUnavailable, KeyboardInterrupt, ExternalShutdownException) as exc:
-        print(f'Delivery 未啟動：{exc}；未清除或取消雲端訂單')
+        print('❌ 配送未啟動，請檢查 start_nav；訂單已保留')
         navigator.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         return 1
     print("✅ Nav2 準備就緒！")
-    print("⏳ 定位尚未就緒時會保留任務，但仍會接收訂單、取消與結果確認")
+    print("⏳ 定位未就緒時保留任務，雲端通訊照常")
 
     latest_power_banks = None
     latest_power_status_at = 0.0
@@ -924,7 +924,7 @@ def main():
                     route_planned = False
                 persist()
         except (TypeError, json.JSONDecodeError):
-            navigator.get_logger().warning("忽略無效 task_result_ack")
+            navigator.get_logger().warning("⚠️ 忽略無效的結果確認訊息")
 
     navigator.create_subscription(
         String, "/smart_carrier/task_result_ack", result_ack_callback, STATE_QOS
@@ -954,8 +954,7 @@ def main():
             progress_message="Recovered after delivery process restart; waiting for safe resume",
         )
         navigator.get_logger().warning(
-            f"已復原重啟前未完成任務 {task_id}（原狀態 {recovered_state}），"
-            "定位可信後將安全續行"
+            "📂 已復原未完成任務，等待安全續行"
         )
 
     def power_status_callback(msg):
@@ -968,7 +967,7 @@ def main():
         except ValueError as exc:
             now = time.monotonic()
             if now - last_power_error_at >= 10.0:
-                navigator.get_logger().error(str(exc))
+                navigator.get_logger().error('⚠️ '+brief(exc))
                 last_power_error_at = now
 
     navigator.create_subscription(String, "power_status", power_status_callback, 10)
@@ -990,7 +989,7 @@ def main():
             has_current_work = bool(pending_orders or active_task or pending_result)
             if batch_id and current_batch_id not in {None, batch_id} and has_current_work:
                 navigator.get_logger().warning(
-                    f"目前仍在執行批次 {current_batch_id}，暫不接收新批次 {batch_id}"
+                    "⏳ 目前批次尚未完成，暫不接收新批次"
                 )
                 return
             if batch_id and current_batch_id != batch_id:
@@ -1024,15 +1023,15 @@ def main():
                     "queued_on_robot",
                     progress_message=f"Queued on robot ({len(pending_orders)} waiting)",
                 )
-                print(f"\n📥 收到雲端任務：{order['name']} ({order['type']})")
+                print(f"\n📥 收到{'租借' if order['type']=='borrow' else '歸還' if order['type']=='return' else '導航'}任務：{order['name']}")
             if added:
                 persist()
                 if batch_id:
                     navigator.get_logger().info(
-                        f"已接收批次 {batch_id}，共新增 {added} 筆，等待一次排程"
+                        f"📋 新增 {added} 筆任務，準備排程"
                     )
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            navigator.get_logger().error(f"訂單解析失敗：{exc}")
+            navigator.get_logger().error(f"❌ 訂單解析失敗：{brief(exc)}")
             if task_id:
                 invalid_task = {"task_id": str(task_id)}
                 queue_result(
@@ -1057,10 +1056,10 @@ def main():
                 # observes cancellation_requests and performs the cancellation on
                 # its next control cycle instead.
                 navigator.get_logger().warning(
-                    f"已收到管理員取消要求，下一控制週期停止任務：{task_id}"
+                    "🛑 收到管理員取消要求，正在停止任務"
                 )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            navigator.get_logger().error(f"無效的取消任務訊息：{exc}")
+            navigator.get_logger().error(f"⚠️ 無效的取消訊息：{brief(exc)}")
 
     navigator.create_subscription(
         String, "/smart_carrier/task_cancel", task_cancel_callback, COMMAND_QOS
@@ -1218,7 +1217,7 @@ def main():
     while latest_power_banks is None and time.monotonic() < deadline:
         rclpy.spin_once(navigator, timeout_sec=0.2)
     if latest_power_banks is None:
-        navigator.get_logger().error("超時未收到健康的 power_status")
+        navigator.get_logger().error("❌ 等待行充感測資料逾時")
         rclpy.shutdown()
         return
 
@@ -1309,7 +1308,7 @@ def main():
                     wait_reason = ("等待定位品質確認，暫緩派發"
                                    if not localization_dispatch_allowed else "STABILIZING_BEFORE_RESUME")
                 navigator.get_logger().warning(
-                    f"定位暫停（{wait_reason}），保留訂單並等待恢復"
+                    f"⏸️ {localization_label(wait_reason)}，保留任務"
                 )
                 last_localization_warning_at = now
             continue
@@ -1328,7 +1327,7 @@ def main():
                     dispatch_last_request_at = now
                 if now - dispatch_started_at >= 10.0 and now - dispatch_last_warning_at >= 10.0:
                     navigator.get_logger().warning(
-                        "啟動任務對帳尚未確認無訂單：留在原地等待 API，不先前往待機點"
+                        "⏳ 等待雲端任務對帳，暫留原地"
                     )
                     dispatch_last_warning_at = now
                 continue
@@ -1355,7 +1354,7 @@ def main():
                     report_standby(point, standby_retry.status(time.monotonic()))
                     continue
                 print("\n🏁 無待處理任務，返回待機點")
-                print(f"待機嘗試 {standby_retry.failures + 1}/{standby_retry.max_attempts}")
+                print(f"🔁 停靠嘗試 {standby_retry.failures + 1}/{standby_retry.max_attempts}")
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
@@ -1381,7 +1380,7 @@ def main():
         now = time.monotonic()
         if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
             if now - last_stale_warning_at >= 10.0:
-                navigator.get_logger().error("power_status 已逾時，暫停新任務")
+                navigator.get_logger().error("⚠️ 行充感測資料逾時，暫停新任務")
                 last_stale_warning_at = now
             continue
 
@@ -1401,7 +1400,7 @@ def main():
                 queue_result(target, fsm, "failed", f"無法恢復槽位確認：{exc}")
             else:
                 navigator.get_logger().warning(
-                    f"恢復任務 {active_task_id} 的 {resume_state} 槽位確認階段"
+                    f"📂 恢復槽位確認：{target.get('slot_number')} 號槽"
                 )
                 wait_for_slot_action(target, fsm, baseline_slots, resumed=True)
             pending_orders.remove(target)
@@ -1447,7 +1446,7 @@ def main():
                 persist()
                 route_names = " → ".join(order["name"] for order in optimized_route)
                 navigator.get_logger().info(
-                    f"批次 {current_batch_id or 'legacy'} 路線已固定：{route_names}"
+                    f"📋 配送路線：{route_names}"
                 )
             target = pending_orders[0]
 
@@ -1459,7 +1458,7 @@ def main():
         is_standby = False
         if resumed_after_localization:
             navigator.get_logger().warning(
-                f"定位已穩定，恢復原任務 {target.get('task_id')} 的導航目標"
+                f"✅ 定位恢復，繼續前往：{target['name']}"
             )
         progress(target, fsm, "precheck", progress_message="Task precheck passed")
         progress(
@@ -1492,12 +1491,12 @@ def main():
                 navigator.cancelTask()
                 cancel_sent = True
             elif optional_runtime and optional_runtime.home_requested and not cancel_sent:
-                navigator.get_logger().warning('低電量返航：先安全取消當前服務導航')
+                navigator.get_logger().warning('🔋 低電量返航，正在取消服務導航')
                 navigator.cancelTask()
                 cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
-                    f"定位 ready=false（最近狀態 {localization_state}），取消導航並保留任務等待重送"
+                    f"⏸️ {localization_label(localization_state)}，取消導航並保留任務"
                 )
                 navigator.cancelTask()
                 cancel_sent = True
@@ -1583,7 +1582,7 @@ def main():
                     progress_message=f"短暫 TF 異常，保留任務等待新鮮資料 ({retries + 1}/2)",
                 )
                 navigator.get_logger().warning(
-                    f"TF 暫態重試 {retries + 1}/2：{nav_error_msg or last_tf_failure[1]}"
+                    f"🔁 等待座標資料後重試（{retries + 1}/2）"
                 )
                 keep_pending = True
             else:

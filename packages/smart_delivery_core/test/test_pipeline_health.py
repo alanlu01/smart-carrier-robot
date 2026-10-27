@@ -6,6 +6,26 @@ from smart_delivery_core import pipeline_health
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics
 
 
+def test_method_measurement_preserves_ros_callback_signature_return_and_exception(monkeypatch):
+    import inspect
+    import pytest
+    from smart_delivery_core import pipeline_health as module
+    clock=[100.]
+    monkeypatch.setattr(module.time,'monotonic',lambda:clock[0])
+    class Probe:
+        @module.timed_operation('callback')
+        def callback(self,message):
+            clock[0]+=.2
+            if message=='fail':raise ValueError('expected')
+            return message
+    node=Probe()
+    assert list(inspect.signature(node.callback).parameters)==['message']
+    assert node.callback('ok')=='ok'
+    with pytest.raises(ValueError,match='expected'):node.callback('fail')
+    result=node.duration_metrics.snapshot(clock[0])['callback']
+    assert result['count']==2 and result['max_sec']==.2
+
+
 def test_receive_peak_retains_its_age_and_source_delay():
     metrics = ReceiptMetrics()
     metrics.observe('scan', 100.0, 0.05)

@@ -25,6 +25,8 @@ from smart_delivery_core.optional_idle import (
 from smart_delivery_core.standby_idle_clock import StandbyIdleClock
 from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
+from smart_delivery_core.delivery_console import people_status, safety_status, reason_label
+from smart_delivery_core.pipeline_health import DurationMetrics, timed_operation
 
 STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -36,6 +38,8 @@ RETRYABLE_SPIN_STOPS = frozenset({
     'unknown_scan_coverage', 'near_obstacle', 'recent_near_obstacle',
     'laser_tf_pending', 'laser_tf_wait_timeout',
 })
+DATA_SPIN_STOPS = frozenset({'scan_stale_or_absent','odom_tf_stale','laser_tf_unavailable',
+                             'laser_tf_pending','laser_tf_wait_timeout'})
 
 
 def yaw_of(quaternion):
@@ -112,6 +116,7 @@ class OptionalIdleRuntime:
         self.localization_wait_deadline = None
         self.observation_alignment = None
         self.safety_report = {}
+        self.duration_metrics = DurationMetrics()
         self.last_unsafe_report = None
         self.pose_report = {}
         self.safety_log_key = None
@@ -219,6 +224,12 @@ class OptionalIdleRuntime:
                 and self.last_scan is not None
                 and self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp)
                 and self._pose() is not None)
+
+    def _can_pause_for_data(self):
+        """Stop on jitter first; fresh evidence is required only to RESUME."""
+        return (self._localization_phase() in ('SUSPECT','LOCALIZED')
+                and self.map_matches and not self.inhibited and not self.stop_accepting
+                and (self.home is None or (self.home.healthy and not self.home.cutoff)))
 
     def _begin_localization_wait(self, resume_state, deadline):
         self.localization_pauses += 1
@@ -378,8 +389,8 @@ class OptionalIdleRuntime:
         self.home.observe(payload, time.monotonic(), self.navigator.get_clock().now().nanoseconds / 1e9)
         if previous != (self.home.latched, self.home.admission_latched):
             self._save_latch(self.home.latched)
-            self.navigator.get_logger().warning('大電池狀態更新：stop_claim=%s, return_home=%s' %
-                                                (self.home.admission_latched, self.home.latched))
+            self.navigator.get_logger().warning('🔋 '+('低電量返航已鎖定' if self.home.latched
+                else '低電量，暫停接單' if self.home.admission_latched else '電池狀態已恢復'))
 
     def _save_latch(self, latched):
         self.latch_path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,6 +475,7 @@ class OptionalIdleRuntime:
         payload['localization_wait_remaining_sec'] = (None if self.state != 'waiting_people_localization'
             else round(max(0., self.localization_wait_deadline-time.monotonic()), 2))
         payload['safety_check'] = self.safety_report
+        payload['wall_durations'] = self.duration_metrics.snapshot(time.monotonic())
         payload['last_unsafe_check'] = self.last_unsafe_report
         payload['parking_recovery_pauses'] = self.parking_recovery_pauses
         payload['parking_recovery_remaining_sec'] = (None if self.parking_recovery_deadline is None
@@ -476,30 +488,20 @@ class OptionalIdleRuntime:
         """Log transitions and bounded progress, never every detector frame."""
         if not self.config['people']['enabled']:
             return
-        labels = {'idle': '待機／冷卻', 'going_observation': '前往人流分析點',
-                  'waiting_observation_stop': '已到分析點，等待停妥及連續安全雷達',
-                  'observing': '人流自旋分析', 'waiting_observation_retry': '自旋已取消，停妥後等待安全續轉',
-                  'waiting_people_localization': '人流安全暫停，有限等待定位恢復',
-                  'people_destination_selected': '分析完成，已選出人流待機點',
-                  'going_people_standby': '分析完成，前往／補停選定待機點',
-                  'waiting_people_parking_recovery': '保留人流待機選點，停妥並有限等待定位／感測恢復',
-                  'people_arrival_check': '分析完成，確認待機點抵達',
-                  'people_parking_retry_wait': '分析完成，等待停妥後有限補停',
-                  'people_parking_blocked': '分析完成，補停額度用盡；未確認抵達，原地等候新任務'}
         key = (self.state, self.reason, self.parking_attempts, self.parking_outcome)
         now = time.monotonic()
         transition = key != self.log_key
-        progress = self.state in ('observing', 'waiting_observation_retry', 'waiting_people_localization') and now-self.last_progress_log >= 5.
+        progress = self.state in ('observing', 'waiting_observation_stop', 'waiting_observation_retry',
+            'waiting_people_localization','waiting_people_parking_recovery') and now-self.last_progress_log >= 5.
         if not transition and not progress:
             return
         self.log_key, self.last_progress_log = key, now
         point = self.goal or {}
-        self.navigator.get_logger().info(
-            '人流｜%s；原因=%s；目標=%s；進度=%.1f°；續轉=%d/%d；分析完成=%s；停靠=%s(%d/%d)；冷卻剩餘=%.0fs；安全=%s' %
-            (labels.get(self.state, self.state), self.reason or '正常', point.get('name', '-'),
-             math.degrees(self.spin_travel), self.spin_resumes, self.config['people']['max_spin_resumes'],
-             self.analysis_completed, self.parking_outcome, self.parking_attempts, self.parking_retry.max_attempts,
-             max(0., self.next_people_at-now), json.dumps(self.guard_report, ensure_ascii=False)))
+        text = ('🛑 人流動作停止中：'+reason_label(self.reason) if self.cancel_requested and self.motion
+                else people_status(self.state,self.reason,point,
+                    math.degrees(self.spin_travel),self.parking_attempts,
+                    self.spin_ready_blocker if self.spin_ready_blocker!='not_waiting' else ''))
+        self.navigator.get_logger().info(text)
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
         now = self.navigator.get_clock().now().nanoseconds
@@ -507,6 +509,7 @@ class OptionalIdleRuntime:
         return (0 <= time.monotonic() - receipt <= limit and source > 0
                 and -0.1 <= (now - source) / 1e9 <= limit)
 
+    @timed_operation('people_pose_lookup')
     def _pose(self, stamp=None):
         try:
             transform = self.buffer.lookup_transform('map', 'base_footprint', stamp or Time())
@@ -558,8 +561,9 @@ class OptionalIdleRuntime:
             self.last_unsafe_report = dict(self.safety_report)
             key = tuple(failed)
             if now-self.safety_log_at >= 5.:
-                self.navigator.get_logger().warning('人流安全檢查未通過：'+json.dumps(
-                    self.safety_report,ensure_ascii=False))
+                message = safety_status(failed,self.state,self.motion)
+                logger = self.navigator.get_logger()
+                (logger.warning if self.motion else logger.info)(message)
                 self.safety_log_key,self.safety_log_at = key,now
         else:
             self.safety_log_key = None
@@ -569,6 +573,7 @@ class OptionalIdleRuntime:
         self.guard_report = self._spin_guard_report(require_stationary)
         return self.guard_report['clear']
 
+    @timed_operation('people_spin_guard')
     def _spin_guard_report(self, require_stationary=True):
         # Freshness/safety is rechecked even when geometry has a short cache.
         if (not self._safe() or (require_stationary and not self._stationary())):
@@ -816,7 +821,7 @@ class OptionalIdleRuntime:
             try:
                 Path(self.observation_tree_path).unlink(missing_ok=True)
             except OSError as exc:
-                self.navigator.get_logger().warning('人流暫存 BT 清理失敗：%s' % exc)
+                self.navigator.get_logger().warning('⚠️ 人流暫存 BT 清理失敗：%s' % exc)
             self.observation_tree_path = None
 
     def _resume_spin_tree(self):
@@ -839,9 +844,8 @@ class OptionalIdleRuntime:
         self._reset_spin_ready()
         self._remove_spin_tree()
         selected = self.people.select(self.config['people']['observation_pose']) if self.people else None
-        if self.people is not None and hasattr(self.people, 'summary'):
-            self.navigator.get_logger().info('人流分析結果：'+json.dumps(
-                self.people.summary(self.config['people']['observation_pose']), ensure_ascii=False))
+        # Complete scores/counters stay in optional_idle_state.people_demand;
+        # the console transition below shows only the selected point/outcome.
         if selected is None:
             self._people_finished('insufficient_directional_demand')
         else:
@@ -919,6 +923,7 @@ class OptionalIdleRuntime:
         self._log_people_state()
         return True
 
+    @timed_operation('optional_poll')
     def poll(self, has_work):
         """Cancel on unsafe data/new service work and drain before any new goal."""
         if has_work:
@@ -998,6 +1003,9 @@ class OptionalIdleRuntime:
             if (self.state in ('going_observation', 'observing') and self.localization_pauses < 2
                     and self._can_wait_localization()):
                 reason = 'localization_suspect'
+            elif (self.state in ('going_observation','observing') and self.localization_pauses < 2
+                    and self._can_pause_for_data()):
+                reason = 'people_data_pause'
             elif self.state == 'going_people_standby' and self._parking_recovery_allowed():
                 reason = 'selected_standby_safety_pause'
             else:
@@ -1006,8 +1014,11 @@ class OptionalIdleRuntime:
             reason = 'observation_or_navigation_timeout'
         elif self.state == 'observing' and not self._clear_to_spin(False):
             reason = self.guard_report.get('reason', 'spin_safety_rejected')
+            if (reason in DATA_SPIN_STOPS and self.localization_pauses < 2
+                    and self._can_pause_for_data()):
+                reason = 'people_data_pause'
         if reason and not self.cancel_requested:
-            if reason == 'localization_suspect':
+            if reason in ('localization_suspect','people_data_pause'):
                 self._begin_localization_wait(self.state, self.deadline if self.state == 'going_observation'
                     else self.observation_session_deadline or self.deadline)
             self.cancel_requested = True
@@ -1064,8 +1075,8 @@ class OptionalIdleRuntime:
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
-            elif self.interrupt_reason == 'localization_suspect':
-                self.state, self.reason = 'waiting_people_localization', 'localization_suspect'
+            elif self.interrupt_reason in ('localization_suspect','people_data_pause'):
+                self.state, self.reason = 'waiting_people_localization', self.interrupt_reason
                 self._reset_spin_ready()
                 self.spin_resume_pending = False
                 self._log_people_state()
