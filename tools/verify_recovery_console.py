@@ -53,7 +53,12 @@ def main():
             message.header.frame_id='synthetic_laser';publisher.publish(message)
             until=time.monotonic()+.05
             while time.monotonic()<until:rclpy.spin_once(probe,timeout_sec=.005)
-        assert not runtime._safe()  # Populate detailed diagnosis; never poll/start an action.
+        # Cover real rcutils per-callsite severity caching, without actions/leases.
+        for moving in (False, True, False, True, False):
+            runtime.motion = moving  # Logging branch only; never poll/start an action.
+            runtime.safety_log_at = -float('inf')
+            assert not runtime._safe()
+        runtime.motion = False
         runtime._heartbeat()
         until=time.monotonic()+.3
         while time.monotonic()<until:rclpy.spin_once(probe,timeout_sec=.01)
@@ -63,7 +68,8 @@ def main():
         assert statuses[-1]['state']=='idle' and 'wall_durations' in statuses[-1]
         assert receiver.duration_metrics.snapshot(time.monotonic())['raw_scan_callback']['count']==count
         print(json.dumps({'domain':231,'raw_callbacks':count,'status_messages':len(statuses),
-            'structured_diagnosis':True,'motor_commands':0,'goals':0}))
+            'structured_diagnosis':True,'native_logger_severity_transitions':4,
+            'motor_commands':0,'goals':0}))
     finally:
         probe.destroy_node()
         rclpy.shutdown()

@@ -121,12 +121,16 @@ def swept_scan_report(scan, sensor_pose, direction, distance, half_x, half_y,
     return report
 
 
-def lateral_speed(progress, distance=0.30, cap=0.25):
-    """Brake before the target; stopping is verified separately by real feedback."""
+def lateral_speed(progress, distance=0.30, cap=0.20, feedback_age=0.):
+    """Reserve reaction/feedback travel and a 25 mm tail before the target."""
     remaining = distance - progress
-    if remaining <= 0.015:
+    if remaining <= 0.025:
         return 0.0
-    return min(cap, math.sqrt(2.0 * 0.5 * max(0.0, remaining - 0.015)))
+    # v*t + v²/(2*a) <= available distance. Actual stop still needs wheel proof.
+    deceleration = .25
+    reaction = .20 + max(0., min(.25, feedback_age))
+    at = deceleration * reaction
+    return min(cap, math.sqrt(at*at + 2*deceleration*(remaining-.025)) - at)
 
 
 def spin_scan_clear(scan, sensor_pose, self_mask=None, sensor_z=0.0,

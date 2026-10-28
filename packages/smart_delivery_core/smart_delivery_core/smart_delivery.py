@@ -552,6 +552,29 @@ def go_to_standby(
 
 
 def main():
+    """Retain the original traceback and stop owned actions before fatal exit."""
+    import traceback
+    from smart_delivery_core.delivery_failure import stop_after_failure
+    runtime_holder = []
+    try:
+        return _run_delivery(runtime_holder)
+    except (Exception, KeyboardInterrupt):
+        if runtime_holder:
+            runtime = runtime_holder[0]
+            try:
+                runtime.navigator.get_logger().error(traceback.format_exc())
+            except Exception:
+                traceback.print_exc()
+            try:
+                report = stop_after_failure(runtime)
+                runtime.navigator.get_logger().error(
+                    '🛑 配送異常，停止確認：' + json.dumps(report, ensure_ascii=False))
+            except Exception:
+                traceback.print_exc()
+        raise
+
+
+def _run_delivery(runtime_holder):
     rclpy.init()
     navigator = DeliveryNavigator()
     tf_buffer = Buffer()
@@ -839,6 +862,7 @@ def main():
             localization_can_resume, set_navigation_active,
             suspend_navigation_lease,
         )
+        runtime_holder.append(optional_runtime)
 
     set_motion_inhibited(False)
 

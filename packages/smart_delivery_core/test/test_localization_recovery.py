@@ -396,7 +396,7 @@ def lateral_harness(manager):
     node, clock = manager
     node.lateral_enabled = node.auto_motion_recovery = True
     node.lateral_attempted = False
-    node.lateral_distance, node.lateral_cap = .30, .25
+    node.lateral_distance, node.lateral_cap = .30, .20
     node.last_odom_pose = (0.0, 0.0, 0.0)
     node.latest_cmd_at = clock.now
     node.lateral_guard, node.lateral_guard_at = {}, 0.0
@@ -431,7 +431,8 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
     for _ in range(5):
         clock.now += .05
         node._tick_lateral_motion()
-    assert node.lateral_commands[-1].linear.y == .25
+    assert node.lateral_commands[-1].linear.y == .20
+    node._lateral_stop_ready = lambda _now: False
     for distance in [.025 * step for step in range(1, 12)] + [.29]:
         clock.now += .10
         node.last_odom_pose = (0.0, distance, 0.0)
@@ -439,6 +440,7 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
     assert node.lateral_phase == 'stopping'
     assert lease.blocked(clock.now)
     assert node.lateral_commands[-1].linear.y == 0.0
+    node._lateral_stop_ready = lambda _now: True
     for _ in range(25):
         clock.now += .05
         node.latest_cmd_at = clock.now
@@ -446,6 +448,7 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
     assert node.lateral_phase is None
     assert not lease.enabled
     assert node.started_spins == ['global']
+    assert {'start','motion_authorized','deceleration','zero_command','wheels_stopped'} <= node.lateral_motion_timing.keys()
     assert not node._try_lateral_recovery(clock.now)  # never a second translation
 
 
@@ -925,3 +928,39 @@ def test_delayed_source_data_cannot_enable_soft_map_window(manager):
     node.latest_odom_stamp_ns=100000000000
     node.latest_raw_scan.header.stamp.sec=99
     assert not node._mild_map_sources_fresh()
+
+
+def test_amcl_callback_remains_responsive_while_pose_file_is_blocked(manager, tmp_path):
+    import threading
+    import time
+    from smart_delivery_core.localization_persistence import LatestPoseWriter
+    node, clock = manager
+    entered, release = threading.Event(), threading.Event()
+    def blocked(*args, **kwargs):
+        entered.set()
+        release.wait(3.)
+    writer = LatestPoseWriter(tmp_path/'pose.json', 'boot', 'map', writer=blocked)
+    node.reuse_same_boot_pose, node.boot_id = True, 'boot'
+    node.pose_cache_writer = writer
+    node.pose_cache_write_period, node.last_pose_cache_write_at = 2., 0.
+    node.state, node.commanded_motion = 'LOCALIZED', True
+    node._map_match_has_recovered = lambda _now: True
+    node.get_clock = lambda: SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100_000_000_000))
+    message = PoseWithCovarianceStamped()
+    message.header.stamp.sec = int(time.time())
+    message.pose.pose.orientation.w = 1.
+    message.pose.covariance[0] = message.pose.covariance[7] = .04
+    message.pose.covariance[35] = .01
+    try:
+        node._amcl_pose_callback(message)
+        assert entered.wait(1.)
+        started = time.perf_counter()
+        for _ in range(20):
+            clock.now += 2.1
+            node._amcl_pose_callback(message)
+        assert time.perf_counter()-started < .2
+        assert node.last_amcl_at == clock.now and writer.snapshot()['pending']
+        assert node.latest_pose_observed_at == message.header.stamp.sec
+    finally:
+        release.set()
+        assert writer.close()

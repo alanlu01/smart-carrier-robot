@@ -268,7 +268,7 @@ def test_old_home_latch_survives_delivery_restart(runtime):
 def test_home_aborts_paused_navigation_and_releases_unstarted_orders():
     source = ROOT / 'smart_delivery_core/smart_delivery.py'
     main = next(node for node in ast.parse(source.read_text()).body
-                if isinstance(node, ast.FunctionDef) and node.name == 'main')
+                if isinstance(node, ast.FunctionDef) and node.name == '_run_delivery')
     loop = next(node for node in main.body if isinstance(node, ast.While)
                 and ast.unparse(node.test) == 'rclpy.ok()')
     branch = next(node for node in loop.body if isinstance(node, ast.If)

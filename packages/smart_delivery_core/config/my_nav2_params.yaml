@@ -105,7 +105,7 @@ localization_manager:
     pre_global_wait_sec: 4.0
     lateral_recovery_enabled: true
     lateral_recovery_distance: 0.30
-    lateral_recovery_speed: 0.25
+    lateral_recovery_speed: 0.20
     lateral_footprint_half_x: 0.22
     lateral_footprint_half_y: 0.16
     local_recovery_wait_sec: 12.0

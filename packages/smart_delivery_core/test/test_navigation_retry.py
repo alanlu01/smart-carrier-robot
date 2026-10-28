@@ -74,7 +74,7 @@ def test_actual_delivery_retry_uses_latest_common_tf_without_starting_nodes():
 
     source = Path(__file__).parents[1] / 'smart_delivery_core' / 'smart_delivery.py'
     main = next(item for item in ast.parse(source.read_text()).body
-                if isinstance(item, ast.FunctionDef) and item.name == 'main')
+                if isinstance(item, ast.FunctionDef) and item.name == '_run_delivery')
     callback = next(item for item in main.body
                     if isinstance(item, ast.FunctionDef) and item.name == 'retry_data_ready')
     buffer = Buffer()

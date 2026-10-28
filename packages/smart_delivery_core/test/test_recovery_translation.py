@@ -42,10 +42,26 @@ def test_odometry_progress_uses_original_heading_not_map():
 
 
 def test_speed_cap_and_braking_target():
-    assert lateral_speed(0) == .25
-    assert 0 < lateral_speed(.27) < .25
+    assert lateral_speed(0) == .20
+    assert 0 < lateral_speed(.27) < .20
+    assert lateral_speed(.20, feedback_age=.20) < lateral_speed(.20)
     assert lateral_speed(.29) == 0
     assert lateral_speed(.31) == 0
+
+
+def test_braking_reserves_feedback_delay_and_real_stopping_tail():
+    # Integrate a delayed command plus finite braking in a deterministic plant.
+    # This validates the envelope, not the real chassis' unknown dynamics.
+    for lag in (.10, .20, .25):
+        position, speed = 0., 0.
+        delayed = [0.] * round(lag/.01)
+        for _ in range(700):
+            command = lateral_speed(position, feedback_age=lag)
+            delayed.append(command)
+            target = delayed.pop(0)
+            speed += max(-.25*.01, min(.25*.01, target-speed))
+            position += speed*.01
+        assert .25 < position < .33
 
 
 def mask():

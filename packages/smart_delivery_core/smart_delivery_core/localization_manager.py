@@ -58,6 +58,7 @@ from smart_delivery_core.localization_persistence import (
     read_boot_id,
     select_same_boot_pose,
     write_cache,
+    LatestPoseWriter,
 )
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics, ScanPairMetrics, timed_operation
 from smart_delivery_core.recovery_translation import (
@@ -407,6 +408,9 @@ class LocalizationManager(Node):
         self.receipt_metrics = ReceiptMetrics()
         self.scan_pair_metrics = ScanPairMetrics()
         self.duration_metrics = DurationMetrics()
+        self.latest_pose_observed_at = None
+        self.pose_cache_writer = LatestPoseWriter(
+            self.pose_cache_path, self.boot_id, self.map_identity)
         self.transient_clock = EvidenceWaitClock()
         self.last_state_publish_at = 0.0
 
@@ -537,7 +541,7 @@ class LocalizationManager(Node):
             "pre_global_wait_sec": 4.0,
             "lateral_recovery_enabled": True,
             "lateral_recovery_distance": 0.30,
-            "lateral_recovery_speed": 0.25,
+            "lateral_recovery_speed": 0.20,
             "lateral_footprint_half_x": 0.22,
             "lateral_footprint_half_y": 0.16,
             "self_mask_config_file": "",  # Same installed YAML as my_lidar.launch.py
@@ -626,14 +630,11 @@ class LocalizationManager(Node):
         now = time.monotonic()
         if not force and now - self.last_pose_cache_write_at < self.pose_cache_write_period:
             return
-        try:
-            write_cache(self.pose_cache_path, self.boot_id, self.latest_pose, map_identity=self.map_identity)
-        except (OSError, ValueError) as exc:
-            if now - self.last_pose_cache_write_at >= self.diagnostic_log_period:
-                self.get_logger().warning(f"無法保存同次開機可信位置：{exc}")
+        observed_at = self.latest_pose_observed_at
+        # Use AMCL's original wall-clock stamp, including forced convergence writes.
+        if (observed_at is not None and 0 <= time.time() - observed_at <= self.amcl_pose_timeout
+                and self.pose_cache_writer.submit(self.latest_pose, observed_at)):
             self.last_pose_cache_write_at = now
-            return
-        self.last_pose_cache_write_at = now
 
     def _set_state(self, state, reason):
         if state != self.state:
@@ -703,6 +704,8 @@ class LocalizationManager(Node):
             "pipeline_receipts": self.receipt_metrics.snapshot(now),
             "scan_pair_timing": self.scan_pair_metrics.snapshot(now),
             "wall_durations": self.duration_metrics.snapshot(now),
+            "pose_cache_io": self.pose_cache_writer.snapshot(),
+            "lateral_motion_timing": getattr(self, 'lateral_motion_timing', {}),
             'quality_history': self.quality_history.snapshot(now),
             "lateral_path_reports": self.lateral_path_reports,
             "lateral_self_mask": self.lateral_self_mask,
@@ -975,6 +978,8 @@ class LocalizationManager(Node):
             self.critical_yaw_std,
         )
         self.latest_pose = current
+        self.latest_pose_observed_at = (
+            message.header.stamp.sec + message.header.stamp.nanosec / 1e9)
         self.latest_quality = quality
         self.last_amcl_at = now
         self.quality_history.observe(
@@ -2122,6 +2127,8 @@ class LocalizationManager(Node):
                     self.lateral_token = payload['token']
                     self.lateral_handoff = True
                     self.lateral_anchor = None
+                    self.lateral_started_at = time.monotonic()
+                    self.lateral_motion_timing = {}
                     self.lateral_abort_reason = None
                     self.recovery_stop.reset()
                     self._cancel_navigation()
@@ -2236,6 +2243,8 @@ class LocalizationManager(Node):
         self.lateral_direction = directions[0]
         self.lateral_anchor = self.last_odom_pose
         self.lateral_started_at = now
+        self.lateral_motion_timing = {}
+        self._record_lateral_event('start', now)
         self.lateral_stopped_since = None
         self.lateral_abort_reason = None
         self.lateral_token = str(uuid.uuid4())
@@ -2254,6 +2263,7 @@ class LocalizationManager(Node):
     def _stop_lateral(self, reason=None):
         if self.lateral_phase != "stopping":
             self.lateral_stop_started_at = time.monotonic()
+            self._record_lateral_event('zero_command', self.lateral_stop_started_at)
             self.recovery_stop.reset()
         if reason:
             self.lateral_abort_reason = reason
@@ -2261,6 +2271,19 @@ class LocalizationManager(Node):
         self.recovery_step = "lateral_stop"
         self._publish_lateral_lease(permit=False)
         self.recovery_cmd_pub.publish(Twist())
+
+    def _record_lateral_event(self, name, now):
+        events = getattr(self, 'lateral_motion_timing', None)
+        if events is None:
+            events = self.lateral_motion_timing = {}
+        if name in events:
+            return
+        pose = self.last_odom_pose
+        item = {'elapsed_sec': round(now-self.lateral_started_at, 6), 'odom_pose': pose}
+        if pose is not None and self.lateral_anchor is not None:
+            progress, cross, yaw = lateral_progress(self.lateral_anchor, pose, self.lateral_direction)
+            item.update(progress_m=progress, cross_track_m=cross, yaw_error_deg=math.degrees(yaw))
+        events[name] = item
 
     def _tick_lateral_motion(self):
         if self.lateral_phase is None:
@@ -2311,6 +2334,7 @@ class LocalizationManager(Node):
                         or abs(cross) > 0.05 or abs(angle) > math.radians(5)):
                     self.lateral_abort_reason = "橫移煞停距離／角度偏差超限"
             if self._lateral_stop_ready(now):
+                self._record_lateral_event('wheels_stopped', now)
                 self.lateral_phase = "disarming"
             elif now - self.lateral_stop_started_at > 3.0 and self.state != "MANUAL_REQUIRED":
                 # Report the fault, but KEEP the stop lease latched until fresh
@@ -2333,6 +2357,7 @@ class LocalizationManager(Node):
             self.recovery_cmd_pub.publish(Twist())
             if guard_matches and self.lateral_guard.get("blocked") is False:
                 self.lateral_phase = "moving"
+                self._record_lateral_event('motion_authorized', now)
                 self.lateral_last_tick_at = now
                 self.lateral_last_pose = self.last_odom_pose
             return
@@ -2356,7 +2381,10 @@ class LocalizationManager(Node):
                 or abs(cross_track) > 0.05 or abs(yaw_error) > math.radians(5)):
             self._stop_lateral("里程計軌跡偏移或旋轉超出限制")
             return
-        speed = lateral_speed(progress, self.lateral_distance, self.lateral_cap)
+        speed = lateral_speed(progress, self.lateral_distance, self.lateral_cap,
+                              feedback_age=max(0., now-self.latest_odom_at))
+        if speed < self.lateral_cap:
+            self._record_lateral_event('deceleration', now)
         if speed == 0.0:
             self._stop_lateral()
             return
@@ -2623,6 +2651,7 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node._shutdown_recovery_stop()
+        node.pose_cache_writer.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

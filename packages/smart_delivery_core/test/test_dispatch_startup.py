@@ -45,7 +45,7 @@ def test_gate_is_observed_before_initial_work_can_be_cancelled_or_acked():
 
     source = Path(__file__).parents[1] / 'smart_delivery_core' / 'smart_delivery.py'
     main = next(item for item in ast.parse(source.read_text()).body
-                if isinstance(item, ast.FunctionDef) and item.name == 'main')
+                if isinstance(item, ast.FunctionDef) and item.name == '_run_delivery')
     loop = next(item for item in main.body if isinstance(item, ast.While)
                 and ast.unparse(item.test) == 'rclpy.ok()')
     assert ast.unparse(loop.body[1]).startswith('startup_dispatch.observe(')
@@ -83,7 +83,7 @@ def test_actual_idle_branch_waits_only_at_startup(
 
     source = Path(__file__).parents[1] / 'smart_delivery_core' / 'smart_delivery.py'
     main = next(item for item in ast.parse(source.read_text()).body
-                if isinstance(item, ast.FunctionDef) and item.name == 'main')
+                if isinstance(item, ast.FunctionDef) and item.name == '_run_delivery')
     loop = next(item for item in main.body if isinstance(item, ast.While)
                 and ast.unparse(item.test) == 'rclpy.ok()')
     idle = next(item for item in loop.body if isinstance(item, ast.If)

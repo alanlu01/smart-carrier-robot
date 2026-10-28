@@ -563,7 +563,11 @@ class OptionalIdleRuntime:
             if now-self.safety_log_at >= 5.:
                 message = safety_status(failed,self.state,self.motion)
                 logger = self.navigator.get_logger()
-                (logger.warning if self.motion else logger.info)(message)
+                # rclpy caches severity by physical call site. Keep distinct lines.
+                if self.motion:
+                    logger.warning(message)
+                else:
+                    logger.info(message)
                 self.safety_log_key,self.safety_log_at = key,now
         else:
             self.safety_log_key = None

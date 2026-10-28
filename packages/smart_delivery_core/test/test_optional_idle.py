@@ -168,7 +168,7 @@ def test_disabled_delivery_does_not_construct_optional_runtime_or_subscriptions(
     import ast
     source = ROOT / 'smart_delivery_core/smart_delivery.py'
     main = next(node for node in ast.parse(source.read_text()).body
-                if isinstance(node, ast.FunctionDef) and node.name == 'main')
+                if isinstance(node, ast.FunctionDef) and node.name == '_run_delivery')
     branch = next(node for node in main.body if isinstance(node, ast.If)
                   and ast.unparse(node.test).startswith("optional_config['home']['enabled']"))
     config = load_idle_config(DEFAULT)
