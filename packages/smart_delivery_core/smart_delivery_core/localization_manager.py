@@ -69,6 +69,7 @@ from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEv
 from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
 from smart_delivery_core.delivery_console import localization_label, brief, reason_label
+from smart_delivery_core.global_pose_gate import ray_consistency
 
 
 STATE_QOS = QoSProfile(
@@ -98,6 +99,7 @@ class LocalizationManager(Node):
         self.mild_map_active = False
         self.restore_heading = bool(self.get_parameter('restore_heading_after_recovery').value)
         self.global_attempts = 0
+        self.post_lateral_observation = False
         self.recovery_stall_window = float(self.get_parameter('global_stall_window_sec').value)
 
         self.initial_x = float(self.get_parameter("initial_pose.x").value)
@@ -121,6 +123,9 @@ class LocalizationManager(Node):
         self.initial_pose_source = "fixed_power_on"
         self.same_boot_pose_untrusted = False
         self._configure_startup_pose()
+        self.global_verification_required = self.initial_pose_source == 'same_boot_trusted_cache'
+        self.global_geometry_report = {}
+        self.global_geometry_at = 0.
         self.motion_cmd_topic = str(self.get_parameter("motion_cmd_topic").value)
         self.raw_scan_topic = str(self.get_parameter("raw_scan_topic").value)
         self.filtered_scan_topic = str(
@@ -706,6 +711,10 @@ class LocalizationManager(Node):
             "wall_durations": self.duration_metrics.snapshot(now),
             "pose_cache_io": self.pose_cache_writer.snapshot(),
             "lateral_motion_timing": getattr(self, 'lateral_motion_timing', {}),
+            "post_lateral_observation": self.post_lateral_observation,
+            "global_pose_gate": dict(required=self.global_verification_required,
+                                     report=self.global_geometry_report,
+                                     age_sec=(now-self.global_geometry_at if self.global_geometry_at else None)),
             'quality_history': self.quality_history.snapshot(now),
             "lateral_path_reports": self.lateral_path_reports,
             "lateral_self_mask": self.lateral_self_mask,
@@ -884,6 +893,8 @@ class LocalizationManager(Node):
         return True
 
     def _reset_map_match_history(self):
+        self.global_geometry_at = 0.
+        self.global_geometry_report = {}
         self.stationary_map_guard.reset()
         self.map_score_window.clear()
         self.latest_map_score = None
@@ -1038,6 +1049,7 @@ class LocalizationManager(Node):
                 and self._scan_is_fresh(now)
                 and not self._verification_data_blockers(now)
                 and recovery_motion_complete
+                and self._global_pose_is_verified(now)
             )
             if self.recovery_step == 'second_guard_wait':
                 # Same-stamp retransmission cannot supply another independent
@@ -1079,6 +1091,7 @@ class LocalizationManager(Node):
         if self.manual_initial_pose_pending:
             self.manual_initial_pose_pending = False
             return
+        self.global_verification_required = False  # Human seed still needs existing six-sample verification.
         if self.state == "MANUAL_REQUIRED":
             self.stable_samples = 0
             self._reset_map_match_history()
@@ -1254,11 +1267,15 @@ class LocalizationManager(Node):
                 'amcl_status':'unavailable' if quality is None else 'stale' if not amcl_fresh
                     else 'healthy' if quality.healthy else 'covariance_unhealthy',
                 'stable_samples':self.stable_samples,'required_samples':self.stable_samples_required,
+                'global_geometry_required':getattr(self,'global_verification_required',False),
+                'global_geometry_verified':self._global_pose_is_verified(now),
                 'sensor_blockers':self._verification_data_blockers(now)}
 
     def _recovery_failure_reason(self):
         checks = self._recovery_failure_checks(time.monotonic())
         details = [f"穩定樣本 {self.stable_samples}/{self.stable_samples_required}"]
+        if not checks['global_geometry_verified']:
+            details.append('全域候選射線驗證尚未通過')
         if checks['amcl_status'] != 'healthy':
             details.append({'unavailable':'尚無 AMCL 資料','stale':'AMCL 資料過期',
                             'covariance_unhealthy':'AMCL covariance 未達健康門檻'}[checks['amcl_status']])
@@ -1685,6 +1702,20 @@ class LocalizationManager(Node):
             )
             self.latest_map_score_at = now
             self.last_map_match_error = ""
+            if getattr(self, 'global_verification_required', False):
+                self.global_geometry_report = ray_consistency(
+                    self.map_message, scan, (float(translation.x),float(translation.y),laser_yaw))
+                source_age=(self.get_clock().now().nanoseconds
+                    -scan.header.stamp.sec*1_000_000_000-scan.header.stamp.nanosec)/1e9
+                self.global_geometry_report['source_age_sec']=round(source_age,4)
+                self.global_geometry_report['verified'] &= -.1<=source_age<=.30
+                self.global_geometry_at=now
+
+    def _global_pose_is_verified(self, now):
+        if not getattr(self, 'global_verification_required', False):
+            return True
+        return (0<=now-self.global_geometry_at<=2*self.map_match_period
+                and self.global_geometry_report.get('verified') is True)
 
     def _map_match_status(self, now):
         return map_match_status(
@@ -1749,6 +1780,9 @@ class LocalizationManager(Node):
             or self.spin_restoring_heading
         ):
             return
+        if not self._global_pose_is_verified(time.monotonic()):
+            return
+        self.global_verification_required = False
         self.suspect_since = None
         self.stationary_map_guard.reset()
         self.map_match_unknown_since = None
@@ -1816,6 +1850,7 @@ class LocalizationManager(Node):
         self.recovery_reason = reason
         self.global_attempts = 0
         self.mild_map_guard.reset()
+        self.post_lateral_observation = False
         self.lateral_attempted = False
         self.lateral_abort_reason = None
         self.spin_sequence = []
@@ -1967,6 +2002,9 @@ class LocalizationManager(Node):
             self._require_manual("AMCL 全域重新定位服務未就緒")
             return
         self.global_localization_client.call_async(Empty.Request())
+        self.global_verification_required = True
+        self.global_geometry_at = 0.
+        self.global_geometry_report = {}
         self.global_attempts += 1
         self.stable_samples = 0
         self._reset_map_match_history()
@@ -2023,9 +2061,9 @@ class LocalizationManager(Node):
                     if not self.global_grace_announced:
                         self.global_grace_announced = True
                         self.get_logger().warning(
-                            "雷達地圖已吻合但 AMCL covariance 尚未收斂；"
-                            f"延長觀察至最多 {self.global_max_wait:.0f} 秒"
-                        )
+                            ('⏳ 全域候選幾何待確認；' if not self._global_pose_is_verified(now)
+                             else '⏳ 等待 AMCL covariance 收斂；')
+                            +f'延長觀察至最多 {self.global_max_wait:.0f} 秒')
                     return
                 if self._convergence_grace(
                     now, self.global_max_wait, self.global_convergence_max_wait
@@ -2060,7 +2098,14 @@ class LocalizationManager(Node):
         # A subsequent independent AMCL callback can now satisfy the existing
         # six-sample healthy rule and mark LOCALIZED without any new motion.
         # Do not consume the one sidestep on a transient callback-phase gap.
-        if self._lateral_sensors_ready(now) and now-self.last_lateral_probe_at>=1.0:
+        if getattr(self,'post_lateral_observation',False):
+            elapsed=now-self.second_guard_started_at
+            if elapsed < min(6.,self.second_guard_wait):
+                return
+            if self.stable_samples > 0 and elapsed < self.second_guard_wait:
+                return
+        if (not getattr(self,'post_lateral_observation',False)
+                and self._lateral_sensors_ready(now) and now-self.last_lateral_probe_at>=1.0):
             self.last_lateral_probe_at=now
             if self._try_lateral_recovery(now):
                 return
@@ -2317,7 +2362,13 @@ class LocalizationManager(Node):
                 elif self.lateral_abort_reason:
                     self._require_manual("橫移已停止：" + self.lateral_abort_reason)
                 else:
-                    self._start_global_recovery()
+                    self.post_lateral_observation = True
+                    self.second_guard_started_at = now
+                    self.second_guard_reason = '橫移後定位尚未收斂'
+                    self.second_guard_scan_stamp_ns = self.second_guard_amcl_stamp_ns = 0
+                    self.recovery_step = 'second_guard_wait'
+                    self.stable_samples = 0
+                    self.get_logger().warning('⏳ 橫移停妥，先觀察定位與旋轉視野')
             elif now - self.lateral_stop_started_at > 4.0 and self.state != 'MANUAL_REQUIRED':
                 self._require_manual('融合節點尚未確認安全解除：'
                                      +json.dumps(self.lateral_guard, ensure_ascii=False))

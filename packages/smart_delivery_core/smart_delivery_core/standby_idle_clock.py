@@ -13,13 +13,32 @@ class StandbyIdleClock:
         self.last_tick = None
         self.pause_since = None
         self.odom_anchor = None
+        self.data_pause_since = None
         self.reason = 'not_verified_parked'
 
     def mark_parked(self, point):
         self.point = dict(point)
         self.reset()
 
-    def update(self, now, *, parked, safe, stationary, pose, odom):
+    def update(self, now, *, parked, safe, stationary, pose, odom, transient_tf_gap=False):
+        # Auxiliary time only: no motion can be authorized on missing TF.
+        if (transient_tf_gap and parked and stationary and self.point is not None
+                and odom is not None and all(math.isfinite(v) for v in odom)):
+            moved = (self.odom_anchor is not None and (
+                math.hypot(odom[0]-self.odom_anchor[0],odom[1]-self.odom_anchor[1])>.02
+                or abs(math.atan2(math.sin(odom[2]-self.odom_anchor[2]),
+                                  math.cos(odom[2]-self.odom_anchor[2])))>.035))
+            self.data_pause_since = now if self.data_pause_since is None else self.data_pause_since
+            if moved or now-self.data_pause_since>1.:
+                self.reset()
+                self.reason='physical_odom_displacement' if moved else 'tf_gap_expired'
+            else:
+                self.last_tick=None
+                self.reason='short_tf_gap_paused'
+            return False
+        if self.data_pause_since is not None and now-self.data_pause_since>1.:
+            self.reset()
+        self.data_pause_since = None
         if not parked or not safe or not stationary or self.point is None or pose is None or odom is None:
             self.reset()
             self.reason = 'not_parked_or_unsafe_or_moving'

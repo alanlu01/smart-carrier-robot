@@ -447,6 +447,11 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
         node._tick_lateral_motion()
     assert node.lateral_phase is None
     assert not lease.enabled
+    assert node.started_spins == []
+    assert node.recovery_step == 'second_guard_wait' and node.post_lateral_observation
+    node._recovery_spin_clear = lambda _now: True
+    clock.now += 6.1
+    node._tick_state_machine()
     assert node.started_spins == ['global']
     assert {'start','motion_authorized','deceleration','zero_command','wheels_stopped'} <= node.lateral_motion_timing.keys()
     assert not node._try_lateral_recovery(clock.now)  # never a second translation
@@ -592,7 +597,8 @@ def test_two_hz_independent_wheel_groups_can_confirm_real_stop(manager):
         node._tick_lateral_motion()
     assert node.lateral_phase is None
     assert not lease.enabled
-    assert node.started_spins == ['global']
+    assert not node.started_spins
+    assert node.recovery_step == 'second_guard_wait' and node.post_lateral_observation
 
 
 def test_stop_does_not_require_clear_laser_but_does_require_physical_wheels(manager):

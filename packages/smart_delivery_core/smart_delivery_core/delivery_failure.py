@@ -5,13 +5,16 @@ import time
 
 def stop_after_failure(runtime, *, timeout=5., spin_once=None):
     """Stop lease renewal, cancel accepted/pending goals, verify a fresh stop."""
-    if spin_once is None:
+    uses_ros = spin_once is None
+    if uses_ros:
         import rclpy
         spin_once = lambda: rclpy.spin_once(runtime.navigator, timeout_sec=.05)
     runtime.observation_collecting = False
     # Keep the independent guard armed: publishing False would release it.
     runtime.suspend_lease()
     runtime.cancel_requested = True
+    if uses_ros and not rclpy.ok():
+        return dict(stopped=False, action_drained=False, reason='ros_context_unavailable', errors=[])
     navigator = runtime.navigator
     deadline = time.monotonic() + timeout
     last_cancel, stopped_since = -float('inf'), None
@@ -21,6 +24,8 @@ def stop_after_failure(runtime, *, timeout=5., spin_once=None):
     cancel = None
     errors = []
     while time.monotonic() < deadline:
+        if uses_ros and not rclpy.ok():
+            return dict(stopped=False, action_drained=False, reason='ros_context_unavailable', errors=errors)
         now = time.monotonic()
         try:
             if request is not None and request.done():

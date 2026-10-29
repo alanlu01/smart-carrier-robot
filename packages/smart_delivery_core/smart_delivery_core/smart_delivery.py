@@ -486,13 +486,12 @@ def go_to_standby(
     optional_interrupt_requested=lambda: False,
 ):
     """尋找最近的待機點並前往避讓"""
-    print("\n💤 準備返回待機點")
     closest_standby = standby_point or min(
         STANDBY_POINTS,
         key=lambda pt: math.hypot(pt["x"] - current_pos["x"], pt["y"] - current_pos["y"]),
     )
 
-    print(f"➡️ 前往待機點：{closest_standby['name']}")
+    navigator.get_logger().info(f"➡️ 前往待機點：{closest_standby['name']}")
     goal_pose = PoseStamped()
     goal_pose.header.frame_id = "map"
     goal_pose.header.stamp = navigator.get_clock().now().to_msg()
@@ -546,7 +545,6 @@ def go_to_standby(
         )
         return None
 
-    print(f"💤 已停妥：{closest_standby['name']}，等待新任務")
     on_outcome(closest_standby, "arrived")
     return {"x": closest_standby["x"], "y": closest_standby["y"]}
 
@@ -555,10 +553,22 @@ def main():
     """Retain the original traceback and stop owned actions before fatal exit."""
     import traceback
     from smart_delivery_core.delivery_failure import stop_after_failure
+    from smart_delivery_core.delivery_signals import DeliverySignals, DeliveryStop
     runtime_holder = []
     try:
-        return _run_delivery(runtime_holder)
-    except (Exception, KeyboardInterrupt):
+        with DeliverySignals():
+            try:
+                return _run_delivery(runtime_holder)
+            except (DeliveryStop, KeyboardInterrupt):
+                if runtime_holder:
+                    runtime = runtime_holder[0]
+                    report = stop_after_failure(runtime)
+                    if report['stopped']:
+                        runtime.navigator.get_logger().info('🛑 配送已停止')
+                    else:
+                        runtime.navigator.get_logger().warning('⚠️ 配送結束；停妥未確認，安全保護維持')
+                return
+    except Exception:
         if runtime_holder:
             runtime = runtime_holder[0]
             try:
@@ -572,10 +582,14 @@ def main():
             except Exception:
                 traceback.print_exc()
         raise
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def _run_delivery(runtime_holder):
-    rclpy.init()
+    from rclpy.signals import SignalHandlerOptions
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     navigator = DeliveryNavigator()
     tf_buffer = Buffer()
     _tf_listener = TransformListener(tf_buffer, navigator)
@@ -696,6 +710,8 @@ def _run_delivery(runtime_holder):
             )
         elif state == "arrived":
             standby_retry.reset()
+            if last_standby_status != (point['name'],'arrived',0):
+                navigator.get_logger().info(f"💤 已停妥：{point['name']}，等待新任務")
             if optional_runtime is not None and last_standby_status != (point['name'],'arrived',0):
                 optional_runtime.mark_parked(point)
         payload = {

@@ -47,3 +47,31 @@ def test_executor_gap_cannot_count_as_healthy_stationary_time():
     tick(clock,0.);tick(clock,.5)
     tick(clock,30.)
     assert clock.elapsed==0.
+
+
+def test_short_tf_gap_preserves_only_existing_elapsed_time():
+    clock=StandbyIdleClock();clock.mark_parked(POINT)
+    tick(clock,0.);tick(clock,.5);before=clock.elapsed
+    assert not tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
+    assert clock.elapsed==before
+    assert tick(clock,1.5) and clock.elapsed==before
+    assert tick(clock,2.) and clock.elapsed==before+.5
+
+
+def test_persistent_gap_and_movement_still_reset_idle_time():
+    clock=StandbyIdleClock();clock.mark_parked(POINT)
+    tick(clock,0.);tick(clock,.5)
+    tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
+    tick(clock,2.1,safe=False,pose=None,transient_tf_gap=True)
+    assert clock.elapsed==0.
+    tick(clock,2.5);tick(clock,3.)
+    tick(clock,3.5,safe=False,pose=None,odom=(.03,0,0),transient_tf_gap=True)
+    assert clock.elapsed==0.
+
+
+def test_returning_fresh_after_one_second_cannot_preserve_unobserved_time():
+    clock=StandbyIdleClock();clock.mark_parked(POINT)
+    tick(clock,0.);tick(clock,.5)
+    tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
+    tick(clock,2.5)
+    assert clock.elapsed==0.

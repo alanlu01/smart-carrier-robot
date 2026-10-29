@@ -55,6 +55,8 @@ TOPICS=(
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health
   /lidar/pipeline_health
   /order /smart_carrier/task_state
+  /bond /amcl/transition_event /map_server/transition_event
+  /controller_server/transition_event /bt_navigator/transition_event /behavior_server/transition_event
   /smart_carrier/task_result /smart_carrier/task_result_ack
   /smart_carrier/task_cancel /diagnostics /rosout
 )
@@ -77,7 +79,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261021-parking-recovery-and-transport-audit\n'
+  printf 'diagnostic_schema=20261029-global-gate-and-nav2-transcript\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \

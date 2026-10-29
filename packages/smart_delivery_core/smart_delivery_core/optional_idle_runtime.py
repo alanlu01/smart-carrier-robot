@@ -493,7 +493,11 @@ class OptionalIdleRuntime:
         transition = key != self.log_key
         progress = self.state in ('observing', 'waiting_observation_stop', 'waiting_observation_retry',
             'waiting_people_localization','waiting_people_parking_recovery') and now-self.last_progress_log >= 5.
-        if not transition and not progress:
+        idle_progress = (self.state=='idle' and self.idle_clock.point is not None
+            and self.idle_clock.reason=='counting_verified_stationary_parking'
+            and self.ready() and self._localization_phase() in (None,'LOCALIZED')
+            and not self.inhibited and now-self.last_progress_log>=30.)
+        if not transition and not progress and not idle_progress:
             return
         self.log_key, self.last_progress_log = key, now
         point = self.goal or {}
@@ -501,6 +505,11 @@ class OptionalIdleRuntime:
                 else people_status(self.state,self.reason,point,
                     math.degrees(self.spin_travel),self.parking_attempts,
                     self.spin_ready_blocker if self.spin_ready_blocker!='not_waiting' else ''))
+        if idle_progress:
+            cooldown=max(0.,self.next_people_at-now)
+            remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
+            text='💤 已停妥：'+str(self.idle_clock.point['name'])+'｜'+(
+                f'人流冷卻 {cooldown:.0f} 秒' if cooldown>0 else f'人流待機剩餘 {remaining:.0f} 秒')
         self.navigator.get_logger().info(text)
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
@@ -568,9 +577,13 @@ class OptionalIdleRuntime:
                     logger.warning(message)
                 else:
                     logger.info(message)
+                self.safety_console_waiting = True
                 self.safety_log_key,self.safety_log_at = key,now
         else:
             self.safety_log_key = None
+            if getattr(self,'safety_console_waiting',False):
+                self.navigator.get_logger().info('✅ 定位／感測已恢復')
+                self.safety_console_waiting = False
         return not failed
 
     def _clear_to_spin(self, require_stationary=True):
@@ -1268,8 +1281,14 @@ class OptionalIdleRuntime:
         pose = self._pose()
         odom = None if self.last_odom is None else self.last_odom[1].pose.pose
         odom_pose = None if odom is None else (odom.position.x,odom.position.y,yaw_of(odom.orientation))
-        if not self.idle_clock.update(now,parked=parked,safe=self._safe(),
-                                     stationary=self._stationary(),pose=pose,odom=odom_pose):
+        safe=self._safe()
+        stationary=self._stationary()
+        transient=(not safe or pose is None) and (
+            self.safety_report.get('failed_checks') in ([],['map_pose_valid'])
+            and self._localization_phase() == 'LOCALIZED')
+        if not self.idle_clock.update(now,parked=parked,safe=safe,
+                                     stationary=stationary,pose=pose,odom=odom_pose,
+                                     transient_tf_gap=transient):
             if self.idle_clock.elapsed == 0.:
                 self.idle_since = None
             return False

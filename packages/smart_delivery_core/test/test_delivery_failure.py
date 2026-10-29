@@ -26,6 +26,11 @@ def test_real_rcutils_idle_moving_idle_severity_transitions():
         runtime.state = 'observing' if moving else 'idle'
         runtime.safety_log_at = -float('inf')
         assert runtime._safe() is False
+    runtime._pose=lambda:dict(x=0.,y=0.,yaw=0.)
+    runtime.last_odom=(100.,SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=100,nanosec=0))))
+    runtime._stamp_fresh=lambda *_:True
+    assert runtime._safe() is True
+    assert runtime.safety_console_waiting is False
 
 
 @pytest.mark.parametrize('pending,stopped,drained', [(False,True,True),(True,True,True),
@@ -65,3 +70,34 @@ def test_entrypoint_retains_original_exception_after_cleanup(monkeypatch):
         smart_delivery.main()
     assert caught.value is original and cleaned == [runtime]
     assert 'ValueError: injected optional failure' in messages[0]
+
+
+@pytest.mark.parametrize('stopped',[True,False])
+def test_requested_stop_has_no_traceback_and_restores_signal_handlers(monkeypatch,stopped):
+    import signal
+    from smart_delivery_core import smart_delivery
+    from smart_delivery_core.delivery_signals import DeliveryStop
+    before=signal.getsignal(signal.SIGINT)
+    messages=[]
+    runtime=SimpleNamespace(navigator=SimpleNamespace(get_logger=lambda:SimpleNamespace(
+        info=messages.append,warning=messages.append,error=lambda _:pytest.fail('normal stop logged as error'))))
+    def run(holder):
+        holder.append(runtime)
+        raise DeliveryStop()
+    monkeypatch.setattr(smart_delivery,'_run_delivery',run)
+    monkeypatch.setattr(delivery_failure,'stop_after_failure',lambda _:dict(stopped=stopped))
+    smart_delivery.main()
+    assert len(messages)==1 and 'Traceback' not in messages[0]
+    assert signal.getsignal(signal.SIGINT)==before
+
+
+def test_invalid_ros_context_returns_without_retrying_executor(monkeypatch):
+    import rclpy
+    calls=[]
+    monkeypatch.setattr(rclpy,'ok',lambda:False)
+    monkeypatch.setattr(rclpy,'spin_once',lambda *_args,**_kwargs:pytest.fail('invalid context spun'))
+    runtime=SimpleNamespace(observation_collecting=True,cancel_requested=False,
+                            suspend_lease=lambda:calls.append('suspend'))
+    report=delivery_failure.stop_after_failure(runtime)
+    assert report['reason']=='ros_context_unavailable' and not report['stopped']
+    assert calls==['suspend']
