@@ -163,13 +163,17 @@ def spin_scan_report(scan, sensor_pose, self_mask=None, sensor_z=0.0,
                               obstacle_x=round(x, 4), obstacle_y=round(y, 4))
                 return report
         known.append(valid)
-    run = longest = 0
-    for valid in known+known:
+    run = longest = start = 0
+    for index, valid in enumerate(known+known):
         run = 0 if valid else run+1
-        longest = max(longest, run)
+        if run > longest:
+            longest, start = min(run,len(known)), index-run+1
     gap = min(longest, len(known))*abs(scan.angle_increment)*180/math.pi
     fraction = sum(known)/len(known)
     clear = fraction >= .75 and gap <= max_unknown_deg
     report.update(clear=clear, reason='clear' if clear else 'unknown_coverage',
                   valid_fraction=round(fraction, 4), missing_arc_deg=round(gap, 3))
+    if longest:
+        angle = scan.angle_min + (start % len(known))*scan.angle_increment + yaw
+        report['missing_start_base_deg'] = round(math.degrees(math.atan2(math.sin(angle),math.cos(angle))),3)
     return report

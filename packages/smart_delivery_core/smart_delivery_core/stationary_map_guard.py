@@ -3,7 +3,7 @@ import math
 
 
 class StationaryMapGuard:
-    """Ignore brief occlusion, never ignore persistent critical mismatch forever."""
+    """Latch a suspicion until recovered; count only fresh, qualified evidence."""
     def __init__(self, duration=10., samples=5, maximum_gap=2.5):
         self.duration, self.samples, self.maximum_gap = duration, samples, maximum_gap
         self.reset()
@@ -13,19 +13,27 @@ class StationaryMapGuard:
         self.count = 0
         self.elapsed = 0.
         self.confirmed = False
+        self.pending = False
 
     @property
     def active(self):
-        return self.started is not None
+        return self.pending
 
-    def observe(self, now, source, qualified):
-        if not qualified or not all(math.isfinite(v) for v in (now, source)):
+    def observe(self, now, source, qualified, *, recovered=None):
+        if recovered is True:
             self.reset()
+            return False
+        if not qualified or not all(math.isfinite(v) for v in (now, source)):
+            pending = self.pending and recovered is False
+            self.reset()
+            self.pending = pending
             return False
         if self.last_source is not None and (source < self.last_source
                 or source-self.last_source > self.maximum_gap
                 or now-self.last_source > self.maximum_gap):
-            self.reset()
+            self.started = self.last_source = None
+            self.count, self.elapsed, self.confirmed = 0, 0., False
+        self.pending = True
         if self.last_source != source:
             if self.started is None:
                 self.started = source

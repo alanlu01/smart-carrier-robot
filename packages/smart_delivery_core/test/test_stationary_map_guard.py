@@ -23,3 +23,14 @@ def test_same_stamp_gaps_and_occlusion_never_fake_persistent_evidence():
     ({'dispatch_allowed':True},True),({'dispatch_allowed':'true'},False),(None,False)])
 def test_dispatch_supplements_ready_not_string_coercion(state,allowed):
     assert dispatch_permitted(state)==allowed
+
+
+def test_degraded_scores_and_short_uncertain_gap_do_not_release_pending_dispatch():
+    g=StationaryMapGuard()
+    assert not g.observe(100.,100.,True,recovered=False)
+    assert not g.observe(101.,101.,False,recovered=False)
+    assert g.active and g.count==0
+    for t in range(102,112):
+        assert not g.observe(t,t,True,recovered=False)
+    assert g.observe(112.,112.,True,recovered=False)
+    assert not g.observe(113.,113.,False,recovered=True) and not g.active

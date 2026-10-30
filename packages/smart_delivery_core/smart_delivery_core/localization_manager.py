@@ -70,6 +70,7 @@ from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
 from smart_delivery_core.delivery_console import localization_label, brief, reason_label
 from smart_delivery_core.global_pose_gate import ray_consistency
+from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
 
 
 STATE_QOS = QoSProfile(
@@ -1469,13 +1470,19 @@ class LocalizationManager(Node):
                 and now - self.map_match_unknown_since >= self.map_match_stale_grace
             )
             map_match_bad = match_status in {"critical", "degraded"} or map_match_stale
-            stationary_mismatch = self.stationary_map_guard.observe(now,self.latest_map_score_at,
-                match_status=='critical' and self.latest_quality.healthy
+            stationary_evidence_ready = (self.latest_quality.healthy
                 and not self.commanded_motion and not self.odom_motion
                 and not self._verification_data_blockers(now)
                 and self.latest_map_sector_count>=self.map_match_min_sectors
                 and self.latest_map_near_fraction<=.60
                 and self._mild_map_sources_fresh())
+            stationary_recovered = (stationary_evidence_ready
+                and self._map_match_has_recovered(now))
+            stationary_mismatch = self.stationary_map_guard.observe(
+                now, self.latest_map_score_at,
+                stationary_evidence_ready and (match_status in ('critical','degraded')
+                    or self.stationary_map_guard.active),
+                recovered=stationary_recovered)
             suspicion_required = localization_suspicion_required(
                 "unknown" if map_match_stale else match_status,
                 self.latest_quality.healthy,
@@ -1486,6 +1493,7 @@ class LocalizationManager(Node):
             if match_status != 'degraded':
                 self.mild_map_guard.reset()
             if (self.mild_map_enabled and match_status == 'degraded'
+                    and not self.stationary_map_guard.active
                     and self.latest_quality.healthy and not self.motion_inhibited
                     and not self._verification_data_blockers(now)
                     and now-self.latest_raw_scan_at <= .30
@@ -1498,13 +1506,16 @@ class LocalizationManager(Node):
                     and self.mild_map_guard.allows(now, self.latest_map_score_at, self.last_odom_pose)):
                 self.mild_map_active = True
                 return
-            if self.latest_quality.critical or (map_match_bad and suspicion_required):
+            if (self.latest_quality.critical or stationary_mismatch
+                    or (map_match_bad and suspicion_required)):
                 if self.suspect_since is None:
                     self.suspect_since = now
                     self.stable_samples = 0
                     self.last_stable_map_score_at = self.latest_map_score_at
                     self.verification_pose_anchor = self.latest_pose
-                    if match_status == "critical":
+                    if stationary_mismatch:
+                        reason = '待機地圖吻合度持續未恢復，需重新確認位置'
+                    elif match_status == "critical":
                         reason = f"雷達地圖吻合度過低 ({self.latest_map_score:.2f})"
                     elif match_status == "degraded":
                         reason = (
@@ -2135,6 +2146,12 @@ class LocalizationManager(Node):
             if not -.1 <= age <= .30:
                 self.second_guard_report.update(reason='odom_tf_stale', odom_tf_age_sec=age)
                 return False
+            base_pose = (tf.transform.translation.x, tf.transform.translation.y,
+                         quaternion_to_yaw(tf.transform.rotation))
+            ros_now = self.get_clock().now().nanoseconds / 1e9
+            if not hasattr(self, 'recovery_scan_evidence'):
+                self.recovery_scan_evidence = RecoveryScanEvidence()
+            all_clear = True
             for name, scan in (('scan', self.latest_raw_scan), ('scan_filtered', self.latest_scan)):
                 tf = self.tf_buffer.lookup_transform('base_footprint', scan.header.frame_id, Time()).transform
                 if abs(tf.rotation.x)>1e-4 or abs(tf.rotation.y)>1e-4:
@@ -2142,12 +2159,37 @@ class LocalizationManager(Node):
                     return False
                 report = spin_scan_report(scan, (tf.translation.x, tf.translation.y,
                     quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z)
+                # Timestamped odom only: global AMCL is deliberately untrusted.
+                # A current near return always wins; history only fills holes.
+                if report.get('reason') in ('clear','unknown_coverage','obstacle_in_rotation_sweep'):
+                    stamp = Time(nanoseconds=scan.header.stamp.sec*1_000_000_000
+                                 + scan.header.stamp.nanosec)
+                    laser = self.tf_buffer.lookup_transform('odom', scan.header.frame_id, stamp).transform
+                    base = self.tf_buffer.lookup_transform('odom', 'base_footprint', stamp).transform
+                    for q in (laser.rotation, base.rotation):
+                        if (abs(q.x)>1e-4 or abs(q.y)>1e-4
+                                or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
+                            raise ValueError('unsupported recovery evidence tilt/quaternion')
+                    self.recovery_scan_evidence.observe(name, scan,
+                        self.latest_raw_scan_at if name=='scan' else self.latest_scan_at,
+                        (laser.translation.x,laser.translation.y,quaternion_to_yaw(laser.rotation)),
+                        (base.translation.x,base.translation.y,quaternion_to_yaw(base.rotation)),
+                        (tf.translation.x,tf.translation.y,quaternion_to_yaw(tf.rotation)),
+                        self.lateral_self_mask,tf.translation.z)
+                    if report.get('reason') == 'unknown_coverage':
+                        history = self.recovery_scan_evidence.report(name,base_pose,now,ros_now)
+                        report['recent_evidence'] = history
+                        if history['clear']:
+                            report.update(clear=True,reason='recent_measured_coverage')
                 self.second_guard_report['scans'][name] = report
                 if not report['clear']:
-                    self.second_guard_report['reason'] = name+'_'+report['reason']
-                    return False
+                    if all_clear:
+                        self.second_guard_report['reason'] = name+'_'+report['reason']
+                    all_clear = False
         except (TransformException, AttributeError, TypeError, ValueError) as exc:
             self.second_guard_report['reason'] = 'transform_or_geometry_error: '+str(exc)
+            return False
+        if not all_clear:
             return False
         self.second_guard_report['reason'] = 'clear'
         return True

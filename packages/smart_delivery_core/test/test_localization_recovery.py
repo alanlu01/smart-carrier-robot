@@ -658,6 +658,21 @@ def test_stationary_critical_mismatch_is_bounded_and_requires_valid_broad_fresh_
     assert node.state=='SUSPECT'
 
 
+def test_stationary_degraded_mismatch_is_not_reset_by_point_two_rebound(manager):
+    node,clock=manager
+    node.state='LOCALIZED';node.recovery_step=None
+    node.map_match_unknown_since=None;node.last_map_only_warning_at=0.
+    node._mild_map_sources_fresh=lambda:True
+    node._set_state=lambda state,reason:(setattr(node,'state',state),setattr(node,'ready',False))
+    for at in range(100,111):
+        score=.18 if at<104 else .23
+        node.latest_map_score=score;node.map_score_window=deque([score]*5)
+        fresh(node,clock,float(at));node.last_amcl_at=clock.now
+        node._tick_state_machine()
+        assert node.stationary_map_guard.active
+    assert node.state=='SUSPECT'
+
+
 def test_lateral_rejection_does_not_consume_attempt_and_safe_space_can_recover_at_five_seconds(manager):
     node,clock,_=lateral_harness(manager)
     node._lateral_path_clear=lambda *_:False

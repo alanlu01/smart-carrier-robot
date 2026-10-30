@@ -53,6 +53,18 @@ class NavigationTranscript:
         self.thread.join(timeout=.5)
 
     def _run(self):
+        streams = {}
+        try:
+            self._write_pending(streams)
+        finally:
+            for stream in streams.values():
+                try:
+                    stream.close()
+                except OSError as exc:
+                    with self.condition:
+                        self.error = str(exc)[:300]
+
+    def _write_pending(self, streams):
         while True:
             with self.condition:
                 self.condition.wait_for(lambda:self.closed or self.pending)
@@ -67,8 +79,10 @@ class NavigationTranscript:
                         payload.update(dropped_bytes=self.dropped_bytes,write_error=self.error)
                     data=json.dumps(payload).encode()+b'\n'
                 self.directory.mkdir(parents=True,exist_ok=True)
-                with (self.directory/suffix).open('ab') as stream:
-                    stream.write(data)
+                if suffix not in streams:
+                    streams[suffix] = (self.directory/suffix).open('ab')
+                streams[suffix].write(data)
+                streams[suffix].flush()
             except OSError as exc:
                 with self.condition:
                     self.error=str(exc)[:300]

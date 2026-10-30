@@ -25,6 +25,7 @@ from hailo_vision.semantic_protocol import (
 from hailo_vision.pipeline_metrics import PipelineMetrics
 from hailo_vision.recovery_lease import LocalizationSpeedLimit, RecoveryLease
 from smart_delivery_core.wheel_feedback import WheelStopEvidence
+from hailo_vision.semantic_association import TargetRangeHistory, range_association
 
 class SensorFusionNode(Node):
     def __init__(self):
@@ -43,7 +44,9 @@ class SensorFusionNode(Node):
         self.last_person_limit_at = None
         self.held_person_multiplier = 1.0
         self.person_safety_state = 'clear'
-        self.history = {} 
+        self.target_ranges = TargetRangeHistory()
+        self.association_diagnostics = {}
+        self.last_stop_association = {}
         self.pipeline_metrics = PipelineMetrics(time.monotonic())
         self.last_pipeline_report_at = time.monotonic()
         self.semantic_sequence = None
@@ -262,6 +265,8 @@ class SensorFusionNode(Node):
             )
             payload['localization_speed_limit'] = self.localization_speed_limit.limit(now)
             payload['recovery_guard_blocked'] = self.recovery_lease.blocked(now)
+            payload['association'] = getattr(self,'association_diagnostics',{})
+            payload['last_stop_association'] = getattr(self,'last_stop_association',{})
             if payload['recovery_guard_blocked']:
                 payload['effective_speed_multiplier'] = 0.0
             message = String()
@@ -550,6 +555,13 @@ class SensorFusionNode(Node):
             self._update_glass_tracker([], scan_msg.header)
             return
 
+        now = time.monotonic()
+        self.target_ranges.begin_frame(now)
+        scan_ns = scan_msg.header.stamp.sec*1_000_000_000+scan_msg.header.stamp.nanosec
+        self.association_diagnostics = dict(sequence=self.semantic_sequence,
+            semantic_stamp_ns=self.latest_semantic_stamp_ns,scan_stamp_ns=scan_ns,
+            sync_skew_sec=(round((scan_ns-self.latest_semantic_stamp_ns)/1e9,4)
+                if self.latest_semantic_stamp_ns is not None else None),targets=[])
         if not detections:
             self._set_speed_multiplier(self._apply_person_clear_hold(1.0))
             self._update_glass_tracker([], scan_msg.header)
@@ -563,40 +575,18 @@ class SensorFusionNode(Node):
             cls_id = target['id']
             display_angle_deg = target['angle']
 
-            if cls_id not in self.history:
-                self.history[cls_id] = {'angle': deque(maxlen=5), 'dist': deque(maxlen=5)}
-
-            if len(self.history[cls_id]['angle']) > 0:
-                last_angle = self.history[cls_id]['angle'][-1]
-                if abs(display_angle_deg - last_angle) > 20.0:
-                    self.history[cls_id]['angle'].clear()
-                    self.history[cls_id]['dist'].clear()
-
             # 鏡像修正與 Index 計算
             LIDAR_DIR_MULTIPLIER = -1.0  
             lidar_target_angle_deg = 180.0 + (display_angle_deg * LIDAR_DIR_MULTIPLIER)
             lidar_target_angle_rad = math.radians(lidar_target_angle_deg % 360.0)
             
-            angle_offset = (lidar_target_angle_rad - scan_msg.angle_min + 2 * math.pi) % (2 * math.pi)
-            center_index = int(angle_offset / scan_msg.angle_increment)
-            
-            target_width_deg = (target['bbox_width'] / 640.0) * 68.0
-            search_window_deg = max((target_width_deg / 2) * 1.2, 3.0) 
-            window_idx = int(math.radians(search_window_deg) / scan_msg.angle_increment)
-
-            valid_distances = []
-            for i in range(-window_idx, window_idx + 1):
-                idx = (center_index + i) % len(scan_msg.ranges)
-                dist = scan_msg.ranges[idx]
-                if 0.35 < dist < scan_msg.range_max and not math.isinf(dist) and not math.isnan(dist):
-                    valid_distances.append(dist)
-
-            if not valid_distances:
+            raw_dist, diagnostic = range_association(target,scan_msg)
+            diagnostic.update(class_id=cls_id,score=target.get('score'),
+                angle_deg=display_angle_deg,bbox_width=target['bbox_width'])
+            if len(self.association_diagnostics['targets']) < 16:
+                self.association_diagnostics['targets'].append(diagnostic)
+            if raw_dist is None:
                 continue
-
-            valid_distances.sort()
-            raw_dist = valid_distances[1] if len(valid_distances) > 1 else valid_distances[0]
-            raw_dist = raw_dist - 0.0
 
             # ==========================================
             # 🛡️ 玻璃專屬處理 (ID: 10)
@@ -613,11 +603,8 @@ class SensorFusionNode(Node):
                 continue # 玻璃不參與減速邏輯，交給 Costmap 處理
 
             # 紀錄其他目標的歷史
-            self.history[cls_id]['angle'].append(display_angle_deg)
-            self.history[cls_id]['dist'].append(raw_dist)
-            
-            # 👇 🌟 關鍵修改 1：捨棄中位數 (np.median)，改用 min 確保對最近危險立刻反應！
-            smooth_dist = float(min(self.history[cls_id]['dist']))
+            smooth_dist, track = self.target_ranges.observe(target,raw_dist,now)
+            diagnostic.update(track=track,held_distance_m=round(smooth_dist,3))
 
             # 禮讓邏輯 (人、車等)
             if cls_id in [0, 2, 3, 4]:
@@ -631,6 +618,9 @@ class SensorFusionNode(Node):
 
         # 更新全局速度與玻璃追蹤
         current_multiplier = self._apply_person_clear_hold(current_multiplier)
+        self.association_diagnostics['detected_multiplier'] = current_multiplier
+        if current_multiplier == 0.:
+            self.last_stop_association = dict(self.association_diagnostics)
         self._set_speed_multiplier(current_multiplier, person_limit_reason)
         self._update_glass_tracker(glass_points_this_frame, scan_msg.header)
 

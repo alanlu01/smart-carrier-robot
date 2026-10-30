@@ -790,7 +790,9 @@ class OptionalIdleRuntime:
             self.observation_alignment = None
         if state == 'observing' and self.observation_session_deadline is not None:
             self.deadline = min(self.deadline, self.observation_session_deadline)
-        self._log_people_state()
+        # Parking caller updates attempts/outcome immediately after success.
+        if state != 'going_people_standby':
+            self._log_people_state()
         return True
 
     def _people_finished(self, reason, terminal_state='idle'):

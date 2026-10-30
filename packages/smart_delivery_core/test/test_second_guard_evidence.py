@@ -101,3 +101,33 @@ def test_second_wait_preserves_existing_time_and_motion_limits(manager):
     assert n.second_guard_wait==8. and n.stable_samples_required==6
     assert n.healthy_xy_std==.25 and n.healthy_yaw_std==.17
     assert not n.started_spins
+
+
+def test_real_second_spin_guard_uses_both_streams_and_obstacle_overrides_history(manager):
+    import math
+    from geometry_msgs.msg import TransformStamped
+    from smart_delivery_core.localization_manager import LocalizationManager
+    n,c=manager
+    n.auto_motion_recovery=True;n._lateral_sensor_blockers=lambda _:[]
+    def lookup(parent,child,stamp):
+        tr=TransformStamped();tr.header.stamp.sec=int(c.now)
+        tr.header.stamp.nanosec=round((c.now-int(c.now))*1e9)
+        tr.transform.rotation.w=1.
+        if child=='laser':
+            tr.transform.translation.x=.15;tr.transform.translation.y=-.025
+            tr.transform.translation.z=.425;tr.transform.rotation.w=0.;tr.transform.rotation.z=1.
+        return tr
+    n.tf_buffer=SimpleNamespace(lookup_transform=lookup)
+    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int(c.now*1e9)))
+    for at,begin in ((100.,100),(100.1,300),(100.2,500)):
+        c.now=at;s=LaserScan();s.header.frame_id='laser'
+        s.header.stamp.sec=int(at);s.header.stamp.nanosec=round((at-int(at))*1e9)
+        s.angle_min=-math.pi;s.angle_increment=2*math.pi/1800
+        s.range_min=.05;s.range_max=10.;s.ranges=[3.]*1800
+        values=list(s.ranges);values[begin:begin+120]=[float('inf')]*120;s.ranges=values
+        n.latest_raw_scan=n.latest_scan=s;n.latest_raw_scan_at=n.latest_scan_at=at
+        clear=LocalizationManager._recovery_spin_clear(n,at)
+    assert clear and set(n.second_guard_report['scans'])=={'scan','scan_filtered'}
+    values=list(s.ranges);values[900]=.25;s.ranges=values
+    c.now=100.3;s.header.stamp.nanosec=300000000
+    assert not LocalizationManager._recovery_spin_clear(n,c.now)
