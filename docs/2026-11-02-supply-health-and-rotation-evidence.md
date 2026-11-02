@@ -16,6 +16,8 @@
   也不能銜接取還確認次數。
 - 取還中短暫異常先暫停確認並顯示供電訊息；持續低壓 2 秒即明確失敗，
   其他無效資料連續 5 秒或完全沒有資料 10 秒亦明確失敗。
+  已復電但正在 5 秒恢復確認及槽位去抖時，保留最多 10 秒恢復空間，
+  避免被配送層提早誤判失敗，仍不使用無效資料確認取還。
   正常操作仍為 3 筆確認、30 秒提醒、60 秒逾時。結果可靠重送機制不變。
 - `/power_status` 新增選用 `slot_supply`：`healthy`、`state`、
   `fault_confirmed`、`failed_channels`、門檻與 `source`。既有 ch1–ch3 欄位不變。
@@ -59,7 +61,7 @@ elapsed_sec、healthy_samples）。觀察期間 ready 保持 true 以保留 acti
 
 ## 驗證與下次測試
 
-候選版本：659 項 pytest 通過（既有 copyright/flake8/PEP257 不在此回歸範圍），
+候選版本：661 項 pytest 通過（既有 copyright/flake8/PEP257 不在此回歸範圍），
 並完成 localhost/domain 231 的 ROS 啟動、日誌、SIGINT/SIGTERM 結束及
 零速限制 DDS 路徑驗證。沒有發出實車目標或非零速度，不代表已完成實車驗收。
 

@@ -11,6 +11,7 @@ class PowerActionHealth:
         self.received_at = None
         self.note = ''
         self.confirmed_fault = False
+        self.recovery_expected = False
 
     def observe(self, text, now):
         self.received_at = now
@@ -21,6 +22,10 @@ class PowerActionHealth:
             self.note = supply_failure(payload)
             supply = payload.get('slot_supply', {})
             self.confirmed_fault = supply.get('fault_confirmed') is True
+            if supply.get('state') == 'recovering':
+                self.recovery_expected = True
+            elif supply.get('state') != 'healthy':
+                self.recovery_expected = False
             slots = payload_to_slots(text, require_healthy=True)
             if self.note:
                 raise ValueError(self.note)
@@ -32,6 +37,7 @@ class PowerActionHealth:
         self.valid = True
         self.bad_since = None
         self.confirmed_fault = False
+        self.recovery_expected = False
         return slots
 
     def failure(self, now):
@@ -39,6 +45,9 @@ class PowerActionHealth:
             return ''
         if self.confirmed_fault:
             return '槽位供電不足，無法確認實體取還，任務已安全停止'
-        if self.bad_since is not None and now-self.bad_since >= 5.:
+        # Allow the monitor's 5 s recovery plus slot debounce to finish. This
+        # remains bounded; fresh but perpetually recovering data cannot wait forever.
+        limit = 10. if self.recovery_expected else 5.
+        if self.bad_since is not None and now-self.bad_since >= limit:
             return '槽位供電／感測持續無效，無法確認實體取還'
         return ''

@@ -31,6 +31,29 @@ def test_confirmed_supply_failure_is_distinct_from_slot_presence():
     assert h.observe(payload(),103.) and h.valid
 
 
+def test_brief_voltage_drop_allows_monitor_recovery_and_slot_debounce():
+    from power_monitor.supply_health import SupplyHealth
+    supply=SupplyHealth();h=PowerActionHealth()
+    health=supply.observe([12.]*3,100.)
+    h.observe(payload(slot_supply=health),100.)
+    with pytest.raises(ValueError):
+        h.observe(payload('unknown',slot_supply=supply.observe([0.]*3,100.5)),100.5)
+    for at in (101.,101.5,102.,102.5,103.,103.5,104.,104.5,105.,105.5,106.,106.5):
+        health=supply.observe([12.]*3,at)
+        with pytest.raises(ValueError):h.observe(payload('unknown',slot_supply=health),at)
+        assert not h.failure(at)
+    assert health['healthy']
+    assert h.observe(payload(slot_supply=supply.observe([12.]*3,107.)),107.) and h.valid
+
+
+def test_recovery_metadata_cannot_extend_confirmation_forever():
+    h=PowerActionHealth()
+    for at in (100.,101.,102.,103.,104.,105.,106.,107.,108.,109.,110.):
+        with pytest.raises(ValueError):
+            h.observe(payload('unknown',slot_supply=dict(healthy=False,state='recovering')),at)
+    assert h.failure(110.)
+
+
 @pytest.mark.parametrize('persistent',[False,True])
 def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_fault(persistent):
     import ast
