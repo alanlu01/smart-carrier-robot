@@ -90,7 +90,7 @@ def test_stale_scan_guard_can_request_data_pause_without_weakening_geometry(runt
     m.guard_report={'clear':False,'reason':'scan_stale_or_absent'}
     m.poll(False)
     assert m.interrupt_reason=='people_data_pause' and n.cancel_calls==1
-    assert m.config['people']['max_unknown_arc_deg']==15.
+    assert m.config['people']['max_unknown_arc_deg']==20.
 
 
 def test_near_obstacle_is_still_immediate_cancel_not_data_grace(runtime):

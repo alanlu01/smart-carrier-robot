@@ -54,6 +54,8 @@ def main():
             until=time.monotonic()+.05
             while time.monotonic()<until:rclpy.spin_once(probe,timeout_sec=.005)
         # Cover real rcutils per-callsite severity caching, without actions/leases.
+        assert not runtime._safe()
+        runtime.safety_pending_since -= .31
         for moving in (False, True, False, True, False):
             runtime.motion = moving  # Logging branch only; never poll/start an action.
             runtime.safety_log_at = -float('inf')

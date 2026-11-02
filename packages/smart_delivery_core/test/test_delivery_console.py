@@ -36,11 +36,27 @@ def test_structured_failure_survives_short_console_and_rate_limit(runtime):
     lines=[];n.get_logger=lambda:SimpleNamespace(info=lines.append,warning=lines.append)
     m._pose=lambda *_:None
     assert not m._safe()
+    assert not lines and m.last_unsafe_report['failed_checks']==['map_pose_valid']
+    t[0]+=.31
+    m._stamp_fresh=lambda *_:True
+    assert not m._safe()
     m._heartbeat()
     assert lines[0].startswith('⏳ 待機計時暫緩') and '{' not in lines[0]
     assert m.last_unsafe_report['failed_checks']==['map_pose_valid']
     assert m.last_unsafe_report['odom_source_age_sec']==0.
     assert not m._safe() and len(lines)==2  # one safe failure + one idle transition
+
+
+def test_short_console_debounce_does_not_delay_the_safety_result(runtime):
+    m,n,t=runtime
+    lines=[];n.get_logger=lambda:SimpleNamespace(info=lines.append,warning=lines.append)
+    original=m._pose
+    m._pose=lambda *_:None
+    assert not m._safe() and not lines
+    t[0]+=.08
+    assert not m._safe() and not lines
+    m._pose=original
+    assert m._safe() and not lines
 
 
 def test_cancel_pending_console_does_not_claim_spin_is_still_analysing(runtime):

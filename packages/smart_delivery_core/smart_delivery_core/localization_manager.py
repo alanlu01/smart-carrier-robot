@@ -71,6 +71,7 @@ from smart_delivery_core.localization_quality_history import LocalizationQuality
 from smart_delivery_core.delivery_console import localization_label, brief, reason_label
 from smart_delivery_core.global_pose_gate import ray_consistency
 from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
+from smart_delivery_core.covariance_probe import CovarianceProbe
 
 
 STATE_QOS = QoSProfile(
@@ -95,6 +96,7 @@ class LocalizationManager(Node):
         self.mild_map_guard = MildMapGuard()
         self.stationary_map_guard = StationaryMapGuard()
         self.quality_history = LocalizationQualityHistory()
+        self.covariance_probe = CovarianceProbe()
         self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
         self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
@@ -485,6 +487,7 @@ class LocalizationManager(Node):
                                  self._recovery_guard_callback, 1)
         self.create_subscription(String, "/stm32_data", self._recovery_feedback_callback, 50)
         self.lateral_timer = self.create_timer(0.05, self._tick_lateral_motion)
+        self.evidence_timer = self.create_timer(0.05, self._drain_recovery_scans)
         self.timer = self.create_timer(0.2, self._tick)
         self._publish_state()
         self.get_logger().info(
@@ -669,6 +672,8 @@ class LocalizationManager(Node):
     @timed_operation('state_heartbeat')
     def _publish_state(self):
         now = time.monotonic()
+        if not hasattr(self, 'covariance_probe'):
+            self.covariance_probe = CovarianceProbe()
         self.last_state_publish_at = now
         message = String()
         freshness = self._freshness_snapshot(now)
@@ -720,6 +725,13 @@ class LocalizationManager(Node):
             "lateral_path_reports": self.lateral_path_reports,
             "lateral_self_mask": self.lateral_self_mask,
             "mild_map_observation": self.mild_map_active,
+            "covariance_probe": {
+                'active': self.covariance_probe.active,
+                'failed': self.covariance_probe.failed,
+                'motion_zero': self.state == 'LOCALIZED' and self.covariance_probe.stopped,
+                'elapsed_sec': max(0.,now-self.covariance_probe.started) if self.covariance_probe.active else 0.,
+                'healthy_samples': self.covariance_probe.healthy_samples,
+            },
             "global_attempts": self.global_attempts,
             'dispatch_allowed': self.ready and not self.stationary_map_guard.active,
             'stationary_map_observation': {
@@ -841,6 +853,7 @@ class LocalizationManager(Node):
         self.latest_scan_at = time.monotonic()
         self._record_receipt("scan_filtered", message, self.latest_scan_at)
         self.latest_scan = message
+        self._queue_recovery_scan('scan_filtered', message, self.latest_scan_at)
         stamp_ns = int(message.header.stamp.sec) * 1_000_000_000 + int(
             message.header.stamp.nanosec
         )
@@ -856,6 +869,7 @@ class LocalizationManager(Node):
     def _raw_scan_callback(self, _message):
         self.latest_raw_scan = _message
         self.latest_raw_scan_at = time.monotonic()
+        self._queue_recovery_scan('scan', _message, self.latest_raw_scan_at)
         self._record_receipt("scan", _message, self.latest_raw_scan_at)
 
     def _record_receipt(self, name, message, now):
@@ -994,12 +1008,15 @@ class LocalizationManager(Node):
             message.header.stamp.sec + message.header.stamp.nanosec / 1e9)
         self.latest_quality = quality
         self.last_amcl_at = now
+        if self.state == 'LOCALIZED':
+            self._observe_covariance_probe(message, current, quality, now)
         self.quality_history.observe(
             message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec,
             now, current, quality, self.latest_map_score)
 
         if (
             self.state == "LOCALIZED"
+            and not getattr(self, 'covariance_probe', CovarianceProbe()).stopped
             and quality.healthy
             and self._map_match_has_recovered(now)
         ):
@@ -1084,6 +1101,42 @@ class LocalizationManager(Node):
                     return
             if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
+
+    def _covariance_evidence_ok(self, now):
+        return (not self._verification_data_blockers(now)
+                and self.latest_map_score is not None and self.latest_map_score >= .60
+                and 0 <= now-self.latest_map_score_at <= 1.5
+                and self.latest_map_sector_count >= self.map_match_min_sectors
+                and self.latest_map_near_fraction <= .60
+                and 0 <= now-self.latest_raw_scan_at <= .30
+                and 0 <= now-self.latest_scan_at <= .30
+                and 0 <= now-self.latest_odom_at <= .25
+                and self.latest_odom_valid and self._mild_map_sources_fresh())
+
+    def _observe_covariance_probe(self, message, pose, quality, now):
+        if not hasattr(self, 'covariance_probe'):
+            self.covariance_probe = CovarianceProbe()
+        probe = self.covariance_probe
+        stamp = message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+        odom = None
+        try:
+            age = (self.get_clock().now().nanoseconds-stamp)/1e9
+            if stamp > 0 and -.1 <= age <= .30 and self._covariance_evidence_ok(now):
+                tf = self.tf_buffer.lookup_transform(
+                    'odom', 'base_footprint', Time(nanoseconds=stamp)).transform
+                q = tf.rotation
+                if (abs(q.x)>1e-4 or abs(q.y)>1e-4
+                        or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
+                    raise ValueError('invalid planar odometry TF')
+                odom = (tf.translation.x, tf.translation.y, quaternion_to_yaw(tf.rotation))
+        except (TransformException, AttributeError, TypeError, ValueError):
+            pass
+        probe.observe(now, stamp, pose, odom, healthy=quality.healthy,
+                      critical=quality.critical, evidence_ok=odom is not None)
+        if probe.stopped and hasattr(self, 'speed_limit_publisher'):
+            message = Float32()
+            message.data = 0.
+            self.speed_limit_publisher.publish(message)
 
     def _external_initial_pose_callback(self, _message):
         if self.lateral_phase is not None:
@@ -1299,7 +1352,9 @@ class LocalizationManager(Node):
             if hasattr(self, 'speed_limit_publisher'):
                 limit = Float32()
                 # Recovery Spin retains the original protected command chain.
-                limit.data = .5 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0
+                probe = getattr(self, 'covariance_probe', None)
+                limit.data = (0. if self.state == 'LOCALIZED' and probe and probe.stopped
+                              else .5 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0)
                 self.speed_limit_publisher.publish(limit)
             if (started - self.last_pipeline_diagnostic_at >= 5.0
                     and self.latest_scan is not None):
@@ -1331,6 +1386,11 @@ class LocalizationManager(Node):
     def _tick_state_machine(self):
         now = time.monotonic()
         self.mild_map_active = False
+        probe = getattr(self, 'covariance_probe', None)
+        if probe and self.state != 'LOCALIZED':
+            self.covariance_probe = CovarianceProbe()
+        elif probe and probe.active:
+            probe.check_deadline(now, self._covariance_evidence_ok(now))
         if self.lateral_phase is not None:
             # Local raw-sensor safety is checked by the independent 20 Hz loop.
             # AMCL/map evidence must not abort or accept localization mid-sidestep.
@@ -1460,6 +1520,11 @@ class LocalizationManager(Node):
                 )
                 return
             match_status = self._map_match_status(now)
+            probe = getattr(self, 'covariance_probe', None)
+            if probe and probe.active:
+                # Keep the active action goal; fusion's independent limit is ZERO.
+                self._publish_state()
+                return
             if match_status == "unknown":
                 if self.map_match_unknown_since is None:
                     self.map_match_unknown_since = now
@@ -1493,6 +1558,7 @@ class LocalizationManager(Node):
             if match_status != 'degraded':
                 self.mild_map_guard.reset()
             if (self.mild_map_enabled and match_status == 'degraded'
+                    and not (probe and probe.stopped)
                     and not self.stationary_map_guard.active
                     and self.latest_quality.healthy and not self.motion_inhibited
                     and not self._verification_data_blockers(now)
@@ -1506,7 +1572,7 @@ class LocalizationManager(Node):
                     and self.mild_map_guard.allows(now, self.latest_map_score_at, self.last_odom_pose)):
                 self.mild_map_active = True
                 return
-            if (self.latest_quality.critical or stationary_mismatch
+            if (self.latest_quality.critical or (probe and probe.failed) or stationary_mismatch
                     or (map_match_bad and suspicion_required)):
                 if self.suspect_since is None:
                     self.suspect_since = now
@@ -2158,7 +2224,8 @@ class LocalizationManager(Node):
                     self.second_guard_report['reason'] = name+'_unsupported_laser_tilt'
                     return False
                 report = spin_scan_report(scan, (tf.translation.x, tf.translation.y,
-                    quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z)
+                    quaternion_to_yaw(tf.rotation)), self.lateral_self_mask, tf.translation.z,
+                    max_unknown_deg=20.)
                 # Timestamped odom only: global AMCL is deliberately untrusted.
                 # A current near return always wins; history only fills holes.
                 if report.get('reason') in ('clear','unknown_coverage','obstacle_in_rotation_sweep'):
@@ -2193,6 +2260,60 @@ class LocalizationManager(Node):
             return False
         self.second_guard_report['reason'] = 'clear'
         return True
+
+    def _queue_recovery_scan(self, name, scan, receipt):
+        # Callback-rate collection only during recovery, with a fixed memory cap.
+        if (getattr(self, 'state', '') not in ('RECOVERING_LOCAL', 'RECOVERING_GLOBAL')
+                or getattr(self, 'commanded_motion', False)
+                or getattr(self, 'odom_motion', False)):
+            return
+        if not hasattr(self, 'recovery_pending_scans'):
+            self.recovery_pending_scans = {key: deque(maxlen=5)
+                                           for key in ('scan', 'scan_filtered')}
+        queue = self.recovery_pending_scans[name]
+        source = scan.header.stamp.sec*1_000_000_000+scan.header.stamp.nanosec
+        if source > 0 and (not queue or source > queue[-1][0]):
+            queue.append((source, scan, receipt))
+
+    @timed_operation('recovery_scan_collection')
+    def _drain_recovery_scans(self):
+        pending = getattr(self, 'recovery_pending_scans', {})
+        if getattr(self, 'state', '') not in ('RECOVERING_LOCAL', 'RECOVERING_GLOBAL'):
+            for queue in pending.values():
+                queue.clear()
+            return
+        if self.commanded_motion or self.odom_motion:
+            for queue in pending.values():
+                queue.clear()
+            return
+        if not hasattr(self, 'recovery_scan_evidence'):
+            self.recovery_scan_evidence = RecoveryScanEvidence()
+        now = time.monotonic()
+        for name, queue in pending.items():
+            remaining = deque(maxlen=5)
+            for source, scan, receipt in queue:
+                age = (self.get_clock().now().nanoseconds-source)/1e9
+                if not (0 <= now-receipt <= .30 and -.1 <= age <= .30):
+                    continue
+                try:
+                    stamp = Time(nanoseconds=source)
+                    mount = self.tf_buffer.lookup_transform('base_footprint', scan.header.frame_id, stamp).transform
+                    laser = self.tf_buffer.lookup_transform('odom', scan.header.frame_id, stamp).transform
+                    base = self.tf_buffer.lookup_transform('odom', 'base_footprint', stamp).transform
+                    for q in (mount.rotation, laser.rotation, base.rotation):
+                        if (abs(q.x)>1e-4 or abs(q.y)>1e-4
+                                or abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1.)>.01):
+                            raise ValueError('unsupported recovery evidence tilt/quaternion')
+                    self.recovery_scan_evidence.observe(name, scan, receipt,
+                        (laser.translation.x,laser.translation.y,quaternion_to_yaw(laser.rotation)),
+                        (base.translation.x,base.translation.y,quaternion_to_yaw(base.rotation)),
+                        (mount.translation.x,mount.translation.y,quaternion_to_yaw(mount.rotation)),
+                        self.lateral_self_mask,mount.translation.z)
+                except TransformException:
+                    remaining.append((source, scan, receipt))  # Retry without blocking the executor.
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            pending[name] = remaining
 
     def _recovery_feedback_callback(self, message):
         now = time.monotonic()

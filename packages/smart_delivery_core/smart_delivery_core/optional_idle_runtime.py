@@ -569,7 +569,9 @@ class OptionalIdleRuntime:
         if failed:
             self.last_unsafe_report = dict(self.safety_report)
             key = tuple(failed)
-            if now-self.safety_log_at >= 5.:
+            if key != getattr(self, 'safety_pending_key', None):
+                self.safety_pending_key, self.safety_pending_since = key, now
+            if now-self.safety_pending_since >= .3 and now-self.safety_log_at >= 5.:
                 message = safety_status(failed,self.state,self.motion)
                 logger = self.navigator.get_logger()
                 # rclpy caches severity by physical call site. Keep distinct lines.
@@ -580,6 +582,7 @@ class OptionalIdleRuntime:
                 self.safety_console_waiting = True
                 self.safety_log_key,self.safety_log_at = key,now
         else:
+            self.safety_pending_key = None
             self.safety_log_key = None
             if getattr(self,'safety_console_waiting',False):
                 self.navigator.get_logger().info('✅ 定位／感測已恢復')

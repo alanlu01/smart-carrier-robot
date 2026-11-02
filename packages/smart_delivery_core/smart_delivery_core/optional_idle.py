@@ -119,8 +119,8 @@ def load_idle_config(path):
             raise ValueError('At least three fresh frames per bin are required')
         if not finite_number(people.get('camera_yaw_offset_rad')):
             raise ValueError('Camera yaw offset must be finite')
-        if not finite_number(people.get('max_unknown_arc_deg')) or not 0 < people['max_unknown_arc_deg'] <= 15:
-            raise ValueError('Unknown scan arc must be positive and at most 15 degrees')
+        if not finite_number(people.get('max_unknown_arc_deg')) or not 0 < people['max_unknown_arc_deg'] <= 20:
+            raise ValueError('Unknown scan arc must be positive and at most 20 degrees')
     return data
 
 

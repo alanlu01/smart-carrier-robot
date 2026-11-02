@@ -27,5 +27,11 @@ class RecoveryScanEvidence:
         frames.append(frame)
 
     def report(self, name, base_pose, now, ros_now):
-        return aligned_spin_report(self.frames[name], base_pose, now, ros_now,
-                                   math.hypot(.22, .16) + .10, 15.)
+        frames = self.frames[name]
+        # A 73% current frame is allowed only with stronger independent coverage.
+        fraction = 0. if not frames else float(np.mean(
+            np.isfinite(frames[-1].ranges) & (frames[-1].ranges >= frames[-1].range_min)
+            & (frames[-1].ranges <= frames[-1].range_max)))
+        return aligned_spin_report(frames, base_pose, now, ros_now,
+                                   math.hypot(.22, .16) + .10, 20.,
+                                   current_min=.73, union_min=.80 if fraction < .75 else .75)

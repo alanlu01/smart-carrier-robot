@@ -215,11 +215,11 @@ def test_unknown_guard_report_does_not_reclassify_inf_as_clear(runtime):
     data.range_min=.05
     data.range_max=10.
     data.ranges=[2.]*360
-    for index in range(100,120):
+    for index in range(100,121):
         data.ranges[index]=float('inf')
     assert not manager._clear_to_spin(False)
     assert manager.guard_report['reason']=='unknown_scan_coverage'
-    assert manager.guard_report['unknown_arc_deg']==pytest.approx(20.)
+    assert manager.guard_report['unknown_arc_deg']==pytest.approx(21.)
 
 
 def test_history_guard_cache_expires_and_new_near_scan_overrides_it(runtime,monkeypatch):

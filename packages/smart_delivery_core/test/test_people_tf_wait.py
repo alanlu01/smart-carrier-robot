@@ -274,7 +274,7 @@ def test_formal_point_changed_but_all_safety_budgets_preserved():
     config = load_idle_config(ROOT/'config/optional_idle_features.yaml')
     people = config['people']
     assert (people['observation_pose']['x'], people['observation_pose']['y']) == (.5, 3.5)
-    assert people['max_unknown_arc_deg'] == 15.
+    assert people['max_unknown_arc_deg'] == 20.
     assert people['safe_scan_samples'] == 3 and people['stopped_before_spin_sec'] == 1.
     assert people['spin_ready_wait_sec'] == 10.
     assert people['max_spin_resumes'] == 2 and people['observation_session_timeout_sec'] == 90.

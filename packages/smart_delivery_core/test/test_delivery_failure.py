@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+import time
 from rclpy.logging import get_logger
 
 from smart_delivery_core.optional_idle_runtime import OptionalIdleRuntime
@@ -25,6 +26,8 @@ def test_real_rcutils_idle_moving_idle_severity_transitions():
         runtime.motion = moving
         runtime.state = 'observing' if moving else 'idle'
         runtime.safety_log_at = -float('inf')
+        assert runtime._safe() is False
+        runtime.safety_pending_since = time.monotonic()-.31
         assert runtime._safe() is False
     runtime._pose=lambda:dict(x=0.,y=0.,yaw=0.)
     runtime.last_odom=(100.,SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=100,nanosec=0))))

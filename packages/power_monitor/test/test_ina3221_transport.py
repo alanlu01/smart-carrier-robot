@@ -117,6 +117,9 @@ def test_real_rclpy_logger_survives_configured_fallback_configured_address(monke
 
 
 def test_unplugged_sensor_publishes_unknown_and_recovers_without_restart(monkeypatch):
+    from power_monitor import ina3221_node
+    clock=[100.]
+    monkeypatch.setattr(ina3221_node.time,'monotonic',lambda:clock[0])
     node, bus = sensor(monkeypatch)
     assert node._probe_sensor(force=True)
     for _ in range(6):
@@ -134,7 +137,8 @@ def test_unplugged_sensor_publishes_unknown_and_recovers_without_restart(monkeyp
         assert all(not history for history in node.current_histories + node.voltage_histories)
     # Restore on the alternate address; logger and state machine both survive.
     bus.available = {0x41}
-    for _ in range(6):
+    for _ in range(16):
+        clock[0]+=.5
         node.timer_callback()
     assert node.i2c_address == 0x41
     payload = json.loads(node.messages[-1].data)

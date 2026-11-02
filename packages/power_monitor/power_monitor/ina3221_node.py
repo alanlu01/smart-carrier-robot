@@ -13,6 +13,7 @@ from power_monitor.power_status import (
     SlotStateTracker,
 )
 from std_msgs.msg import String
+from power_monitor.supply_health import SupplyHealth
 
 INA3221_MANUFACTURER_ID = 0x5449
 INA3221_DIE_ID = 0x3220
@@ -89,6 +90,17 @@ class INA3221Node(Node):
         self.declare_parameter("vehicle_cutoff_voltage_v", 9.5)
         self.declare_parameter("slot_enabled", [True, True, True])
         self.declare_parameter('main_battery_source_verified', False)
+        self.declare_parameter('slot_supply_source', 'charging_bus')
+        self.supply_source = str(self.get_parameter('slot_supply_source').value)
+        self.declare_parameter('slot_supply_min_voltage_v', 9.5)
+        self.declare_parameter('slot_supply_recovered_voltage_v', 9.8)
+        self.declare_parameter('slot_supply_recovery_sec', 5.0)
+        self.declare_parameter('slot_supply_fault_sec', 2.0)
+        self.supply_health = SupplyHealth(
+            self.get_parameter('slot_supply_min_voltage_v').value,
+            self.get_parameter('slot_supply_recovered_voltage_v').value,
+            self.get_parameter('slot_supply_recovery_sec').value,
+            self.get_parameter('slot_supply_fault_sec').value)
         self.verified_battery_publisher = None
         if self.get_parameter('main_battery_source_verified').value:
             self.verified_battery_publisher = self.create_publisher(
@@ -350,6 +362,11 @@ class INA3221Node(Node):
 
         channels = {}
         cycle_failed = samples is None
+        if not hasattr(self,'supply_health'):
+            self.supply_health = SupplyHealth()
+        supply=self.supply_health.observe(
+            [value[1] for value in samples] if samples is not None else [None]*3,
+            time.monotonic(),sensor_ok=not cycle_failed,enabled=self.slot_enabled)
         if cycle_failed:
             # Never mix readings from before a real outage into recovery data.
             # The failed cycle below remains unknown rather than empty/full.
@@ -377,7 +394,7 @@ class INA3221Node(Node):
                 self.state_trackers[index].update(
                     current_average if sensor_ok else None,
                     voltage_average if sensor_ok else None,
-                    sensor_ok=sensor_ok,
+                    sensor_ok=sensor_ok and supply['healthy'],
                 )
                 if enabled
                 else "disabled"
@@ -430,7 +447,7 @@ class INA3221Node(Node):
             cutoff_voltage_v=self.vehicle_cutoff_voltage,
         )
         summary_parts.append(
-            "Vehicle: "
+            "Charging bus: "
             f"{vehicle_battery['voltage']} V, {vehicle_battery['status']}"
         )
         summary = " | ".join(summary_parts)
@@ -455,7 +472,11 @@ class INA3221Node(Node):
 
         message = String()
         payload = dict(channels)
+        vehicle_battery['source_verified'] = self.verified_battery_publisher is not None
+        vehicle_battery['voltage_source'] = getattr(self, 'supply_source', 'charging_bus')
         payload["vehicle_battery"] = vehicle_battery
+        supply['source'] = getattr(self, 'supply_source', 'charging_bus')
+        payload['slot_supply'] = supply
         message.data = json.dumps(payload, ensure_ascii=False)
         self.publisher.publish(message)
 

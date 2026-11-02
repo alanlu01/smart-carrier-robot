@@ -128,6 +128,7 @@ def test_pre_spin_global_recovery_discards_directional_evidence(runtime):
 
 def test_safety_diagnostics_distinguish_tf_and_odom_and_are_rate_limited(runtime):
     m,n,t=runtime
+    m.home=None  # Keep the test about TF/odom, not the battery's separate TTL.
     messages=[];n.get_logger=lambda:SimpleNamespace(warning=messages.append,info=messages.append)
     m._pose=lambda *_:None
     assert not OptionalIdleRuntime._safe(m)
@@ -136,6 +137,8 @@ def test_safety_diagnostics_distinguish_tf_and_odom_and_are_rate_limited(runtime
     m.last_odom=(90.,m.last_odom[1])
     assert not OptionalIdleRuntime._safe(m)
     assert m.safety_report['failed_checks']==['odom_fresh']
+    assert len(messages)==0  # Brief failures remain in diagnostics, not console.
+    t[0]+=.31;OptionalIdleRuntime._safe(m)
     assert len(messages)==1
     t[0]+=5.1;OptionalIdleRuntime._safe(m)
     assert len(messages)==2

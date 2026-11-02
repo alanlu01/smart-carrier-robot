@@ -131,3 +131,44 @@ def test_real_second_spin_guard_uses_both_streams_and_obstacle_overrides_history
     values=list(s.ranges);values[900]=.25;s.ranges=values
     c.now=100.3;s.header.stamp.nanosec=300000000
     assert not LocalizationManager._recovery_spin_clear(n,c.now)
+
+
+def test_callback_rate_collector_accumulates_between_state_machine_ticks(manager):
+    import math
+    from geometry_msgs.msg import TransformStamped
+    from smart_delivery_core.localization_manager import LocalizationManager
+    n,c=manager
+    calls=[]
+    def lookup(parent,child,stamp):
+        calls.append((parent,child,stamp.nanoseconds))
+        tf=TransformStamped();tf.transform.rotation.w=1.
+        tf.header.stamp.sec=int(c.now);tf.header.stamp.nanosec=round((c.now-int(c.now))*1e9)
+        return tf
+    n.tf_buffer=SimpleNamespace(lookup_transform=lookup)
+    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=round(c.now*1e9)))
+    for at in (100.,100.1,100.2):
+        c.now=at;s=LaserScan();s.header.frame_id='laser'
+        s.header.stamp.sec=100;s.header.stamp.nanosec=round((at-100.)*1e9)
+        s.angle_min=-math.pi;s.angle_increment=2*math.pi/1800
+        s.range_min=.05;s.range_max=16.;s.ranges=[3.]*1800
+        for name in ('scan','scan_filtered'):n._queue_recovery_scan(name,s,at)
+    n._drain_recovery_scans()  # No state-machine tick was needed to collect three frames.
+    assert all(len(frames)==3 for frames in n.recovery_scan_evidence.frames.values())
+    assert all(len(q)==0 for q in n.recovery_pending_scans.values())
+    assert {ns for _,_,ns in calls}=={100000000000,100100000000,100200000000}
+    n.state='LOCALIZED';n._queue_recovery_scan('scan',s,at)
+    assert not n.recovery_pending_scans['scan']
+
+
+def test_collector_retries_missing_tf_without_blocking_and_expires_pending_frames(manager):
+    from tf2_ros import TransformException
+    n,c=manager
+    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=round(c.now*1e9)))
+    n.tf_buffer=SimpleNamespace(lookup_transform=lambda *args:(_ for _ in ()).throw(TransformException('wait')))
+    s=LaserScan();s.header.stamp.sec=100
+    n._queue_recovery_scan('scan',s,100.)
+    n._drain_recovery_scans()
+    assert len(n.recovery_pending_scans['scan'])==1
+    assert len(n.recovery_scan_evidence.frames['scan'])==0
+    c.now=100.31;n._drain_recovery_scans()
+    assert not n.recovery_pending_scans['scan']

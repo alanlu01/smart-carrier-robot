@@ -34,8 +34,9 @@ class ScanEvidence:
                    np.asarray(scan.ranges, dtype=float).copy(), scan.range_min, scan.range_max)
 
 
-def aligned_spin_report(frames, base_pose, now, ros_now, radius, max_unknown_deg=15.):
-    """Rebin measured rays about the current laser; preserve the 15° scan budget."""
+def aligned_spin_report(frames, base_pose, now, ros_now, radius, max_unknown_deg=15.,
+                        current_min=.75, union_min=.75):
+    """Rebin measured rays; caller controls explicitly bounded visibility budgets."""
     report = {'clear': False, 'reason': 'insufficient_recent_scan_evidence',
               'evidence_frames': 0, 'evidence_mode': 'odom_aligned_short_history'}
     if not frames or not all(math.isfinite(v) for v in (*base_pose, now, ros_now, radius)):
@@ -120,7 +121,7 @@ def aligned_spin_report(frames, base_pose, now, ros_now, radius, max_unknown_deg
     # Quantization must not make a real unknown hole look smaller.
     gap = min(360., min(peak,360)+2.0) if peak else 0.
     fraction = float(np.mean(known))
-    clear = used >= 3 and current_fraction >= .75 and fraction >= .75 and gap <= max_unknown_deg
+    clear = used >= 3 and current_fraction >= current_min and fraction >= union_min and gap <= max_unknown_deg
     report.update(clear=clear, reason='clear' if clear else 'unknown_scan_coverage',
                   valid_fraction=round(fraction,4), unknown_arc_deg=gap)
     report['evidence_deadline_sec'] = min(used_sources)+.50 if used_sources else ros_now

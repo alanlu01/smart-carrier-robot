@@ -4,6 +4,12 @@ ina3221_node:
     i2c_address: 64
     # Do not enable until INA really measures the same MAIN battery as the chassis.
     main_battery_source_verified: false
+    # This protects slot evidence, independently of chassis SOC/home policy.
+    slot_supply_source: charging_bus
+    slot_supply_min_voltage_v: 9.5
+    slot_supply_recovered_voltage_v: 9.8
+    slot_supply_recovery_sec: 5.0
+    slot_supply_fault_sec: 2.0
     # A0 接點或上電時序異常時，依晶片識別碼自動探測 INA3221。
     auto_detect_i2c_address: true
     i2c_probe_addresses: [64, 65, 66, 67]
@@ -15,7 +21,7 @@ ina3221_node:
     # 3 samples keep useful noise rejection while cutting physical-action latency.
     window_size: 3
     sample_period: 0.5
-    # bus voltage 是 3S 車輛母線，不能用來判斷槽位是否有行充。
+    # 3S 充電母線（目前仍為獨立小電池），不能用來判斷槽位是否有行充。
     empty_voltage_max_v: 1.0
     # 2026-08 實測：正常快充模組空載 0.003–0.005 A。
     empty_current_max_a: 0.008

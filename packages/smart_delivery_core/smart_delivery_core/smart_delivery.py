@@ -16,6 +16,7 @@ from smart_delivery_core.delivery_console import localization_label, brief
 from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
+from smart_delivery_core.power_action_health import PowerActionHealth
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rcl_interfaces.msg import Log
@@ -812,6 +813,7 @@ def _run_delivery(runtime_holder):
     latest_power_status_at = 0.0
     latest_power_sequence = 0
     last_power_error_at = 0.0
+    power_health = PowerActionHealth()
     active_task_id = None
     cancellation_requests = {}
     journal = DeliveryJournal()
@@ -1000,11 +1002,16 @@ def _run_delivery(runtime_holder):
     def power_status_callback(msg):
         nonlocal latest_power_banks, latest_power_status_at
         nonlocal latest_power_sequence, last_power_error_at
+        latest_power_sequence += 1
+        was_healthy = power_health.valid
         try:
-            latest_power_banks = payload_to_slots(msg.data, require_healthy=True)
+            latest_power_banks = power_health.observe(msg.data, time.monotonic())
             latest_power_status_at = time.monotonic()
-            latest_power_sequence += 1
+            if not was_healthy:
+                navigator.get_logger().info('✅ 槽位供電／感測已就緒')
         except ValueError as exc:
+            # Retain inventory for display only, never reuse it as action evidence.
+            latest_power_status_at = 0.0
             now = time.monotonic()
             if now - last_power_error_at >= 10.0:
                 navigator.get_logger().error('⚠️ '+brief(exc))
@@ -1107,6 +1114,9 @@ def _run_delivery(runtime_holder):
 
     def wait_for_slot_action(target, fsm, baseline_slots, *, resumed=False):
         slot_number = int(target["slot_number"])
+        if not power_health.valid:
+            queue_result(target, fsm, 'failed', power_health.note or '槽位資料尚未就緒')
+            return
         try:
             verifier = SlotActionVerifier(
                 target["type"],
@@ -1146,11 +1156,19 @@ def _run_delivery(runtime_holder):
         wrong_slot_event_id = None
         confirmed = False
         action_cancelled = False
+        power_failure = ''
+        unhealthy_reported = False
         try:
             while rclpy.ok() and time.monotonic() - started < timeout_seconds:
                 rclpy.spin_once(navigator, timeout_sec=0.2)
                 if active_task_id in cancellation_requests:
                     action_cancelled = True
+                    break
+                power_failure = power_health.failure(time.monotonic())
+                if (power_health.received_at is not None
+                        and time.monotonic()-power_health.received_at > POWER_STATUS_TIMEOUT_SECONDS):
+                    power_failure = '槽位資料逾時，無法確認實體取還'
+                if power_failure:
                     break
                 elapsed = time.monotonic() - started
                 if not warned and elapsed >= warning_seconds:
@@ -1182,6 +1200,18 @@ def _run_delivery(runtime_holder):
                         action_deadline=action_deadline,
                         warning=True,
                     )
+                if (not power_health.valid
+                        or time.monotonic()-latest_power_status_at > 2.):
+                    verifier.matching_samples = 0
+                    if not unhealthy_reported:
+                        progress(target, fsm, 'waiting_action', expected_slot=slot_number,
+                                 action_deadline=action_deadline,
+                                 progress_message=power_health.note or '槽位更新中，暫停租還確認')
+                        unhealthy_reported = True
+                        last_verification = None
+                        wrong_slot_signature = wrong_slot_event_id = None
+                    continue
+                unhealthy_reported = False
                 if latest_power_sequence == last_sequence:
                     continue
                 last_sequence = latest_power_sequence
@@ -1236,6 +1266,8 @@ def _run_delivery(runtime_holder):
                 "cancelled",
                 cancellation_requests.pop(active_task_id),
             )
+        elif power_failure:
+            queue_result(target, fsm, 'failed', power_failure)
         elif confirmed:
             queue_result(
                 target,
@@ -1418,9 +1450,10 @@ def _run_delivery(runtime_holder):
         # next parking episode, without changing batch scheduling or inventory.
         standby_retry.reset()
         now = time.monotonic()
-        if now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
+        if not power_health.valid or now - latest_power_status_at > POWER_STATUS_TIMEOUT_SECONDS:
             if now - last_stale_warning_at >= 10.0:
-                navigator.get_logger().error("⚠️ 行充感測資料逾時，暫停新任務")
+                reason = power_health.note or '行充感測資料逾時'
+                navigator.get_logger().error(f'⚠️ {reason}；暫停新任務')
                 last_stale_warning_at = now
             continue
 
