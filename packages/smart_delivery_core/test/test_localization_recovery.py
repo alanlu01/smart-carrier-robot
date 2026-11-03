@@ -120,6 +120,20 @@ def fresh(node, clock, at):
     node.latest_map_score_at = at
 
 
+def test_initial_seed_retries_before_navigation_readiness_blocker(manager):
+    node, clock = manager
+    node.state = 'VERIFYING'
+    node.initial_pose_last_published = 97.
+    node.last_amcl_at = 0.
+    node.initial_pose_publisher = SimpleNamespace(get_subscription_count=lambda: 1)
+    node._observe_wait = lambda now: False
+    seeds = []
+    node._publish_initial_pose = lambda retry=False: seeds.append(retry)
+    node._tick_state_machine()
+    assert seeds == [True]
+    assert not node.started_spins
+
+
 def amcl(node, xy_std=0.20):
     """Deliver a healthy real ROS pose message to the production callback."""
     msg = PoseWithCovarianceStamped()

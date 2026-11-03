@@ -4,10 +4,11 @@ import math
 
 
 class MildMapGuard:
-    """Permit only a short, distance-bounded half-speed observation window."""
+    """Permit only a short observation window bounded by cumulative motion."""
 
-    def __init__(self, seconds=3.0, distance=.40, samples=3):
+    def __init__(self, seconds=3.0, distance=.40, samples=3, angle=None):
         self.seconds, self.distance, self.samples = seconds, distance, samples
+        self.angle = angle
         self.reset()
 
     def reset(self):
@@ -16,6 +17,8 @@ class MildMapGuard:
         self.last_map_at = None
         self.count = 0
         self.exhausted = False
+        self.travel = self.turn = 0.
+        self.last_pose = None
 
     def allows(self, now, map_at, pose):
         if self.exhausted or pose is None or not all(math.isfinite(v) for v in pose):
@@ -25,9 +28,15 @@ class MildMapGuard:
         if map_at != self.last_map_at:
             self.count += 1
             self.last_map_at = map_at
-        moved = math.hypot(pose[0]-self.anchor[0], pose[1]-self.anchor[1])
-        self.exhausted = (now-self.started >= self.seconds or moved >= self.distance
-                          or self.count >= self.samples)
+        if self.last_pose is not None:
+            dx, dy = pose[0]-self.last_pose[0], pose[1]-self.last_pose[1]
+            turn = abs(math.atan2(math.sin(pose[2]-self.last_pose[2]), math.cos(pose[2]-self.last_pose[2])))
+            self.travel += math.hypot(dx, dy)
+            self.turn += turn
+        self.last_pose = pose
+        self.exhausted = (now-self.started >= self.seconds or self.travel >= self.distance
+                          or (self.samples is not None and self.count >= self.samples)
+                          or (self.angle is not None and self.turn >= self.angle))
         return not self.exhausted
 
 

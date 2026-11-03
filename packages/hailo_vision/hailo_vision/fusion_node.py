@@ -14,6 +14,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import Float32, Header, String
+from nav2_msgs.msg import CollisionMonitorState
+from smart_delivery_core.atomic_wheel_feedback import AtomicWheelReceiver
+from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
 
 from hailo_vision.semantic_protocol import (
     closest_timestamped_item,
@@ -136,7 +139,10 @@ class SensorFusionNode(Node):
         self.create_subscription(
             String, '/localization/recovery_motion_lease', self.recovery_lease_callback, 1
         )
-        self.create_subscription(String, '/stm32_data', self.recovery_feedback_callback, 50)
+        self.atomic_wheels = AtomicWheelReceiver(None, self.recovery_stop)
+        self.create_subscription(String, '/chassis/wheel_sample', self.atomic_wheel_callback, LOCAL_ODOM_QOS)
+        self.near_stop_until = 0.
+        self.create_subscription(CollisionMonitorState, '/collision_monitor_state', self.collision_state_callback, 10)
         self.create_subscription(Odometry, '/odom', self.recovery_odom_callback, 20)
         status_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                                 reliability=ReliabilityPolicy.RELIABLE)
@@ -305,7 +311,7 @@ class SensorFusionNode(Node):
             self.pub_safe_cmd.publish(Twist())
             return
         lease = self.recovery_lease
-        if lease.blocked(time.monotonic()):
+        if lease.blocked(time.monotonic()) or time.monotonic() < getattr(self, 'near_stop_until', 0.):
             self.pub_safe_cmd.publish(Twist())
             return
         effective_multiplier = min(
@@ -317,6 +323,11 @@ class SensorFusionNode(Node):
         real_cmd.linear.x = msg.linear.x * effective_multiplier
         real_cmd.linear.y = msg.linear.y * effective_multiplier
         real_cmd.angular.z = msg.angular.z * effective_multiplier
+        if 0 < self.localization_speed_limit.limit(time.monotonic()) <= .4:
+            norm = math.hypot(real_cmd.linear.x, real_cmd.linear.y)
+            if norm > .20:
+                real_cmd.linear.x *= .20/norm
+                real_cmd.linear.y *= .20/norm
         if lease.enabled:
             # Translation permission never authorizes other motion or a speed
             # above the agreed cap; semantic stop/reduction still applies.
@@ -383,6 +394,18 @@ class SensorFusionNode(Node):
 
     def recovery_feedback_callback(self, message):
         self.recovery_stop.observe(message.data, time.monotonic())
+
+    def atomic_wheel_callback(self, message):
+        try:
+            self.atomic_wheels.observe(json.loads(message.data),
+                self.get_clock().now().nanoseconds, time.monotonic())
+        except (ValueError, TypeError):
+            return
+
+    def collision_state_callback(self, message):
+        if message.action_type == 1 and message.polygon_name == 'NearFootprintStop':
+            self.near_stop_until = time.monotonic()+.75
+            self.pub_safe_cmd.publish(Twist())
 
     def recovery_odom_callback(self, message):
         self.recovery_odom_at = time.monotonic()

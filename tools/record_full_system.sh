@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 # Preserve every topic from the full-system checklist. No raw camera frames.
 TOPICS=(
-  /scan /scan_filtered /stm32_data /odom /amcl_pose /initialpose
+  /scan /scan_filtered /stm32_data /chassis/wheel_sample /odom /amcl_pose /initialpose
   /tf /tf_static /map /particle_cloud
   /plan /behavior_tree_log
   /cmd_vel_nav /cmd_vel_smoothed /cmd_vel /chassis_cmd_vel

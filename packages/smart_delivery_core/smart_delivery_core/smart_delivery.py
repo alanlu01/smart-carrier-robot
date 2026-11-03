@@ -625,6 +625,7 @@ def _run_delivery(runtime_holder):
     localization_intervention_kind = 'pose'
     localization_state_received = False
     localization_dispatch_allowed = False
+    localization_mild = False
     localization_ready_received = False
     localization_interrupt_generation = 0
     localization_wait_started_at = time.monotonic()
@@ -765,10 +766,12 @@ def _run_delivery(runtime_holder):
 
     def localization_state_callback(message):
         nonlocal localization_intervention_kind
+        nonlocal localization_mild
         nonlocal localization_state, localization_state_received, localization_dispatch_allowed
         try:
             snapshot = json.loads(message.data)
             localization_state = snapshot.get("state", "UNKNOWN")
+            localization_mild = snapshot.get('mild_map_observation') is True
             localization_intervention_kind = snapshot.get('manual_intervention_kind','pose')
             localization_dispatch_allowed = dispatch_permitted(snapshot)
             localization_state_received = True
@@ -1580,6 +1583,16 @@ def _run_delivery(runtime_holder):
 
         set_navigation_active(False)
         nav_result = navigator.getResult()
+        if nav_result == TaskResult.SUCCEEDED and localization_mild:
+            # The existing goal may finish during bounded odometry continuation,
+            # but no physical handover may be confirmed on degraded map evidence.
+            arrival_deadline = time.monotonic()+6.
+            while localization_mild and time.monotonic() < arrival_deadline:
+                rclpy.spin_once(navigator, timeout_sec=.05)
+                if localization_ready is False or active_task_id in cancellation_requests:
+                    break
+            if localization_mild or localization_ready is False:
+                localization_aborted = True
         nav_error_code, nav_error_msg = 0, ""
         try:
             action_result = navigator.result_future.result().result

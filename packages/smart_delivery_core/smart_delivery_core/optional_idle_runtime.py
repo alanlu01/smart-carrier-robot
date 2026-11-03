@@ -110,6 +110,7 @@ class OptionalIdleRuntime:
         self.last_progress_log = 0.0
         self.localization_status = None
         self.localization_pauses = 0
+        self.data_pauses = 0
         self.localization_restarts = 0
         self.localization_resume_state = None
         self.localization_resume_deadline = None
@@ -231,8 +232,11 @@ class OptionalIdleRuntime:
                 and self.map_matches and not self.inhibited and not self.stop_accepting
                 and (self.home is None or (self.home.healthy and not self.home.cutoff)))
 
-    def _begin_localization_wait(self, resume_state, deadline):
-        self.localization_pauses += 1
+    def _begin_localization_wait(self, resume_state, deadline, *, data_only=False):
+        if data_only:
+            self.data_pauses += 1
+        else:
+            self.localization_pauses += 1
         self.localization_resume_state = resume_state
         self.localization_resume_deadline = deadline
         limit = time.monotonic()+self.config['people'].get('localization_wait_sec', 20.)
@@ -471,6 +475,7 @@ class OptionalIdleRuntime:
         payload['people_demand'] = (self.people.summary(self.config['people']['observation_pose'])
             if self.people is not None and hasattr(self.people, 'summary') else None)
         payload['localization_pauses'] = self.localization_pauses
+        payload['data_pauses'] = self.data_pauses
         payload['localization_restarts'] = self.localization_restarts
         payload['localization_wait_remaining_sec'] = (None if self.state != 'waiting_people_localization'
             else round(max(0., self.localization_wait_deadline-time.monotonic()), 2))
@@ -520,6 +525,13 @@ class OptionalIdleRuntime:
 
     @timed_operation('people_pose_lookup')
     def _pose(self, stamp=None):
+        now_mono = time.monotonic()
+        cached = getattr(self, '_pose_cache', None)
+        if stamp is None and cached is not None and 0 <= now_mono-cached[0] <= .01:
+            age = (self.navigator.get_clock().now().nanoseconds-cached[1])/1e9
+            if -.1 <= age <= .30:
+                self.pose_report = dict(valid=True, reason='healthy', source_age_sec=round(age,4))
+                return dict(cached[2])
         try:
             transform = self.buffer.lookup_transform('map', 'base_footprint', stamp or Time())
         except TransformException as exc:
@@ -535,6 +547,8 @@ class OptionalIdleRuntime:
                 'yaw': yaw_of(transform.transform.rotation)}
         valid = all(math.isfinite(value) for value in pose.values())
         self.pose_report.update(valid=valid,reason='healthy' if valid else 'tf_nonfinite')
+        if valid and stamp is None:
+            self._pose_cache = (now_mono, source, dict(pose))
         return pose if valid else None
 
     def _stationary(self):
@@ -788,7 +802,7 @@ class OptionalIdleRuntime:
             self.spin_resume_requests = 0
             self.people = None
             self.guard_report = {}
-            self.localization_pauses = self.localization_restarts = 0
+            self.localization_pauses = self.localization_restarts = self.data_pauses = 0
             self.localization_wait_deadline = self.localization_resume_deadline = None
             self.observation_alignment = None
         if state == 'observing' and self.observation_session_deadline is not None:
@@ -1025,7 +1039,7 @@ class OptionalIdleRuntime:
             if (self.state in ('going_observation', 'observing') and self.localization_pauses < 2
                     and self._can_wait_localization()):
                 reason = 'localization_suspect'
-            elif (self.state in ('going_observation','observing') and self.localization_pauses < 2
+            elif (self.state in ('going_observation','observing') and self.data_pauses < 8
                     and self._can_pause_for_data()):
                 reason = 'people_data_pause'
             elif self.state == 'going_people_standby' and self._parking_recovery_allowed():
@@ -1036,13 +1050,14 @@ class OptionalIdleRuntime:
             reason = 'observation_or_navigation_timeout'
         elif self.state == 'observing' and not self._clear_to_spin(False):
             reason = self.guard_report.get('reason', 'spin_safety_rejected')
-            if (reason in DATA_SPIN_STOPS and self.localization_pauses < 2
+            if (reason in DATA_SPIN_STOPS and self.data_pauses < 8
                     and self._can_pause_for_data()):
                 reason = 'people_data_pause'
         if reason and not self.cancel_requested:
             if reason in ('localization_suspect','people_data_pause'):
                 self._begin_localization_wait(self.state, self.deadline if self.state == 'going_observation'
-                    else self.observation_session_deadline or self.deadline)
+                    else self.observation_session_deadline or self.deadline,
+                    data_only=reason == 'people_data_pause')
             self.cancel_requested = True
             self.cancel_started = time.monotonic()
             self.interrupt_reason = reason
@@ -1283,6 +1298,10 @@ class OptionalIdleRuntime:
             if self.state == 'people_arrival_check' and now >= self.deadline:
                 self._parking_failed('standby_arrival_not_verified')
             return True
+        # Poll still owns high-rate cancellation and safety; cap idle decisions.
+        if now-getattr(self, '_last_idle_decision', -float('inf')) < .10:
+            return False
+        self._last_idle_decision = now
         pose = self._pose()
         odom = None if self.last_odom is None else self.last_odom[1].pose.pose
         odom_pose = None if odom is None else (odom.position.x,odom.position.y,yaw_of(odom.orientation))

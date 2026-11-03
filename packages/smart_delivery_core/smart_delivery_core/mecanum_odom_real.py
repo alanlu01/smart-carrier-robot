@@ -11,17 +11,18 @@ import json
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler
 from smart_delivery_core.pipeline_health import DurationMetrics, ReceiptMetrics
 from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
+from smart_delivery_core.atomic_wheel_feedback import AtomicWheelReceiver
 
 class MecanumOdomReal(Node):
     def __init__(self):
         super().__init__('mecanum_odom_real')
         
-        # 1. 訂閱隊友發布的 STM32 原始字串話題
+        # 1. 訂閱串口來源組好的完整四輪回授；沿用原始換算與補償係數。
         self.subscription = self.create_subscription(
             String,
-            'stm32_data',
-            self.stm32_data_callback,
-            10)
+            '/chassis/wheel_sample',
+            self.atomic_wheel_callback,
+            LOCAL_ODOM_QOS)
             
         # 2. 初始化發布器 (Publisher) 與 TF 廣播器
         # No public reliable writer in the feedback/integration process.
@@ -60,6 +61,7 @@ class MecanumOdomReal(Node):
             batch_window_sec=batch_window_sec,
             started_at=time.monotonic(),
         )
+        self.atomic_wheels = AtomicWheelReceiver(self.feedback_assembler)
         self.feedback_state = 'waiting'
         self.local_write_errors = 0
         self.receipt_metrics = ReceiptMetrics()
@@ -70,7 +72,9 @@ class MecanumOdomReal(Node):
         self.feedback_health_timer = self.create_timer(1.0, self.publish_feedback_health)
         
         # 🌟 5. 修正後的精準車體幾何參數
-        self.wheel_radius = 0.08  # 真實輪子半徑 8cm
+        # 既有 0.08 與下方 0.000389 是成對實測校正值；實車半徑為 0.04。
+        # 本次只改 URDF 顯示，不能單獨把這個換算半徑減半。
+        self.wheel_radius = 0.08
         self.wheel_base = 0.106   # 前後輪距的一半 (21.2 / 2)
         self.track_width = 0.101  # 左右輪距的一半 (20.2 / 2)
         self.geometry_factor = self.wheel_base + self.track_width
@@ -102,6 +106,17 @@ class MecanumOdomReal(Node):
         with self.duration_metrics.measure('stm32_callback'):
             self._consume_stm32_data(msg)
 
+    def atomic_wheel_callback(self, msg):
+        now = time.monotonic()
+        try:
+            sample = self.atomic_wheels.observe(json.loads(msg.data),
+                self.get_clock().now().nanoseconds, now)
+        except (ValueError, TypeError):
+            return
+        if sample is not None:
+            self.receipt_metrics.observe('wheel_sample', now)
+            self._apply_wheel_snapshot(sample)
+
     def _consume_stm32_data(self, msg):
         self.receipt_metrics.observe('stm32_data', time.monotonic())
         raw_str = msg.data
@@ -110,23 +125,20 @@ class MecanumOdomReal(Node):
             if snapshot is None:
                 return
 
-            next_speeds = {}
-            for letter, raw_val in snapshot.items():
-                wheel_position = self.motor_mapping[letter]
-                real_rad_s = (
-                    raw_val
-                    * self.rt_to_rad_s
-                    * self.compensation[wheel_position]
-                )
-                next_speeds[wheel_position] = (
-                    -real_rad_s if letter in ['B', 'D'] else real_rad_s
-                )
-            self.current_speeds = next_speeds
-            if self.feedback_state != 'healthy':
-                self.get_logger().info('STM32 四輪回授已完整，里程計 watchdog 正常')
-            self.feedback_state = 'healthy'
+            self._apply_wheel_snapshot(snapshot)
         except Exception as e:
             self.get_logger().error(f'字串解析出錯: {e}，原始字串為: {raw_str}')
+
+    def _apply_wheel_snapshot(self, snapshot):
+        next_speeds = {}
+        for letter, raw_val in snapshot.items():
+            wheel_position = self.motor_mapping[letter]
+            real_rad_s = raw_val*self.rt_to_rad_s*self.compensation[wheel_position]
+            next_speeds[wheel_position] = -real_rad_s if letter in ['B', 'D'] else real_rad_s
+        self.current_speeds = next_speeds
+        if self.feedback_state != 'healthy':
+            self.get_logger().info('STM32 四輪回授已完整，里程計 watchdog 正常')
+        self.feedback_state = 'healthy'
 
     def euler_to_quaternion(self, yaw):
         q = Quaternion()

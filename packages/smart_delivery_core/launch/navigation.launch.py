@@ -62,7 +62,7 @@ def generate_launch_description():
 
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(nav2_share, "launch", "bringup_launch.py")
+            os.path.join(core_share, "launch", "nav2_composed_bringup.launch.py")
         ),
         launch_arguments={
             "map": LaunchConfiguration("map"),
@@ -127,9 +127,9 @@ def generate_launch_description():
             behavior_tree_argument,
             use_sim_time_argument,
             auto_initialize_argument,
-            DeclareLaunchArgument('use_composition',default_value='False',
-                                  description='Separate Nav2 processes by default; true is the container comparison'),
-            DeclareLaunchArgument('nav_transport_profile',default_value='async',
+            DeclareLaunchArgument('use_composition',default_value='True',
+                                  description='Composed Nav2 by default; false is the standalone comparison'),
+            DeclareLaunchArgument('nav_transport_profile',default_value='current',
                                   description='async uses bounded asynchronous UDP; current is the legacy comparison'),
             OpaqueFunction(function=guarded_start),
         ]

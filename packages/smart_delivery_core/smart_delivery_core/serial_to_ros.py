@@ -6,6 +6,7 @@ import serial
 from rclpy.node import Node
 from std_msgs.msg import String
 from smart_delivery_core.serial_recovery import ReconnectingSerial, FeedbackReadiness
+from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
 
 
 class SerialToROS(Node):
@@ -20,6 +21,7 @@ class SerialToROS(Node):
         self.summary_period = max(1.,float(self.get_parameter('summary_log_period_sec').value))
         self.log_raw_frames = bool(self.get_parameter('log_raw_frames').value)
         self.publisher_ = self.create_publisher(String, 'stm32_data', 10)
+        self.sample_pub = self.create_publisher(String, '/chassis/wheel_sample', LOCAL_ODOM_QOS)
         self.health_pub = self.create_publisher(String, '/chassis/serial_rx_health', 1)
         self.session = ''
         self.pending = bytearray()
@@ -55,10 +57,14 @@ class SerialToROS(Node):
                 if not text:
                     continue
                 before = self.feedback.samples.complete_sample_count
-                self.feedback.observe(text,now)
+                snapshot = self.feedback.observe(text,now)
                 if self.feedback.samples.complete_sample_count > before:
                     self.complete_ros_ns = self.get_clock().now().nanoseconds
                     completed = True
+                    self.sample_pub.publish(String(data=json.dumps(dict(
+                        schema_version=1, source='serial_rx', session=self.link.session,
+                        sequence=self.feedback.samples.complete_sample_count,
+                        sample_ros_stamp_ns=self.complete_ros_ns, wheels=snapshot))))
                 if self.log_raw_frames:
                     self.get_logger().debug('STM32: '+text)
                 self.publisher_.publish(String(data=text))

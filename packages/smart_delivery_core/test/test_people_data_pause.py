@@ -38,7 +38,7 @@ def test_short_data_gap_can_resume_remaining_angle_not_a_new_full_turn(runtime):
     assert len(n.sent)==2 and m.state=='observing'
     tree=ET.parse(n.sent[-1].behavior_tree)
     assert float(tree.find('.//Spin').attrib['spin_dist'])==pytest.approx(2*math.pi-.6)
-    assert m.observation_session_deadline==end and m.localization_pauses==1
+    assert m.observation_session_deadline==end and m.localization_pauses==0 and m.data_pauses==1
     m._people_finished('test_cleanup')
 
 
@@ -77,7 +77,7 @@ def test_missing_data_never_extends_twenty_second_wait_or_ninety_second_session(
 def test_pause_budget_not_reset_by_recovery(runtime):
     m,n,_=data_pause(runtime)
     m.state,m.motion,m.cancel_requested='observing',True,False
-    m.localization_pauses=2;m._safe=lambda:False
+    m.localization_pauses=2;m.data_pauses=8;m._safe=lambda:False
     m.poll(False)
     assert m.interrupt_reason=='unsafe_localization_or_odom_or_battery'
     n.complete=True;m.poll(False)

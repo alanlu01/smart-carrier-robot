@@ -16,13 +16,13 @@
   <link name="base_footprint"/>
 
   <!-- 📍 2. 車體運動與旋轉中心 (base_link) -->
-  <!-- 設於動力輪軸心高度：距離地面 8 cm (輪胎半徑) -->
+  <!-- 保留既有軸心高度 8 cm；本次僅校正輪子顯示尺寸。 -->
   <link name="base_link"/>
 
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
     <child link="base_link"/>
-    <origin xyz="0 0 0.080" rpy="0 0 0"/> <!-- 輪胎半徑 8cm -->
+    <origin xyz="0 0 0.080" rpy="0 0 0"/> <!-- 既有軸高，本次不變 -->
   </joint>
 
   <!-- 🚗 3. 實體底盤主體 (chassis) -->
@@ -63,11 +63,11 @@
   </joint>
 
   <!-- 🛞 5. 虛擬四輪展示 (不參與物理運動計算，純 RViz2 視覺觀看) -->
-  <!-- 輪胎半徑 8 cm (0.08m), 寬度 4.2 cm (0.042m) -->
+  <!-- 實車輪胎直徑 8 cm，半徑 4 cm (0.04m)，寬度 4.2 cm (0.042m)。 -->
   <link name="wheel_front_left">
     <visual>
       <geometry>
-        <cylinder radius="0.080" length="0.042"/>
+        <cylinder radius="0.040" length="0.042"/>
       </geometry>
       <material name="wheel_color"/>
     </visual>
@@ -82,7 +82,7 @@
   <link name="wheel_front_right">
     <visual>
       <geometry>
-        <cylinder radius="0.080" length="0.042"/>
+        <cylinder radius="0.040" length="0.042"/>
       </geometry>
       <material name="wheel_color"/>
     </visual>
@@ -96,7 +96,7 @@
   <link name="wheel_rear_left">
     <visual>
       <geometry>
-        <cylinder radius="0.080" length="0.042"/>
+        <cylinder radius="0.040" length="0.042"/>
       </geometry>
       <material name="wheel_color"/>
     </visual>
@@ -110,7 +110,7 @@
   <link name="wheel_rear_right">
     <visual>
       <geometry>
-        <cylinder radius="0.080" length="0.042"/>
+        <cylinder radius="0.040" length="0.042"/>
       </geometry>
       <material name="wheel_color"/>
     </visual>

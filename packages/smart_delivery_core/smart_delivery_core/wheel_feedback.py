@@ -65,6 +65,13 @@ class WheelSampleAssembler:
             reference = self.started_at
         return max(0.0, float(now) - reference)
 
+    def add_snapshot(self, snapshot, observed_at):
+        """Accept a validated atomic group without receiver-side line timing."""
+        self._pending.clear()
+        self._batch_started_at = None
+        self.last_complete_at = observed_at
+        self.complete_sample_count += 1
+
     def is_stale(self, now, timeout_sec):
         if timeout_sec <= 0:
             raise ValueError("timeout_sec must be greater than zero")

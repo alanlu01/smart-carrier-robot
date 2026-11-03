@@ -104,6 +104,7 @@ class FeedbackReadiness:
             self.good_groups = (self.good_groups+1 if all(math.isfinite(v) for v in sample.values()) else 0)
         elif '_RT:' in line and ('nan' in line.lower() or 'inf' in line.lower()):
             self.good_groups = 0
+        return sample
 
     def snapshot(self, now):
         at = self.samples.last_complete_at

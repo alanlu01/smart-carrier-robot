@@ -20,6 +20,17 @@ from smart_delivery_core.optional_idle import home_pending_decision, load_idle_c
 ROOT = Path(__file__).parents[1]
 
 
+def test_data_waits_keep_localization_budget_and_original_deadline(runtime):
+    manager,navigator,moment=runtime
+    manager.observation_session_deadline=120.
+    for _ in range(3):
+        manager._begin_localization_wait('observing',115.,data_only=True)
+    assert manager.data_pauses==3 and manager.localization_pauses==0
+    assert manager.localization_wait_deadline==115.
+    manager._begin_localization_wait('observing',115.)
+    assert manager.localization_pauses==1
+
+
 class Future:
     def __init__(self, value, complete=True):
         self.value, self.complete = value, complete

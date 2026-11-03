@@ -356,9 +356,9 @@ local_costmap:
           inf_is_valid: True
           data_type: "LaserScan"
           raytrace_max_range: 3.0
-          raytrace_min_range: 0.25
+          raytrace_min_range: 0.15
           obstacle_max_range: 2.5
-          obstacle_min_range: 0.25
+          obstacle_min_range: 0.15
         # 👇 🌟 新增：玻璃虛擬感測器的專屬設定 (Local)
         visual_glass:
           topic: /visual_glass
@@ -396,9 +396,9 @@ global_costmap:
           marking: True
           data_type: "LaserScan"
           raytrace_max_range: 3.0
-          raytrace_min_range: 0.25
+          raytrace_min_range: 0.15
           obstacle_max_range: 2.5
-          obstacle_min_range: 0.25
+          obstacle_min_range: 0.15
         # 👇 🌟 新增：玻璃虛擬感測器的專屬設定 (Global)
         visual_glass:
           topic: /visual_glass
@@ -541,7 +541,14 @@ collision_monitor:
     stop_pub_timeout: 2.0
     # Polygons represent zone around the robot for "stop", "slowdown" and "limit" action types,
     # and robot footprint for "approach" action type.
-    polygons: ["FootprintApproach"]
+    polygons: ["NearFootprintStop", "FootprintApproach"]
+    NearFootprintStop:
+      type: "polygon"
+      action_type: "stop"
+      points: "[[0.30, 0.24], [0.30, -0.24], [-0.30, -0.24], [-0.30, 0.24]]"
+      min_points: 2
+      visualize: False
+      enabled: True
     FootprintApproach:
       type: "polygon"
       action_type: "approach"

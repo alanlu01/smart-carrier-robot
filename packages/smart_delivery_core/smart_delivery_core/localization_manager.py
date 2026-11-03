@@ -66,6 +66,8 @@ from smart_delivery_core.recovery_translation import (
 )
 from smart_delivery_core.degraded_localization import MildMapGuard, convergence_is_stalled
 from smart_delivery_core.wheel_feedback import WheelSampleAssembler, WheelStopEvidence
+from smart_delivery_core.atomic_wheel_feedback import AtomicWheelReceiver
+from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
 from smart_delivery_core.stationary_map_guard import StationaryMapGuard
 from smart_delivery_core.localization_quality_history import LocalizationQualityHistory
 from smart_delivery_core.delivery_console import localization_label, brief, reason_label
@@ -93,7 +95,7 @@ class LocalizationManager(Node):
         super().__init__("localization_manager")
         self._declare_parameters()
         self.mild_map_enabled = bool(self.get_parameter('mild_map_observation_enabled').value)
-        self.mild_map_guard = MildMapGuard()
+        self.mild_map_guard = MildMapGuard(seconds=6., distance=.60, samples=None, angle=1.)
         self.stationary_map_guard = StationaryMapGuard()
         self.quality_history = LocalizationQualityHistory()
         self.covariance_probe = CovarianceProbe()
@@ -489,7 +491,8 @@ class LocalizationManager(Node):
         )
         self.create_subscription(String, "/localization/recovery_motion_guard",
                                  self._recovery_guard_callback, 1)
-        self.create_subscription(String, "/stm32_data", self._recovery_feedback_callback, 50)
+        self.atomic_wheels = AtomicWheelReceiver(self.recovery_feedback, self.recovery_stop)
+        self.create_subscription(String, '/chassis/wheel_sample', self._atomic_wheel_callback, LOCAL_ODOM_QOS)
         self.create_subscription(String, '/navigation/pipeline_health', self._navigation_health_callback, 1)
         self.lateral_timer = self.create_timer(0.05, self._tick_lateral_motion)
         self.evidence_timer = self.create_timer(0.05, self._drain_recovery_scans)
@@ -741,7 +744,7 @@ class LocalizationManager(Node):
                 'healthy_samples': self.covariance_probe.healthy_samples,
             },
             "global_attempts": self.global_attempts,
-            'dispatch_allowed': self.ready and not self.stationary_map_guard.active,
+            'dispatch_allowed': self.ready and not self.stationary_map_guard.active and not self.mild_map_active,
             'stationary_map_observation': {
                 'active': self.stationary_map_guard.active,
                 'elapsed_sec': round(self.stationary_map_guard.elapsed,3),
@@ -1384,7 +1387,7 @@ class LocalizationManager(Node):
                 # Recovery Spin retains the original protected command chain.
                 probe = getattr(self, 'covariance_probe', None)
                 limit.data = (0. if self.state == 'LOCALIZED' and probe and probe.stopped
-                              else .5 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0)
+                              else .4 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0)
                 self.speed_limit_publisher.publish(limit)
             if (started - self.last_pipeline_diagnostic_at >= 5.0
                     and self.latest_scan is not None):
@@ -1484,6 +1487,14 @@ class LocalizationManager(Node):
             self._publish_state()
             return
 
+        # AMCL discovery can follow the first seed. Nav2 readiness itself
+        # waits for AMCL's map->odom, so it must not block seed retransmission.
+        if (self.state == 'VERIFYING' and self.last_amcl_at < self.initial_pose_last_published
+                and getattr(self, 'verify_seed_retry_allowed', True)
+                and now-self.initial_pose_last_published >= 2.
+                and self.initial_pose_publisher.get_subscription_count() >= 1):
+            self._publish_initial_pose(retry=True)
+
         if observing and not self._observe_wait(now):
             return
 
@@ -1508,13 +1519,6 @@ class LocalizationManager(Node):
 
         if self.state == "VERIFYING":
             self._request_nomotion_if_due(now)
-            if (
-                self.last_amcl_at < self.initial_pose_last_published
-                and getattr(self,'verify_seed_retry_allowed',True)
-                and now - self.initial_pose_last_published >= 2.0
-                and self.initial_pose_publisher.get_subscription_count() >= 1
-            ):
-                self._publish_initial_pose(retry=True)
             if self.observation_clock.elapsed >= self.verify_timeout:
                 if self._convergence_grace(now, self.verify_timeout, self.verify_max_wait):
                     return
@@ -1591,7 +1595,9 @@ class LocalizationManager(Node):
                 self.commanded_motion,
                 self.odom_motion,
             ) or stationary_mismatch
-            if match_status != 'degraded':
+            # Only genuine recovered evidence renews the odometry budget.
+            # Unknown/critical frames cannot repeatedly grant a fresh window.
+            if match_status == 'healthy' and self._map_match_has_recovered(now):
                 self.mild_map_guard.reset()
             if (self.mild_map_enabled and match_status == 'degraded'
                     and not (probe and probe.stopped)
@@ -2368,6 +2374,13 @@ class LocalizationManager(Node):
         now = time.monotonic()
         self.recovery_feedback.add_line(message.data, now)
         self.recovery_stop.observe(message.data, now)
+
+    def _atomic_wheel_callback(self, message):
+        try:
+            self.atomic_wheels.observe(json.loads(message.data),
+                self.get_clock().now().nanoseconds, time.monotonic())
+        except (ValueError, TypeError):
+            return
 
     def _recovery_guard_callback(self, message):
         try:
