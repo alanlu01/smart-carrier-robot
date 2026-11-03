@@ -2,6 +2,8 @@
 import json,os,resource,signal,subprocess,time,tempfile
 from pathlib import Path
 import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import TransformStamped,Twist
 from std_msgs.msg import String
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
@@ -21,11 +23,17 @@ def main():
     node.create_subscription(Twist,'/cmd_vel',commands.append,10)
     base=Path(os.environ['ROS_LOG_DIR']);base.mkdir(parents=True,exist_ok=True)
     root=Path(tempfile.mkdtemp(prefix='entrypoint_',dir=base))
+    # ROS domain isolation does not isolate files: never touch the production pose cache.
+    parameters=yaml.safe_load((Path(get_package_share_directory('smart_delivery_core'))/
+                               'config/my_nav2_params.yaml').read_text())
+    parameters['localization_manager']['ros__parameters']['pose_cache_path']=str(root/'pose_cache.json')
+    test_params=root/'nav_params.yaml'
+    test_params.write_text(yaml.safe_dump(parameters,allow_unicode=True))
     logpath=root/'entrypoint.log'
     try:
         with logpath.open('w') as log:
             child=subprocess.Popen(['ros2','launch','smart_delivery_core','navigation.launch.py',
-                'auto_initialize:=false'],stdout=log,stderr=subprocess.STDOUT,start_new_session=True,
+                'auto_initialize:=false','params_file:='+str(test_params)],stdout=log,stderr=subprocess.STDOUT,start_new_session=True,
                 env=dict(os.environ,ROS_LOG_DIR=str(root)),
                 preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_CORE,(0,0)))
             try:
