@@ -97,6 +97,10 @@ class LocalizationManager(Node):
         self.stationary_map_guard = StationaryMapGuard()
         self.quality_history = LocalizationQualityHistory()
         self.covariance_probe = CovarianceProbe()
+        self.manual_intervention_kind = 'pose'
+        self.verify_seed_retry_allowed = True
+        self.navigation_health = None
+        self.navigation_health_at = 0.
         self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
         self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
@@ -486,6 +490,7 @@ class LocalizationManager(Node):
         self.create_subscription(String, "/localization/recovery_motion_guard",
                                  self._recovery_guard_callback, 1)
         self.create_subscription(String, "/stm32_data", self._recovery_feedback_callback, 50)
+        self.create_subscription(String, '/navigation/pipeline_health', self._navigation_health_callback, 1)
         self.lateral_timer = self.create_timer(0.05, self._tick_lateral_motion)
         self.evidence_timer = self.create_timer(0.05, self._drain_recovery_scans)
         self.timer = self.create_timer(0.2, self._tick)
@@ -661,8 +666,9 @@ class LocalizationManager(Node):
             ready_message.data = self.ready
             self.ready_publisher.publish(ready_message)
         if changed:
-            icon = '✅' if self.ready else '🙋' if state=='MANUAL_REQUIRED' else '🔄' if state.startswith('RECOVERING') else '⏳'
-            message = f"{icon} {localization_label(state)}"
+            icon = ('✅' if self.ready else '🛠️' if state=='MANUAL_REQUIRED' and getattr(self,'manual_intervention_kind','pose')=='pipeline'
+                    else '🙋' if state=='MANUAL_REQUIRED' else '🔄' if state.startswith('RECOVERING') else '⏳')
+            message = f"{icon} {localization_label(state, getattr(self,'manual_intervention_kind','pose'))}"
             if self.ready:
                 self.get_logger().info(message)
             else:
@@ -681,6 +687,8 @@ class LocalizationManager(Node):
             'sample_ros_stamp_ns': self.get_clock().now().nanoseconds,
             "state": self.state,
             "ready": self.ready,
+            'manual_intervention_kind': getattr(self,'manual_intervention_kind','pose'),
+            'navigation_health': getattr(self,'navigation_health',None),
             "reason": self.state_reason,
             "scan_age_sec": (
                 None if not self.latest_scan_at else now - self.latest_scan_at
@@ -1146,7 +1154,12 @@ class LocalizationManager(Node):
             self.manual_initial_pose_pending = False
             return
         self.global_verification_required = False  # Human seed still needs existing six-sample verification.
+        self.verify_seed_retry_allowed = False
         if self.state == "MANUAL_REQUIRED":
+            if (getattr(self,'manual_intervention_kind','pose') == 'pipeline'
+                    and self._verification_data_blockers(time.monotonic())):
+                self.get_logger().warning('🛠️ 初始位置已收到，先恢復底盤／導航資料再驗證')
+                return
             self.stable_samples = 0
             self._reset_map_match_history()
             self.verify_reference_required = False
@@ -1180,6 +1193,13 @@ class LocalizationManager(Node):
     def _verification_data_blockers(self, now):
         """Separate unavailable observations from genuinely unhealthy covariance."""
         blockers = []
+        feedback = getattr(self,'recovery_feedback',None)
+        if feedback is not None and (feedback.last_complete_at is None or feedback.is_stale(now,.8)):
+            blockers.append('chassis_feedback_unavailable')
+        nav = getattr(self,'navigation_health',None)
+        if nav is not None and (nav.get('state') != 'ready'
+                                or not 0 <= now-self.navigation_health_at <= 3.):
+            blockers.append('nav2_services_unavailable')
         for name, stamp, limit in (
             ("raw_scan", self.latest_raw_scan_at, self.scan_timeout),
             ("scan_filtered", self.latest_scan_at, self.scan_timeout),
@@ -1198,6 +1218,16 @@ class LocalizationManager(Node):
         if self.last_map_match_error:
             blockers.append("map_match_update_failed")
         return blockers
+
+    def _navigation_health_callback(self, message):
+        try:
+            payload = json.loads(message.data)
+            age = (self.get_clock().now().nanoseconds-int(payload['sample_ros_stamp_ns']))/1e9
+            if not isinstance(payload,dict) or not -.1 <= age <= 3.:
+                raise ValueError('stale navigation health')
+            self.navigation_health, self.navigation_health_at = payload,time.monotonic()
+        except (ValueError,TypeError,KeyError):
+            self.navigation_health = {'state':'unavailable'}
 
     def _mild_map_sources_fresh(self):
         """Receipt timing alone cannot turn delayed source data into fresh data."""
@@ -1480,6 +1510,7 @@ class LocalizationManager(Node):
             self._request_nomotion_if_due(now)
             if (
                 self.last_amcl_at < self.initial_pose_last_published
+                and getattr(self,'verify_seed_retry_allowed',True)
                 and now - self.initial_pose_last_published >= 2.0
                 and self.initial_pose_publisher.get_subscription_count() >= 1
             ):
@@ -1491,6 +1522,11 @@ class LocalizationManager(Node):
             return
 
         if self.state == "LOCALIZED":
+            system_blockers = self._verification_data_blockers(now)
+            if any(x in system_blockers for x in ('chassis_feedback_unavailable','nav2_services_unavailable')):
+                self._begin_recovery('底盤／導航資料管線中斷：'+', '.join(system_blockers),
+                                     transient_sensor_timeout=True,sensor_pipeline_timeout=True)
+                return
             if self.latest_quality is None:
                 self._begin_recovery("AMCL 位姿資料逾時")
                 return
@@ -1611,6 +1647,18 @@ class LocalizationManager(Node):
                         "不觸發定位自旋"
                     )
                     self.last_map_only_warning_at = now
+            return
+
+        if (self.state == 'MANUAL_REQUIRED'
+                and getattr(self,'manual_intervention_kind','pose') == 'pipeline'
+                and not self._verification_data_blockers(now)):
+            self.stable_samples = 0
+            self.verification_pose_anchor = self.latest_pose
+            self.initial_pose_last_published = now
+            self.verify_seed_retry_allowed = False
+            self.verify_reference_required = False
+            self.manual_intervention_kind = 'pose'
+            self._set_state('VERIFYING','資料管線已恢復，重新驗證定位')
             return
 
         if self.state == "SUSPECT":
@@ -1812,6 +1860,7 @@ class LocalizationManager(Node):
         )
 
     def _publish_initial_pose(self, retry=False):
+        self.verify_seed_retry_allowed = True
         message = PoseWithCovarianceStamped()
         message.header.frame_id = "map"
         message.header.stamp = self.get_clock().now().to_msg()
@@ -2451,6 +2500,7 @@ class LocalizationManager(Node):
         self.lateral_direction = directions[0]
         self.lateral_anchor = self.last_odom_pose
         self.lateral_started_at = now
+        self.lateral_progress_value, self.lateral_progress_at = 0.,now
         self.lateral_motion_timing = {}
         self._record_lateral_event('start', now)
         self.lateral_stopped_since = None
@@ -2597,9 +2647,19 @@ class LocalizationManager(Node):
             return
         speed = lateral_speed(progress, self.lateral_distance, self.lateral_cap,
                               feedback_age=max(0., now-self.latest_odom_at))
+        if not hasattr(self,'lateral_progress_value') or abs(progress-self.lateral_progress_value) >= .001:
+            self.lateral_progress_value, self.lateral_progress_at = progress,now
+        if speed <= .02 and now-self.lateral_progress_at >= 1.:
+            if progress >= self.lateral_distance-.030:
+                self._record_lateral_event('settled_tail_completion', now)
+                self._stop_lateral()
+            else:
+                self._stop_lateral('橫移低速停滯，未達有效距離')
+            return
         if speed < self.lateral_cap:
             self._record_lateral_event('deceleration', now)
         if speed == 0.0:
+            self._record_lateral_event('target_tolerance_completion', now)
             self._stop_lateral()
             return
         if not self._lateral_path_clear(self.lateral_direction,
@@ -2836,6 +2896,8 @@ class LocalizationManager(Node):
         )
 
     def _require_manual(self, reason):
+        self.manual_intervention_kind = ('pipeline' if any(word in reason for word in
+            ('資料管線','底盤回授','回授確認','無新鮮回授','Nav2')) else 'pose')
         if self.lateral_phase is not None and self.lateral_phase != "disarming":
             self._stop_lateral(reason)
         self.spin_sequence = []
@@ -2852,7 +2914,10 @@ class LocalizationManager(Node):
         self.recovery_step = None
         self._cancel_navigation()
         self._set_state("MANUAL_REQUIRED", reason)
-        self.get_logger().error("🙋 請在 RViz 設定初始位置")
+        if self.manual_intervention_kind == 'pipeline':
+            self.get_logger().error('🛠️ 請先恢復底盤／導航資料，暫停派發並保留任務')
+        else:
+            self.get_logger().error("🙋 請在 RViz 設定初始位置")
 
 
 def main(args=None):

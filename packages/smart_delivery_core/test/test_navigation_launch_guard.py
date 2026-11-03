@@ -47,7 +47,9 @@ def test_unguarded_existing_container_is_detected_and_never_killed(tmp_path):
     owner=guard(tmp_path).acquire();owner.close()
 
 
-@pytest.mark.parametrize('name',['bt_navigator','controller_server','amcl','map_server'])
+@pytest.mark.parametrize('name',['bt_navigator','controller_server','amcl','map_server',
+    'planner_server','smoother_server','behavior_server','route_server','opennav_docking',
+    'waypoint_follower','velocity_smoother','collision_monitor'])
 def test_standalone_nav2_nodes_also_prevent_conflicting_bringup(tmp_path,name):
     process(tmp_path,name=name)
     with pytest.raises(RuntimeError,match='尚未結束'):

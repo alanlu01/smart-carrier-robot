@@ -8,7 +8,9 @@ from xml.etree import ElementTree as ET
 KEYS = ('ROS_DOMAIN_ID','RMW_IMPLEMENTATION','RMW_FASTRTPS_USE_QOS_FROM_XML',
         'RMW_FASTRTPS_PUBLICATION_MODE','FASTRTPS_DEFAULT_PROFILES_FILE',
         'FASTDDS_DEFAULT_PROFILES_FILE')
-SENSORS = ('scan_to_scan_filter_chain','odom_transport','mecanum_odom_real')
+SENSORS = ('scan_to_scan_filter_chain','odom_transport','mecanum_odom_real',
+           'amcl','map_server','controller_server','bt_navigator','planner_server','smoother_server',
+           'behavior_server','collision_monitor','velocity_smoother','lifecycle_manager')
 
 
 def inspect_processes(proc_root='/proc'):

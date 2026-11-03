@@ -622,6 +622,7 @@ def _run_delivery(runtime_holder):
     localization_ready = None
     localization_ready_since = None
     localization_state = "UNINITIALIZED"
+    localization_intervention_kind = 'pose'
     localization_state_received = False
     localization_dispatch_allowed = False
     localization_ready_received = False
@@ -763,10 +764,12 @@ def _run_delivery(runtime_holder):
         )
 
     def localization_state_callback(message):
+        nonlocal localization_intervention_kind
         nonlocal localization_state, localization_state_received, localization_dispatch_allowed
         try:
             snapshot = json.loads(message.data)
             localization_state = snapshot.get("state", "UNKNOWN")
+            localization_intervention_kind = snapshot.get('manual_intervention_kind','pose')
             localization_dispatch_allowed = dispatch_permitted(snapshot)
             localization_state_received = True
         except (AttributeError, TypeError, json.JSONDecodeError):
@@ -1380,7 +1383,7 @@ def _run_delivery(runtime_holder):
                     wait_reason = ("等待定位品質確認，暫緩派發"
                                    if not localization_dispatch_allowed else "STABILIZING_BEFORE_RESUME")
                 navigator.get_logger().warning(
-                    f"⏸️ {localization_label(wait_reason)}，保留任務"
+                    f"⏸️ {localization_label(wait_reason,localization_intervention_kind)}，保留任務"
                 )
                 last_localization_warning_at = now
             continue
@@ -1569,7 +1572,7 @@ def _run_delivery(runtime_holder):
                 cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
-                    f"⏸️ {localization_label(localization_state)}，取消導航並保留任務"
+                    f"⏸️ {localization_label(localization_state,localization_intervention_kind)}，取消導航並保留任務"
                 )
                 navigator.cancelTask()
                 cancel_sent = True

@@ -2,11 +2,11 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, GroupAction, SetEnvironmentVariable
 from launch.event_handlers import OnShutdown, OnProcessIO, OnProcessExit
 from launch.logging import launch_config
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
@@ -69,6 +69,7 @@ def generate_launch_description():
             "params_file": configured_nav2_params,
             "use_sim_time": LaunchConfiguration("use_sim_time"),
             "autostart": "true",
+            'use_composition': PythonExpression(["'",LaunchConfiguration('use_composition'),"'.lower() == 'true'"]),
         }.items(),
     )
 
@@ -96,15 +97,27 @@ def generate_launch_description():
     )
 
     def guarded_start(context):
+        mode = LaunchConfiguration('nav_transport_profile').perform(context)
+        if mode not in ('current','async'):
+            raise ValueError('nav_transport_profile must be current or async')
+        if LaunchConfiguration('use_composition').perform(context).lower() not in ('true','false'):
+            raise ValueError('use_composition must be true or false')
         lease = NavigationLaunchLease().acquire()
-        transcript = NavigationTranscript(launch_config.log_dir)
+        transcript = NavigationTranscript(launch_config.log_dir, multi_process=True)
         def release(context):
             lease.close()
             return []
+        nav_actions = [nav2]
+        if mode == 'async':
+            profile = os.path.join(core_share,'config','fastdds_nav_async.xml')
+            nav_actions = [SetEnvironmentVariable(name=name,value=value) for name,value in (
+                ('FASTRTPS_DEFAULT_PROFILES_FILE',profile),('FASTDDS_DEFAULT_PROFILES_FILE',profile),
+                ('RMW_FASTRTPS_USE_QOS_FROM_XML','1'),('RMW_FASTRTPS_PUBLICATION_MODE','ASYNCHRONOUS'))]+nav_actions
         return [RegisterEventHandler(OnShutdown(on_shutdown=[OpaqueFunction(function=release)])),
                 RegisterEventHandler(OnProcessIO(on_stdout=transcript.output,on_stderr=transcript.output)),
                 RegisterEventHandler(OnProcessExit(on_exit=transcript.exited)),
-                nav2, localization_manager, delivery_goal_guard]
+                GroupAction(actions=nav_actions), localization_manager, delivery_goal_guard,
+                Node(package='smart_delivery_core',executable='navigation_health',output='screen')]
 
     return LaunchDescription(
         [
@@ -114,6 +127,10 @@ def generate_launch_description():
             behavior_tree_argument,
             use_sim_time_argument,
             auto_initialize_argument,
+            DeclareLaunchArgument('use_composition',default_value='False',
+                                  description='Separate Nav2 processes by default; true is the container comparison'),
+            DeclareLaunchArgument('nav_transport_profile',default_value='async',
+                                  description='async uses bounded asynchronous UDP; current is the legacy comparison'),
             OpaqueFunction(function=guarded_start),
         ]
     )

@@ -28,7 +28,12 @@ class NavigationLaunchLease:
                 executable = Path(words[0]).name
                 is_container = (executable.startswith('component_container')
                                 and any('__node:=nav2_container' in word for word in words))
-                is_server = executable in ('bt_navigator', 'controller_server', 'amcl', 'map_server')
+                is_server = executable in ('bt_navigator','controller_server','amcl','map_server',
+                    'planner_server','smoother_server','behavior_server','route_server','opennav_docking',
+                    'waypoint_follower','velocity_smoother','collision_monitor')
+                is_server = is_server or (executable == 'lifecycle_manager' and any(
+                    word in ('__node:=lifecycle_manager_navigation','__node:=lifecycle_manager_localization')
+                    for word in words))
                 if not (is_container or is_server):
                     continue
                 environment = item.joinpath('environ').read_bytes().split(b'\0')

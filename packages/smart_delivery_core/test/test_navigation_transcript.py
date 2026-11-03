@@ -15,3 +15,15 @@ def test_only_nav2_container_output_and_exit_are_saved(tmp_path):
     result=json.loads((tmp_path/'nav2_container_123.exit.json').read_text())
     assert result['returncode']==-6 and result['dropped_bytes']==0
     assert len(list(tmp_path.iterdir()))==2
+
+
+def test_one_standalone_exit_does_not_close_other_nodes_transcript(tmp_path):
+    writer=NavigationTranscript(tmp_path,multi_process=True)
+    for name,pid in (('amcl',1),('controller_server',2)):
+        event=S(cmd=[name],pid=pid,text=b'isolated log\n',from_stderr=True,returncode=0)
+        writer.output(event);writer.exited(event)
+        assert not writer.closed
+    writer.close()
+    for name,pid in (('amcl',1),('controller_server',2)):
+        assert (tmp_path/f'nav2_{name}_{pid}.stderr.log').read_bytes()==b'isolated log\n'
+        assert json.loads((tmp_path/f'nav2_{name}_{pid}.exit.json').read_text())['returncode']==0

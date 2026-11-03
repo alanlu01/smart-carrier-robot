@@ -7,7 +7,9 @@ def brief(value, limit=64):
     return text if len(text) <= limit else text[:limit-1]+'…'
 
 
-def localization_label(state):
+def localization_label(state, intervention_kind='pose'):
+    if state == 'MANUAL_REQUIRED' and intervention_kind == 'pipeline':
+        return '底盤／導航資料中斷，等待恢復'
     return {
         'UNINITIALIZED':'尚未初始化','WAITING_FOR_SENSORS':'等待感測資料',
         'SEEDING':'設定初始位置','VERIFYING':'驗證定位','LOCALIZED':'定位就緒',

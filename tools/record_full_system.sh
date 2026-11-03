@@ -50,6 +50,7 @@ TOPICS=(
   /smart_carrier/delivery_navigation_active /delivery/standby_state
   /delivery/startup_state
   /chassis/odom_local /chassis/odometry_transport_health
+  /chassis/serial_rx_health /chassis/serial_tx_health /navigation/pipeline_health
   /power_status /vehicle_battery_status
   /vision/semantic_info /visual_glass /semantic/speed_multiplier
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health
@@ -67,7 +68,7 @@ printf '%s\n' "$RECORD_HELP" > "$RECORD_DIR/recorder_help.txt"
 cp "$QOS_FILE" "$RECORD_DIR/recording_qos.yaml"
 mkdir -p "$RECORD_DIR/config_snapshot"
 # Explicit whitelist; never copy robot.env or dump API credentials.
-for CONFIG in my_nav2_params.yaml slam_mapping.yaml my_laser_filter.yaml optional_idle_features.yaml fastdds_sensor_publish.xml; do
+for CONFIG in my_nav2_params.yaml slam_mapping.yaml my_laser_filter.yaml optional_idle_features.yaml fastdds_sensor_publish.xml fastdds_nav_async.xml fastdds_robot.xml; do
   if [[ -f "$CORE_SHARE/config/$CONFIG" ]]; then
     cp "$CORE_SHARE/config/$CONFIG" "$RECORD_DIR/config_snapshot/"
   fi

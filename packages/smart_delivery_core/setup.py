@@ -39,6 +39,7 @@ setup(
             'scan_pipeline_monitor = smart_delivery_core.scan_pipeline_monitor:main',
             'serial_bridge = smart_delivery_core.serial_bridge:main',
             'localization_manager = smart_delivery_core.localization_manager:main',
+            'navigation_health = smart_delivery_core.navigation_health:main',
             'delivery_goal_guard = smart_delivery_core.delivery_goal_guard:main',
             'smart_delivery = smart_delivery_core.smart_delivery:main',
             'optional_idle_map_inspect = smart_delivery_core.optional_idle_inspect:main',

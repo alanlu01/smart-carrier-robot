@@ -1,63 +1,119 @@
-#!/usr/bin/env python3
+"""Reconnect with zero speed and fresh stopped-wheel evidence before motion."""
+import json
+import math
+import time
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-import serial
-import sys
+from std_msgs.msg import String
+from smart_delivery_core.serial_recovery import ReconnectingSerial, fresh_feedback
+
+ZERO = b'$CMD,0.00,0.00,0.00#\n'
+
 
 class CmdVelToSerialNode(Node):
     def __init__(self):
         super().__init__('cmd_vel_to_serial_node')
-        
-        # --- 1. 序列埠 (Serial) 設定 ---
-        # 🌟 這裡換成我們剛剛綁定的專屬 udev 名稱
-        self.serial_port_name = '/dev/stm32' 
-        self.baud_rate = 115200 
-        
-        try:
-            self.serial_port = serial.Serial(self.serial_port_name, self.baud_rate, timeout=1)
-            self.get_logger().info(f"✅ 成功連接到 STM32 序列埠: {self.serial_port_name}")
-        except serial.SerialException as e:
-            self.get_logger().error(f"❌ 無法開啟序列埠 {self.serial_port_name}，錯誤: {e}")
-            sys.exit(1)
+        self.declare_parameter('serial_port','/dev/stm32')
+        self.declare_parameter('baud_rate',115200)
+        self.link = ReconnectingSerial(str(self.get_parameter('serial_port').value),
+                                     int(self.get_parameter('baud_rate').value),self.get_logger())
+        self.session = self.rx_session = ''
+        self.feedback, self.feedback_at = {}, 0.
+        self.armed = False
+        self.last_command = -float('inf')
+        self.last_zero = -float('inf')
+        self.opened_ros_ns = 0
+        self.rejected_commands = 0
+        self.accepted_commands = 0
+        self.arming_count = 0
+        self.health_pub = self.create_publisher(String,'/chassis/serial_tx_health',1)
+        self.subscription = self.create_subscription(Twist,'/chassis_cmd_vel',self.cmd_vel_callback,1)
+        self.create_subscription(String,'/chassis/serial_rx_health',self.feedback_callback,1)
+        self.timer = self.create_timer(.05,self.poll)
+        self.create_timer(.2,self.publish_health)
 
-        # --- 2. 訂閱者 (Subscriber) 設定 ---
-        self.subscription = self.create_subscription(
-            Twist,
-            '/chassis_cmd_vel',
-            self.cmd_vel_callback,
-            10
-        )
-        self.get_logger().info("🎧 正在監聽 /cmd_vel 三軸速度指令 (Vx, Vy, W)...")
-
-    def cmd_vel_callback(self, msg):
-        # 提取出 線速度 (vx, vy) 與 角速度 (w)
-        vx = msg.linear.x
-        vy = msg.linear.y  # 👈 麥克納姆輪專屬的橫向平移速度
-        w = msg.angular.z
-        
-        # --- 3. 封包格式化 (加入 vy) ---
-        # 格式: $CMD,vx,vy,w#\n
-        command_str = f"$CMD,{vx:.2f},{vy:.2f},{w:.2f}#\n"
-        
-        # --- 4. 發送至 STM32 ---
+    def feedback_callback(self, message):
         try:
-            self.serial_port.write(command_str.encode('utf-8'))
-            # 🌟 將 info 改為 debug，避免遙控時狂刷終端機導致系統卡頓
-            self.get_logger().debug(f"📤 發送指令: {command_str.strip()}")
-        except Exception as e:
-            self.get_logger().error(f"⚠️ 發送失敗: {e}")
+            payload = json.loads(message.data)
+            if not isinstance(payload,dict):
+                raise ValueError('feedback must be an object')
+            self.feedback, self.feedback_at = payload,time.monotonic()
+        except (ValueError,TypeError):
+            self.feedback = {}
+
+    def feedback_ready(self, now):
+        return fresh_feedback(self.feedback,self.get_clock().now().nanoseconds,now-self.feedback_at)
+
+    def zero(self, now):
+        if self.link.port is not None and now-self.last_zero >= .15:
+            self.link.write(ZERO,now)
+            self.last_zero = now
+
+    def poll(self):
+        now = time.monotonic()
+        if not self.link.poll(now):
+            self.armed = False
+            return
+        if self.session != self.link.session:
+            self.session = self.link.session
+            self.armed = False
+            self.opened_ros_ns = self.get_clock().now().nanoseconds
+            self.last_zero = -float('inf')
+            self.zero(now)
+            if self.link.port is None:
+                return
+        ready = self.feedback_ready(now)
+        if not ready or self.rx_session != self.feedback.get('session'):
+            if self.armed:
+                self.last_zero = -float('inf')
+            self.armed = False
+            self.rx_session = self.feedback.get('session','')
+        if (not self.armed and ready and self.feedback.get('stop_proven') is True
+                and self.feedback['sample_ros_stamp_ns'] > self.opened_ros_ns):
+            if self.feedback['complete_ros_stamp_ns'] <= self.opened_ros_ns:
+                self.zero(now)
+                return
+            self.armed = True
+            self.arming_count += 1
+            self.get_logger().info('✅ STM32 新鮮回授及停車確認完成')
+        if not self.armed or now-self.last_command > .25:
+            self.zero(now)
+
+    def cmd_vel_callback(self, message, info=None):
+        now = time.monotonic()
+        values = (message.linear.x,message.linear.y,message.angular.z)
+        source = getattr(info,'source_timestamp',0) if info is not None else 0
+        source_ok = info is None or source > 0 and -.1 <= (self.get_clock().now().nanoseconds-source)/1e9 <= .25
+        if (not self.armed or self.rx_session != self.feedback.get('session')
+                or not self.feedback_ready(now) or not source_ok
+                or not all(math.isfinite(v) for v in values)):
+            self.rejected_commands += 1
+            self.zero(now)
+            return
+        payload = f'$CMD,{values[0]:.2f},{values[1]:.2f},{values[2]:.2f}#\n'.encode()
+        if self.link.write(payload,now):
+            self.last_command = now
+            self.accepted_commands += 1
+        else:
+            self.armed = False
+
+    def publish_health(self):
+        now = time.monotonic()
+        data = self.link.snapshot(now)
+        data.update(sample_ros_stamp_ns=self.get_clock().now().nanoseconds,
+                    armed=self.armed and self.feedback_ready(now),rx_session=self.rx_session,
+                    rejected_commands=self.rejected_commands,
+                    accepted_commands=self.accepted_commands,
+                    arming_count=self.arming_count,
+                    state='ready' if self.armed and self.feedback_ready(now) else 'waiting_for_safe_feedback')
+        self.health_pub.publish(String(data=json.dumps(data)))
 
     def destroy_node(self):
-        if hasattr(self, 'serial_port') and self.serial_port.is_open:
-            try:
-                self.serial_port.write(b"$CMD,0.00,0.00,0.00#\n")
-                self.serial_port.flush()
-            except Exception as e:
-                self.get_logger().warning(f"關閉前送出零速指令失敗: {e}")
-            self.serial_port.close()
-            self.get_logger().info("🔒 序列埠已安全關閉。")
-        super().destroy_node()
+        self.link.write(ZERO,time.monotonic())
+        self.link.close()
+        return super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -68,7 +124,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():rclpy.shutdown()
 
-if __name__ == '__main__':
-    main()
+
+if __name__=='__main__':main()

@@ -1,5 +1,6 @@
 """Bounded asynchronous container output capture; never controls lifecycle."""
 from collections import deque
+import atexit
 import json
 from pathlib import Path
 import threading
@@ -9,8 +10,11 @@ import time
 class NavigationTranscript:
     MAX_PENDING = 2*1024*1024
 
-    def __init__(self, directory):
+    def __init__(self, directory, multi_process=False):
         self.directory=Path(directory)
+        self.multi_process = multi_process
+        if multi_process:
+            atexit.register(self.close)
         self.condition=threading.Condition()
         self.pending=deque()
         self.pending_bytes=self.dropped_bytes=0
@@ -21,8 +25,17 @@ class NavigationTranscript:
 
     @staticmethod
     def matches(event):
-        return (event.cmd and Path(event.cmd[0]).name in ('component_container','component_container_isolated')
-                and '__node:=nav2_container' in event.cmd)
+        return (event.cmd and (
+            Path(event.cmd[0]).name in ('component_container','component_container_isolated')
+            and '__node:=nav2_container' in event.cmd
+            or Path(event.cmd[0]).name in ('map_server','amcl','controller_server','planner_server',
+                'smoother_server','behavior_server','bt_navigator','waypoint_follower','velocity_smoother',
+                'collision_monitor','docking_server','opennav_docking','route_server','lifecycle_manager')))
+
+    @staticmethod
+    def prefix(event):
+        name=Path(event.cmd[0]).name
+        return 'nav2_container' if name.startswith('component_container') else 'nav2_'+name
 
     def _put(self, suffix, data):
         with self.condition:
@@ -36,15 +49,16 @@ class NavigationTranscript:
     def output(self,event):
         if self.matches(event):
             stream='stderr' if event.from_stderr else 'stdout'
-            self._put(f'nav2_container_{event.pid}.{stream}.log',bytes(event.text))
+            self._put(f'{self.prefix(event)}_{event.pid}.{stream}.log',bytes(event.text))
 
     def exited(self,event,_context=None):
         if self.matches(event):
             with self.condition:
                 payload=dict(pid=event.pid,returncode=event.returncode,wall_time=time.time(),
                              dropped_bytes=self.dropped_bytes,write_error=self.error)
-            self._put(f'nav2_container_{event.pid}.exit.json',json.dumps(payload).encode()+b'\n')
-            self.close()
+            self._put(f'{self.prefix(event)}_{event.pid}.exit.json',json.dumps(payload).encode()+b'\n')
+            if not self.multi_process:
+                self.close()
 
     def close(self):
         with self.condition:

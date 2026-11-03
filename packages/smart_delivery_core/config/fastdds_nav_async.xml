@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Validated separate-process navigation profile; ROS reliability/durability are preserved. -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles"><profiles>
+  <transport_descriptors>
+    <transport_descriptor><transport_id>nav_shm</transport_id><type>SHM</type></transport_descriptor>
+    <transport_descriptor><transport_id>nav_udp</transport_id><type>UDPv4</type><non_blocking_send>true</non_blocking_send></transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="nav_transport_comparison" is_default_profile="true"><rtps>
+    <userTransports><transport_id>nav_shm</transport_id><transport_id>nav_udp</transport_id></userTransports>
+    <useBuiltinTransports>false</useBuiltinTransports>
+  </rtps></participant>
+  <publisher profile_name="nav_writer" is_default_profile="true">
+    <qos><publishMode><kind>ASYNCHRONOUS</kind></publishMode>
+      <reliability><max_blocking_time><sec>0</sec><nanosec>100000000</nanosec></max_blocking_time></reliability>
+    </qos><historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+  </publisher>
+  <subscriber profile_name="nav_reader" is_default_profile="true"><historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy></subscriber>
+</profiles></dds>

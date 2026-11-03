@@ -425,7 +425,8 @@ def lateral_harness(manager):
     return node, clock, lease
 
 
-def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
+@pytest.mark.parametrize('tail',[.2735564237599696,.29])
+def test_one_sidestep_stops_then_runs_second_global_recovery(manager,tail):
     node, clock, lease = lateral_harness(manager)
     assert node._try_lateral_recovery(clock.now)
     for _ in range(5):
@@ -433,7 +434,7 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager):
         node._tick_lateral_motion()
     assert node.lateral_commands[-1].linear.y == .20
     node._lateral_stop_ready = lambda _now: False
-    for distance in [.025 * step for step in range(1, 12)] + [.29]:
+    for distance in [.025 * step for step in range(1, 11)] + [tail]:
         clock.now += .10
         node.last_odom_pose = (0.0, distance, 0.0)
         node._tick_lateral_motion()

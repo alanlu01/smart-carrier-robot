@@ -122,9 +122,9 @@ def swept_scan_report(scan, sensor_pose, direction, distance, half_x, half_y,
 
 
 def lateral_speed(progress, distance=0.30, cap=0.20, feedback_age=0.):
-    """Reserve reaction/feedback travel and a 25 mm tail before the target."""
+    """Reserve a 25 mm tail and a 3 mm completion tolerance before the target."""
     remaining = distance - progress
-    if remaining <= 0.025:
+    if remaining <= 0.028:
         return 0.0
     # v*t + v²/(2*a) <= available distance. Actual stop still needs wheel proof.
     deceleration = .25
