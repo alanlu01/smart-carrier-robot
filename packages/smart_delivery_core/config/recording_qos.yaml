@@ -5,3 +5,13 @@
   depth: 20
   reliability: reliable
   durability: volatile
+/chassis/serial_rx_health:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/chassis/wheel_sample:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile

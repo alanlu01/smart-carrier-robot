@@ -5,7 +5,7 @@ import pytest
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from smart_delivery_core.serial_recovery import ReconnectingSerial,FeedbackReadiness,fresh_feedback
-from smart_delivery_core.cmd_vel_to_serial import CmdVelToSerialNode,ZERO
+from smart_delivery_core.serial_io import SerialTransmitter,ZERO
 
 
 class Port:
@@ -81,16 +81,18 @@ def test_feedback_metadata_cannot_authorize_bad_or_delayed_evidence(fault):
 
 
 def transmitter(monkeypatch):
-    from smart_delivery_core import cmd_vel_to_serial as module
+    from smart_delivery_core import serial_io as module
     now=[100.]
     monkeypatch.setattr(module.time,'monotonic',lambda:now[0])
-    n=object.__new__(CmdVelToSerialNode);l,s,ports,lines=link()
-    n.link=l;n.session=n.rx_session='';n.feedback={};n.feedback_at=0.;n.armed=False
-    n.opened_ros_ns=0;n.last_command=n.last_zero=-float('inf');n.rejected_commands=0
-    n.accepted_commands=0
-    n.arming_count=0
-    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=round(now[0]*1e9)))
-    n.get_logger=lambda:SimpleNamespace(info=lines.append)
+    l,s,ports,lines=link()
+    n=SerialTransmitter('fake',115200,link=l,clock_ns=lambda:round(now[0]*1e9))
+    def feedback(message):
+        n.feedback=json.loads(message.data);n.feedback_at=now[0]
+    def command(message,info=None):
+        n.command(dict(values=[message.linear.x,message.linear.y,message.angular.z],
+            source_stamp_ns=round(now[0]*1e9) if info is None else info.source_timestamp,
+            received_at=now[0]))
+    n.feedback_callback=feedback;n.cmd_vel_callback=command
     return n,now,s,ports
 
 
@@ -122,3 +124,15 @@ def test_session_change_between_health_callback_and_timer_still_rejects_motion(m
     n.feedback_callback(String(data=json.dumps(payload(t[0],session='replacement',stopped=False))))
     m=Twist();m.linear.y=.2;n.cmd_vel_callback(m)
     assert all(w==ZERO for w in ports[-1].writes)
+
+
+def test_frontend_preserves_jazzy_dictionary_source_timestamp_and_rejects_nan():
+    from smart_delivery_core.cmd_vel_to_serial import CmdVelToSerialNode
+    from smart_delivery_core.pipeline_health import DurationMetrics
+    n=object.__new__(CmdVelToSerialNode);records=[]
+    n.metrics=DurationMetrics();n.commands=SimpleNamespace(put=records.append)
+    m=Twist();m.linear.x=.3
+    n.cmd_vel_callback(m,dict(source_timestamp=123456789))
+    assert records[-1]['source_stamp_ns']==123456789 and records[-1]['values'][0]==.3
+    m.linear.x=float('nan');n.cmd_vel_callback(m,dict(source_timestamp=123456790))
+    assert records[-1]['source_stamp_ns']==0 and records[-1]['values']==[0.,0.,0.]

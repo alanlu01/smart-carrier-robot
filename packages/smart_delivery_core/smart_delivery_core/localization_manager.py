@@ -74,6 +74,7 @@ from smart_delivery_core.delivery_console import localization_label, brief, reas
 from smart_delivery_core.global_pose_gate import ray_consistency
 from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
 from smart_delivery_core.covariance_probe import CovarianceProbe
+from smart_delivery_core.pipeline_recheck import PipelineRecheck
 
 
 STATE_QOS = QoSProfile(
@@ -103,6 +104,7 @@ class LocalizationManager(Node):
         self.verify_seed_retry_allowed = True
         self.navigation_health = None
         self.navigation_health_at = 0.
+        self.pipeline_recheck = None
         self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
         self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
@@ -672,6 +674,8 @@ class LocalizationManager(Node):
             icon = ('✅' if self.ready else '🛠️' if state=='MANUAL_REQUIRED' and getattr(self,'manual_intervention_kind','pose')=='pipeline'
                     else '🙋' if state=='MANUAL_REQUIRED' else '🔄' if state.startswith('RECOVERING') else '⏳')
             message = f"{icon} {localization_label(state, getattr(self,'manual_intervention_kind','pose'))}"
+            if getattr(self, 'pipeline_recheck', None) is not None:
+                message = '📡 資料中斷，等待停車驗證'
             if self.ready:
                 self.get_logger().info(message)
             else:
@@ -691,6 +695,8 @@ class LocalizationManager(Node):
             "state": self.state,
             "ready": self.ready,
             'manual_intervention_kind': getattr(self,'manual_intervention_kind','pose'),
+            'pipeline_recheck': (self.pipeline_recheck.snapshot(now)
+                                 if getattr(self, 'pipeline_recheck', None) else None),
             'navigation_health': getattr(self,'navigation_health',None),
             "reason": self.state_reason,
             "scan_age_sec": (
@@ -1045,6 +1051,11 @@ class LocalizationManager(Node):
                 )
                 return
 
+        if getattr(self, 'pipeline_recheck', None) is not None:
+            # Only the stopped pipeline verifier may release this hold. Old
+            # callbacks and the ordinary six-sample path cannot bypass it.
+            return
+
         if self.state in {
             "VERIFYING",
             "RECOVERING_LOCAL",
@@ -1156,6 +1167,13 @@ class LocalizationManager(Node):
         if self.manual_initial_pose_pending:
             self.manual_initial_pose_pending = False
             return
+        if getattr(self, 'pipeline_recheck', None) is not None:
+            self.pipeline_recheck = None
+            self.stable_samples = 0
+            self._reset_map_match_history()
+            self.verify_reference_required = False
+            self.verify_seed_retry_allowed = False
+            self._set_state('VERIFYING', '收到人工初始位置，正在驗證')
         self.global_verification_required = False  # Human seed still needs existing six-sample verification.
         self.verify_seed_retry_allowed = False
         if self.state == "MANUAL_REQUIRED":
@@ -1419,6 +1437,9 @@ class LocalizationManager(Node):
     def _tick_state_machine(self):
         now = time.monotonic()
         self.mild_map_active = False
+        if getattr(self, 'pipeline_recheck', None) is not None:
+            self._tick_pipeline_recheck(now)
+            return
         probe = getattr(self, 'covariance_probe', None)
         if probe and self.state != 'LOCALIZED':
             self.covariance_probe = CovarianceProbe()
@@ -1915,6 +1936,8 @@ class LocalizationManager(Node):
         if not self._global_pose_is_verified(time.monotonic()):
             return
         self.global_verification_required = False
+        self.pipeline_recheck = None
+        self.manual_intervention_kind = 'pose'
         self.suspect_since = None
         self.stationary_map_guard.reset()
         self.map_match_unknown_since = None
@@ -1956,9 +1979,31 @@ class LocalizationManager(Node):
         transient_sensor_timeout=False,
         sensor_pipeline_timeout=False,
     ):
-        if self.state in {"RECOVERING_LOCAL", "RECOVERING_GLOBAL", "MANUAL_REQUIRED"}:
+        from_pipeline = getattr(self, 'pipeline_recheck', None) is not None and not sensor_pipeline_timeout
+        if self.state in {"RECOVERING_LOCAL", "RECOVERING_GLOBAL", "MANUAL_REQUIRED"} and not from_pipeline:
             return
         now = time.monotonic()
+        if sensor_pipeline_timeout and self.state == 'LOCALIZED':
+            reference = self._pipeline_transform()
+            if (self.latest_quality is None or not self.latest_quality.healthy
+                    or self.latest_map_score is None or self.latest_map_score < self.map_match_recovery_score):
+                reference = None
+            self.pipeline_recheck = PipelineRecheck(
+                now, self.get_clock().now().nanoseconds, reference,
+                required=self.stable_samples_required, timeout=self.pipeline_wait_timeout,
+                verification_timeout=max(8., self.transient_recovery_max),
+                distance=self.verification_pose_distance, angle=self.verification_pose_angle)
+            self.stable_samples = 0
+            self.manual_intervention_kind = 'pipeline'
+            self._cancel_navigation()
+            self.recovery_step = 'pipeline_wait'
+            self.recovery_step_started = now
+            self.transient_recovery_eligible = False
+            self._set_state('RECOVERING_LOCAL', '資料管線中斷，安全停車並保留定位')
+            self.get_logger().warning('📡 回授／導航資料中斷，安全停車並保留任務')
+            return
+        self.pipeline_recheck = None
+        self.manual_intervention_kind = 'pose'
         self.transient_recovery_eligible = bool(
             transient_sensor_timeout
             and self.latest_quality is not None
@@ -2030,6 +2075,58 @@ class LocalizationManager(Node):
             "請確認 fusion_node/start_ai 已啟動）"
         )
         return False
+
+    def _pipeline_transform(self):
+        """Use AMCL's map->odom transform, not unsynchronised moving poses."""
+        try:
+            tf = self.tf_buffer.lookup_transform('map', 'odom', Time(),
+                timeout=RclpyDuration(seconds=0.))
+            t, q = tf.transform.translation, tf.transform.rotation
+            result = (float(t.x), float(t.y), quaternion_to_yaw(q))
+            return result if all(math.isfinite(v) for v in result) else None
+        except (AttributeError, TransformException):
+            return None
+
+    def _tick_pipeline_recheck(self, now):
+        guard = self.pipeline_recheck
+        if self._scan_is_fresh(now) and now-self.last_map_match_check_at >= self.map_match_period:
+            self.last_map_match_check_at = now
+            self._update_map_match_score(now)
+        blockers = self._verification_data_blockers(now)
+        available = (not blockers and self.latest_odom_valid
+                     and self._mild_map_sources_fresh() and self._sensor_tf_is_ready())
+        stop = getattr(self, 'recovery_stop', None)
+        stopped = (not self.commanded_motion and not self.odom_motion
+                   and stop is not None and stop.ready(now))
+        new_amcl = (getattr(self, 'latest_pose_observed_at', 0.)*1e9 > guard.source_ns
+                    and self.last_amcl_at > guard.started)
+        new_scan = bool(self.latest_scan is not None and
+            self.latest_scan.header.stamp.sec*1_000_000_000+self.latest_scan.header.stamp.nanosec > guard.source_ns)
+        raw_score = getattr(self, 'latest_map_score_raw', None)
+        healthy = (self.latest_quality is not None and self.latest_quality.healthy
+                   and raw_score is not None and raw_score >= self.map_match_recovery_score
+                   and self._map_match_has_recovered(now)
+                   and self.latest_map_sector_count >= self.map_match_min_sectors and new_scan)
+        before = guard.reason
+        action = guard.observe(now, available=available, stopped=stopped, healthy=healthy,
+            new_amcl=new_amcl, map_at=self.latest_map_score_at,
+            amcl_stamp_ns=round(getattr(self, 'latest_pose_observed_at', 0.)*1e9),
+            transform=self._pipeline_transform())
+        self.stable_samples = guard.samples
+        self._request_nomotion_if_due(now)
+        if action == 'resume':
+            self._mark_localized('資料管線恢復，既有位置驗證通過')
+            self.get_logger().info('▶️ 資料與位置驗證通過，繼續原任務')
+        elif action == 'manual_pipeline':
+            self._require_manual('底盤／導航資料管線持續未恢復，維持安全停車')
+        elif action == 'pose_recovery':
+            self.get_logger().warning('📍 資料已恢復但位置未通過驗證，進入定位恢復')
+            self._begin_recovery('資料恢復後位置仍不確定')
+        elif guard.reason != before:
+            if guard.reason == 'verifying':
+                self.get_logger().info('🔎 資料恢復，驗證既有位置')
+            elif guard.reason == 'position_changed':
+                self.get_logger().warning('📍 位置有變化，保持停車並確認')
 
     def _tick_local_recovery(self, now):
         if self.sensor_waiting_for_pipeline:
@@ -2909,6 +3006,7 @@ class LocalizationManager(Node):
         )
 
     def _require_manual(self, reason):
+        self.pipeline_recheck = None
         self.manual_intervention_kind = ('pipeline' if any(word in reason for word in
             ('資料管線','底盤回授','回授確認','無新鮮回授','Nav2')) else 'pose')
         if self.lateral_phase is not None and self.lateral_phase != "disarming":

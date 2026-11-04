@@ -8,6 +8,8 @@ def brief(value, limit=64):
 
 
 def localization_label(state, intervention_kind='pose'):
+    if state == 'RECOVERING_LOCAL' and intervention_kind == 'pipeline':
+        return '資料中斷，等待停車驗證'
     if state == 'MANUAL_REQUIRED' and intervention_kind == 'pipeline':
         return '底盤／導航資料中斷，等待恢復'
     return {
