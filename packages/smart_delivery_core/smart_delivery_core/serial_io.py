@@ -5,7 +5,7 @@ import time
 
 from smart_delivery_core.pipeline_health import DurationMetrics
 from smart_delivery_core.serial_recovery import (
-    FeedbackReadiness, ReconnectingSerial, fresh_feedback,
+    FeedbackReadiness, ReconnectingSerial, fresh_feedback, feedback_diagnostics,
 )
 
 ZERO = b'$CMD,0.00,0.00,0.00#\n'
@@ -123,6 +123,15 @@ class SerialTransmitter:
         self.last_tick = None
         self.max_tick_gap = 0.
         self.metrics = DurationMetrics()
+        self.disarm_counts, self.reject_counts = {}, {}
+        self.last_disarm = self.last_rejection = None
+
+    def disarm(self, reason, now):
+        if self.armed:
+            self.disarm_counts[reason] = self.disarm_counts.get(reason, 0)+1
+            self.last_disarm = dict(reason=reason, at=now,
+                feedback=feedback_diagnostics(self.feedback,self.clock_ns(),now-self.feedback_at))
+        self.armed = False
 
     def feedback_ready(self, now):
         return fresh_feedback(self.feedback, self.clock_ns(), now-self.feedback_at)
@@ -141,11 +150,11 @@ class SerialTransmitter:
         with self.metrics.measure('serial_poll'):
             connected = self.link.poll(now)
         if not connected:
-            self.armed = False
+            self.disarm('tx_disconnected',now)
             return
         if self.session != self.link.session:
             self.session = self.link.session
-            self.armed = False
+            self.disarm('tx_session_changed',now)
             self.opened_ros_ns = self.clock_ns()
             self.last_zero = -float('inf')
             self.zero(now)
@@ -155,7 +164,10 @@ class SerialTransmitter:
         if not ready or self.rx_session != self.feedback.get('session') or gap > .25:
             if self.armed:
                 self.last_zero = -float('inf')
-            self.armed = False
+            reason = ('io_loop_gap' if gap > .25 else 'rx_session_changed'
+                      if self.rx_session != self.feedback.get('session') else
+                      feedback_diagnostics(self.feedback,self.clock_ns(),now-self.feedback_at)['reason'])
+            self.disarm(reason,now)
             self.rx_session = self.feedback.get('session', '')
         if (not self.armed and ready and self.feedback.get('stop_proven') is True
                 and self.feedback['sample_ros_stamp_ns'] > self.opened_ros_ns
@@ -177,6 +189,13 @@ class SerialTransmitter:
                 or not 0 <= now-received <= .25
                 or not source > 0 or not -.1 <= (self.clock_ns()-source)/1e9 <= .25):
             self.rejected_commands += 1
+            reason = ('not_armed' if not self.armed else 'rx_session_changed'
+                      if self.rx_session != self.feedback.get('session') else 'feedback_not_ready'
+                      if not self.feedback_ready(now) else 'invalid_values'
+                      if len(values) != 3 or not all(math.isfinite(v) for v in values)
+                      else 'command_receipt_age' if not 0 <= now-received <= .25 else 'command_source_age')
+            self.reject_counts[reason] = self.reject_counts.get(reason,0)+1
+            self.last_rejection = dict(reason=reason,at=now)
             self.zero(now)
             return
         encoded = f'$CMD,{values[0]:.2f},{values[1]:.2f},{values[2]:.2f}#\n'.encode()
@@ -186,7 +205,7 @@ class SerialTransmitter:
             self.last_command = now
             self.accepted_commands += 1
         else:
-            self.armed = False
+            self.disarm('command_write_failed',now)
 
     def health(self, now):
         data = self.link.snapshot(now)
@@ -194,6 +213,9 @@ class SerialTransmitter:
         data.update(sample_ros_stamp_ns=self.clock_ns(), armed=ready, rx_session=self.rx_session,
                     rejected_commands=self.rejected_commands, accepted_commands=self.accepted_commands,
                     arming_count=self.arming_count, state='ready' if ready else 'waiting_for_safe_feedback',
+                    feedback_gate=feedback_diagnostics(self.feedback,self.clock_ns(),now-self.feedback_at),
+                    disarm_counts=dict(self.disarm_counts), last_disarm=self.last_disarm,
+                    rejection_counts=dict(self.reject_counts), last_rejection=self.last_rejection,
                     io_tick_max_gap_sec=self.max_tick_gap,
                     wall_durations=self.metrics.snapshot(now), logs=list(self.logger.records))
         return data

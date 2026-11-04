@@ -48,6 +48,11 @@ class _CompletedNavigator:
         return self.result
 
 
+@pytest.fixture(autouse=True)
+def standby_executor(monkeypatch):
+    monkeypatch.setattr('smart_delivery_core.smart_delivery.rclpy.spin_once',lambda *_args,**_kwargs:None)
+
+
 def test_standby_only_reports_arrival_after_nav2_success():
     lease = []
     failed = go_to_standby(
@@ -80,6 +85,13 @@ def test_standby_terminal_cancel_does_not_charge_retry_budget(cause):
     )
     assert arrived is None
     assert outcomes == ['approaching', 'interrupted_by_' + cause]
+
+
+def test_unsolicited_cancel_is_interruption_without_false_arrival():
+    outcomes = []
+    assert go_to_standby(_CompletedNavigator(TaskResult.CANCELED),{'x':0.,'y':0.},
+                        on_outcome=lambda _,state:outcomes.append(state)) is None
+    assert outcomes == ['approaching','interrupted_by_navigation']
 
 
 def test_cloud_borrow_task_uses_backend_coordinates_and_full_slot():

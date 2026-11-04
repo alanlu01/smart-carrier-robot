@@ -50,6 +50,17 @@ def test_recovery_retargets_same_selected_point_without_new_scan_or_false_arriva
     assert all(not goal.behavior_tree for goal in n.sent)
 
 
+def test_midroute_recovery_has_route_budget_but_fixed_session_deadline(runtime):
+    m,n,t,point=interrupted(runtime)
+    fixed=m.parking_deadline
+    m._at_goal=lambda *_:False
+    recover(m,t)
+    m.idle()
+    assert m.deadline-t[0] == pytest.approx(min(m.config['people']['navigation_timeout_sec'],fixed-t[0]))
+    assert m.deadline-t[0] > 30.
+    assert m.parking_deadline==fixed
+
+
 def test_global_recovery_may_finish_before_same_map_target_is_revalidated(runtime):
     m,n,t,point=interrupted(runtime)
     m._localization_phase=lambda:'RECOVERING_GLOBAL'

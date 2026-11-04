@@ -1276,7 +1276,9 @@ class OptionalIdleRuntime:
             self.parking_stop_since = self.parking_stop_since if self.parking_stop_since is not None else now
             if now-self.parking_stop_since < 1. or not self.parking_retry.can_attempt(now):
                 return True
-            timeout = people['navigation_timeout_sec'] if self.parking_attempts==0 else 30.
+            # A midroute interruption is a route resume, not a short final correction.
+            nearby = self._at_goal(self.selected_standby, .5, math.pi)
+            timeout = 30. if self.parking_attempts > 0 and nearby else people['navigation_timeout_sec']
             if self._start(self.selected_standby, 'going_people_standby', '',
                            min(timeout,self.parking_deadline-now)):
                 self.parking_attempts += 1

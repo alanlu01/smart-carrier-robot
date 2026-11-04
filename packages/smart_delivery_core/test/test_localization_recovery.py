@@ -76,6 +76,7 @@ def manager(monkeypatch):
         suspect_promising_max=30.0,
         last_state_publish_at=100.0,
         quality_history=LocalizationQualityHistory(),
+        recovery_stop=SimpleNamespace(ready=lambda _:False),
     )
     cov = [0.0] * 36
     cov[0] = cov[7] = 0.20 ** 2
@@ -470,6 +471,24 @@ def test_one_sidestep_stops_then_runs_second_global_recovery(manager,tail):
     assert node.started_spins == ['global']
     assert {'start','motion_authorized','deceleration','zero_command','wheels_stopped'} <= node.lateral_motion_timing.keys()
     assert not node._try_lateral_recovery(clock.now)  # never a second translation
+
+
+@pytest.mark.parametrize('degrees,aborted',[(6.,False),(9.,True)])
+def test_braking_yaw_recheck_only_after_independent_stop(manager,degrees,aborted):
+    import math
+    node,clock,_lease=lateral_harness(manager)
+    assert node._try_lateral_recovery(clock.now)
+    node._stop_lateral()
+    node._lateral_stop_ready=lambda _:False
+    node.last_odom_pose=(0.,.28,math.radians(degrees))
+    clock.now+=.1
+    node._tick_lateral_motion()
+    assert node.lateral_phase=='stopping'
+    assert bool(node.lateral_abort_reason)==aborted
+    node._lateral_stop_ready=lambda _:True
+    node._tick_lateral_motion()
+    assert node.lateral_phase=='disarming'
+    assert not node.started_spins
 
 
 @pytest.mark.parametrize('fault', ['scan', 'obstacle', 'guard', 'inhibit', 'yaw', 'timeout'])

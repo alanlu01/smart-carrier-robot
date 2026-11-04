@@ -21,6 +21,10 @@ def localization_label(state, intervention_kind='pose'):
     }.get(state, brief(state))
 
 
+def localization_wait_label(state, intervention_kind='pose'):
+    return '等待定位狀態同步' if state == 'LOCALIZED' else localization_label(state, intervention_kind)
+
+
 def reason_label(reason):
     """Translate common control codes without hiding the original in ROS state."""
     reason = str(reason or '')

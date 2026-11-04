@@ -114,15 +114,33 @@ class FeedbackReadiness:
                     stop_proven=self.stop.ready(now))
 
 
-def fresh_feedback(payload, ros_now_ns, received_age):
+def feedback_diagnostics(payload, ros_now_ns, received_age):
+    """Explain the existing fail-closed gate without relaxing any threshold."""
+    data = dict(ready=False, reason='invalid_payload', source_age_sec=None,
+                complete_source_age_sec=None, received_age_sec=None, complete_age_sec=None)
     try:
         stamp = int(payload['sample_ros_stamp_ns'])
         age = (ros_now_ns-stamp)/1e9
         complete = float(payload['complete_sample_age_sec'])
         complete_stamp = int(payload['complete_ros_stamp_ns'])
-        return (payload['healthy'] is True and payload['connected'] is True and bool(payload['session'])
-                and stamp > 0 and -.1 <= age <= .35 and 0 <= received_age <= .35
-                and complete_stamp > 0 and -.1 <= (ros_now_ns-complete_stamp)/1e9 <= .65
-                and math.isfinite(complete) and 0 <= complete+max(0.,age) <= .65)
-    except (KeyError, ValueError, TypeError):
-        return False
+        complete_age = (ros_now_ns-complete_stamp)/1e9
+        for key,value in (('source_age_sec',age),('complete_source_age_sec',complete_age),
+                          ('received_age_sec',received_age),('complete_age_sec',complete)):
+            data[key] = value if math.isfinite(value) else None
+        checks = (
+            ('rx_unhealthy',payload['healthy'] is True),
+            ('rx_disconnected',payload['connected'] is True),('missing_session',bool(payload['session'])),
+            ('feedback_source_age',stamp > 0 and -.1 <= age <= .35),
+            ('feedback_receipt_age',0 <= received_age <= .35),
+            ('wheel_source_age',complete_stamp > 0 and -.1 <= complete_age <= .65),
+            ('wheel_complete_age',math.isfinite(complete) and 0 <= complete+max(0.,age) <= .65),
+        )
+        data['reason'] = next((name for name,ok in checks if not ok),'ready')
+        data['ready'] = data['reason'] == 'ready'
+    except (KeyError, ValueError, TypeError, OverflowError):
+        pass
+    return data
+
+
+def fresh_feedback(payload, ros_now_ns, received_age):
+    return feedback_diagnostics(payload, ros_now_ns, received_age)['ready']

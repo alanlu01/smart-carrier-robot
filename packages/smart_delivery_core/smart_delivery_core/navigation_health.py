@@ -5,6 +5,10 @@ import rclpy
 from rclpy.node import Node
 from lifecycle_msgs.srv import GetState
 from std_msgs.msg import String
+from bond.msg import Status
+from tf2_msgs.msg import TFMessage
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from smart_delivery_core.pipeline_health import ReceiptMetrics, timed_operation
 
 TARGETS = ('map_server','amcl','controller_server','bt_navigator','behavior_server','collision_monitor')
 
@@ -22,10 +26,43 @@ class NavigationHealth(Node):
         super().__init__('navigation_health')
         self.health_clients = {name:self.create_client(GetState,'/'+name+'/get_state') for name in TARGETS}
         self.pending, self.records = {}, {}
+        self.timeouts = {name:0 for name in TARGETS}
+        self.errors = {name:0 for name in TARGETS}
+        self.response_max = {name:0. for name in TARGETS}
+        self.receipts = ReceiptMetrics()
+        self.bonds = {}
         self.last_probe = self.last_publish = -float('inf')
         self.publisher = self.create_publisher(String,'/navigation/pipeline_health',1)
+        qos = QoSProfile(depth=10,reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Status,'/bond',self.observe_bond,qos)
+        self.create_subscription(TFMessage,'/tf',self.observe_tf,qos)
         self.create_timer(.1,self.poll)
 
+    def observe_bond(self, message):
+        if message.id not in TARGETS:
+            return
+        key = (message.id,message.instance_id)
+        if key not in self.bonds and len(self.bonds) >= 32:
+            oldest = min(self.bonds,key=lambda k:self.bonds[k]['at'])
+            del self.bonds[oldest]
+        now = time.monotonic()
+        stamp = message.header.stamp.sec+message.header.stamp.nanosec/1e9
+        previous = self.bonds.get(key,{})
+        self.bonds[key] = dict(at=now,stamp=stamp,count=previous.get('count',0)+1,
+            max_receive_gap_sec=max(previous.get('max_receive_gap_sec',0.),now-previous.get('at',now)),
+            max_source_gap_sec=max(previous.get('max_source_gap_sec',0.),stamp-previous.get('stamp',stamp)),
+            active=bool(message.active))
+
+    def observe_tf(self, message):
+        now = time.monotonic()
+        for tf in message.transforms:
+            pair = (tf.header.frame_id.lstrip('/'),tf.child_frame_id.lstrip('/'))
+            if pair in (('map','odom'),('odom','base_footprint')):
+                age = (self.get_clock().now().nanoseconds-
+                       (tf.header.stamp.sec*1_000_000_000+tf.header.stamp.nanosec))/1e9
+                self.receipts.observe('->'.join(pair),now,age)
+
+    @timed_operation('poll')
     def poll(self):
         now = time.monotonic()
         for name,(future,start) in list(self.pending.items()):
@@ -34,10 +71,12 @@ class NavigationHealth(Node):
                     result = future.result().current_state
                     self.records[name] = dict(id=result.id,label=result.label,at=now,
                                               response_sec=now-start)
+                    self.response_max[name] = max(self.response_max[name],now-start)
                 except Exception:
-                    pass
+                    self.errors[name] += 1
                 self.pending.pop(name)
             elif now-start>.75:
+                self.timeouts[name] += 1
                 future.cancel()
                 self.health_clients[name].remove_pending_request(future)
                 self.pending.pop(name)
@@ -51,6 +90,12 @@ class NavigationHealth(Node):
             payload=navigation_snapshot(self.records,now)
             payload['sample_ros_stamp_ns']=self.get_clock().now().nanoseconds
             payload['diagnostic_only']=True
+            payload['service_diagnostics']=dict(timeouts=dict(self.timeouts),errors=dict(self.errors),
+                response_max_sec=dict(self.response_max),pending_age_sec={n:now-start for n,(_,start) in self.pending.items()})
+            payload['bonds']=[dict(node=name,instance=instance,age_sec=now-record['at'],**record)
+                              for (name,instance),record in self.bonds.items()]
+            payload['tf_receipts']=self.receipts.snapshot(now)
+            payload['wall_durations']=self.duration_metrics.snapshot(now)
             self.publisher.publish(String(data=json.dumps(payload)))
 
 

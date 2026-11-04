@@ -12,7 +12,7 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from nav2_simple_commander.robot_navigator import TaskResult
 from smart_delivery_core.delivery_navigator import DeliveryNavigator, Nav2StartupUnavailable
-from smart_delivery_core.delivery_console import localization_label, brief
+from smart_delivery_core.delivery_console import localization_label, localization_wait_label, brief
 from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
@@ -528,6 +528,11 @@ def go_to_standby(
                 on_outcome(closest_standby, "interrupted_by_localization")
                 return None
         result = navigator.getResult()
+        if result != TaskResult.SUCCEEDED:
+            # Drain late ready/order callbacks that can follow the action result.
+            deadline = time.monotonic()+.3
+            while time.monotonic() < deadline:
+                rclpy.spin_once(navigator, timeout_sec=.05)
     finally:
         set_navigation_active(False)
 
@@ -540,6 +545,10 @@ def go_to_standby(
         on_outcome(closest_standby, "interrupted_by_localization")
         return None
     if result != TaskResult.SUCCEEDED:
+        if result == TaskResult.CANCELED:
+            on_outcome(closest_standby, "interrupted_by_navigation")
+            navigator.get_logger().info("⏸️ 停靠導航已中斷，等待狀態同步後重試")
+            return None
         on_outcome(closest_standby, "failed")
         navigator.get_logger().warning(
             f"⚠️ 尚未停妥：{closest_standby['name']}，稍後重試"
@@ -717,6 +726,8 @@ def _run_delivery(runtime_holder):
                 navigator.get_logger().info(f"💤 已停妥：{point['name']}，等待新任務")
             if optional_runtime is not None and last_standby_status != (point['name'],'arrived',0):
                 optional_runtime.mark_parked(point)
+        elif state == "interrupted_by_navigation":
+            standby_retry.retry_at = max(standby_retry.retry_at, now+1.)
         payload = {
             "state": state, "name": point["name"],
             "x": point["x"], "y": point["y"], "yaw": point["yaw"],
@@ -1386,7 +1397,7 @@ def _run_delivery(runtime_holder):
                     wait_reason = ("等待定位品質確認，暫緩派發"
                                    if not localization_dispatch_allowed else "STABILIZING_BEFORE_RESUME")
                 navigator.get_logger().warning(
-                    f"⏸️ {localization_label(wait_reason,localization_intervention_kind)}，保留任務"
+                    f"⏸️ {localization_wait_label(wait_reason,localization_intervention_kind)}，保留任務"
                 )
                 last_localization_warning_at = now
             continue
@@ -1575,7 +1586,7 @@ def _run_delivery(runtime_holder):
                 cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
-                    f"⏸️ {localization_label(localization_state,localization_intervention_kind)}，取消導航並保留任務"
+                    f"⏸️ {localization_wait_label(localization_state,localization_intervention_kind)}，取消導航並保留任務"
                 )
                 navigator.cancelTask()
                 cancel_sent = True

@@ -75,6 +75,9 @@ from smart_delivery_core.global_pose_gate import ray_consistency
 from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
 from smart_delivery_core.covariance_probe import CovarianceProbe
 from smart_delivery_core.pipeline_recheck import PipelineRecheck
+from smart_delivery_core.settled_motion import can_arm_stationary_anchor, near_convergence
+from smart_delivery_core.recovery_spin import RecoverySpin
+from nav2_msgs.msg import CollisionMonitorState
 
 
 STATE_QOS = QoSProfile(
@@ -105,6 +108,10 @@ class LocalizationManager(Node):
         self.navigation_health = None
         self.navigation_health_at = 0.
         self.pipeline_recheck = None
+        self.managed_spin = None
+        self.managed_spin_handle = None
+        self.managed_spin_resume = False
+        self.spin_near_stop_at = -float('inf')
         self.second_guard_wait = float(self.get_parameter('second_guard_wait_sec').value)
         self.last_lateral_probe_at = -float('inf')
         self.mild_map_active = False
@@ -497,6 +504,8 @@ class LocalizationManager(Node):
         self.create_subscription(String, '/chassis/wheel_sample', self._atomic_wheel_callback, LOCAL_ODOM_QOS)
         self.create_subscription(String, '/navigation/pipeline_health', self._navigation_health_callback, 1)
         self.lateral_timer = self.create_timer(0.05, self._tick_lateral_motion)
+        self.spin_supervisor_timer = self.create_timer(.05, self._tick_managed_spin)
+        self.create_subscription(CollisionMonitorState, '/collision_monitor_state', self._spin_collision_callback, 10)
         self.evidence_timer = self.create_timer(0.05, self._drain_recovery_scans)
         self.timer = self.create_timer(0.2, self._tick)
         self._publish_state()
@@ -697,6 +706,9 @@ class LocalizationManager(Node):
             'manual_intervention_kind': getattr(self,'manual_intervention_kind','pose'),
             'pipeline_recheck': (self.pipeline_recheck.snapshot(now)
                                  if getattr(self, 'pipeline_recheck', None) else None),
+            'recovery_spin': (self.managed_spin.snapshot(now) if getattr(self, 'managed_spin', None) else None),
+            'last_recovery_spin': getattr(self, 'last_recovery_spin', None),
+            'lateral_settled_yaw_recheck': getattr(self, 'lateral_settled_yaw_recheck', False),
             'navigation_health': getattr(self,'navigation_health',None),
             "reason": self.state_reason,
             "scan_age_sec": (
@@ -990,10 +1002,17 @@ class LocalizationManager(Node):
         if self.odom_motion:
             self.last_odom_motion_at = now
         self.last_odom_pose = current
+        managed = getattr(self, 'managed_spin', None)
+        if managed is not None:
+            managed.observe(current[2], self.latest_odom_stamp_ns, float(twist.angular.z))
         if self.commanded_motion or self.state != "LOCALIZED":
             self.stationary_odom_anchor = None
             return
         if self.stationary_odom_anchor is None:
+            stop = getattr(self, 'recovery_stop', None)
+            if not can_arm_stationary_anchor(now, getattr(self, 'last_motion_command_at', 0.),
+                    self.commanded_motion, self.odom_motion, stop is not None and stop.ready(now)):
+                return
             self.stationary_odom_anchor = current
             return
         distance, angle = pose_jump(self.stationary_odom_anchor, current)
@@ -1051,7 +1070,7 @@ class LocalizationManager(Node):
                 )
                 return
 
-        if getattr(self, 'pipeline_recheck', None) is not None:
+        if getattr(self, 'pipeline_recheck', None) is not None or getattr(self, 'managed_spin', None) is not None:
             # Only the stopped pipeline verifier may release this hold. Old
             # callbacks and the ordinary six-sample path cannot bypass it.
             return
@@ -1161,6 +1180,10 @@ class LocalizationManager(Node):
             self.speed_limit_publisher.publish(message)
 
     def _external_initial_pose_callback(self, _message):
+        if getattr(self, 'managed_spin', None) is not None:
+            self._require_manual('收到人工位置，先安全停止旋轉')
+            self.get_logger().warning('🛑 收到人工位置，先確認旋轉已停止，停妥後請再提供位置')
+            return
         if self.lateral_phase is not None:
             self._stop_lateral("收到人工初始位置；先停止，待停妥後重新提供位置")
             return
@@ -1406,6 +1429,9 @@ class LocalizationManager(Node):
                 probe = getattr(self, 'covariance_probe', None)
                 limit.data = (0. if self.state == 'LOCALIZED' and probe and probe.stopped
                               else .4 if self.state == 'LOCALIZED' and self.mild_map_active else 1.0)
+                managed = getattr(self, 'managed_spin', None)
+                if managed is not None:
+                    limit.data = min(limit.data, managed.speed_limit())
                 self.speed_limit_publisher.publish(limit)
             if (started - self.last_pipeline_diagnostic_at >= 5.0
                     and self.latest_scan is not None):
@@ -1437,6 +1463,8 @@ class LocalizationManager(Node):
     def _tick_state_machine(self):
         now = time.monotonic()
         self.mild_map_active = False
+        if getattr(self, 'managed_spin', None) is not None:
+            return
         if getattr(self, 'pipeline_recheck', None) is not None:
             self._tick_pipeline_recheck(now)
             return
@@ -2296,9 +2324,30 @@ class LocalizationManager(Node):
                     return
                 if self._convergence_grace(
                     now, self.global_max_wait, self.global_convergence_max_wait
-                ):
+                ) or self._near_convergence_grace(now):
                     return
                 self._global_recovery_failed(now, '全域重新定位後仍未通過可信度檢查')
+
+    def _near_convergence_grace(self, now):
+        elapsed = self.observation_clock.elapsed
+        if not (self.global_max_wait <= elapsed < self.global_max_wait+15.
+                and not self.commanded_motion and not self.odom_motion
+                and self.recovery_stop.ready(now)
+                and not self._verification_data_blockers(now)
+                and self._map_match_has_recovered(now)
+                and self.latest_map_score is not None and self.latest_map_score >= .60
+                and self._global_pose_is_verified(now)):
+            return False
+        history = getattr(self, 'quality_history', None)
+        samples = [(s['at'], s['pose'], s['xy_std'], s['yaw_std'])
+                   for s in (history.samples if history else [])
+                   if max(self.recovery_step_started, now-10.) <= s['at'] <= now]
+        allowed = near_convergence(samples, self.healthy_xy_std, self.healthy_yaw_std,
+                                   self.verification_pose_distance, self.verification_pose_angle)
+        if allowed and not getattr(self, 'near_convergence_announced', False):
+            self.near_convergence_announced = True
+            self.get_logger().info('⏳ 地圖已吻合、信心持續收斂；額外觀察最多 15 秒，仍需通過原確認門檻')
+        return allowed
 
     def _global_recovery_failed(self, now, reason):
         if self.global_attempts < 2:
@@ -2619,6 +2668,7 @@ class LocalizationManager(Node):
         self.lateral_handoff = False
         self.recovery_stop.reset()
         self.lateral_phase = "arming"
+        self.lateral_settled_yaw_recheck = False
         self.recovery_step = "lateral_move"
         self.stable_samples = 0
         self._reset_map_match_history()
@@ -2705,9 +2755,13 @@ class LocalizationManager(Node):
                 )
                 if (not all(math.isfinite(v) for v in (travelled, cross, angle))
                         or travelled > self.lateral_distance + 0.03
-                        or abs(cross) > 0.05 or abs(angle) > math.radians(5)):
+                        or abs(cross) > 0.05 or abs(angle) > math.radians(8)):
                     self.lateral_abort_reason = "橫移煞停距離／角度偏差超限"
+                elif abs(angle) > math.radians(5):
+                    self.lateral_settled_yaw_recheck = True
             if self._lateral_stop_ready(now):
+                if getattr(self, 'lateral_settled_yaw_recheck', False):
+                    self.get_logger().info('⏳ 橫移已停穩，煞停角差 5～8°；重新確認定位與旋轉空間')
                 self._record_lateral_event('wheels_stopped', now)
                 self.lateral_phase = "disarming"
             elif now - self.lateral_stop_started_at > 3.0 and self.state != "MANUAL_REQUIRED":
@@ -2782,6 +2836,12 @@ class LocalizationManager(Node):
 
     def _shutdown_recovery_stop(self):
         """Bounded best effort; unavailable feedback leaves fusion STOP latched."""
+        if getattr(self, 'managed_spin', None) is not None:
+            self._stop_managed_spin('manual_stop')
+            self.managed_spin.reason = 'manual_stop'
+            deadline = time.monotonic()+4.
+            while rclpy.ok() and self.managed_spin is not None and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=.05)
         if self.lateral_phase is None:
             return
         self._stop_lateral('定位管理器關閉')
@@ -2800,6 +2860,19 @@ class LocalizationManager(Node):
         goal = Spin.Goal()
         goal.target_yaw = float(self.spin_sequence.pop(0))
         goal.time_allowance = Duration(sec=self.spin_time_allowance)
+        if self.state == 'RECOVERING_GLOBAL' and not self.spin_restoring_heading:
+            if self.last_odom_pose is None:
+                self._require_manual('定位旋轉缺少里程計角度')
+                return
+            if not getattr(self, 'managed_spin_resume', False):
+                self.near_convergence_announced = False
+                self.managed_spin = RecoverySpin(goal.target_yaw, time.monotonic(),
+                    self.last_odom_pose[2], self.latest_odom_stamp_ns, self.spin_time_allowance)
+            self.managed_spin_resume = False
+            self.managed_spin_handle = None
+            goal.target_yaw = self.managed_spin.sign*self.managed_spin.remaining
+            goal.time_allowance = Duration(sec=max(1, math.ceil(
+                self.managed_spin.active_limit-self.managed_spin.active_elapsed)))
         self.spin_goal_target = goal.target_yaw
         self.spin_goal_started_at = time.monotonic()
         odom_yaw = (
@@ -2830,8 +2903,14 @@ class LocalizationManager(Node):
             return
         if not goal_handle.accepted:
             self.spin_in_progress = False
+            if getattr(self, 'managed_spin', None) is not None:
+                self.managed_spin.cancel_confirmed = True
             self._require_manual("Spin 被行為伺服器拒絕，可能沒有安全旋轉空間")
             return
+        if getattr(self, 'managed_spin', None) is not None:
+            self.managed_spin_handle = goal_handle
+            if self.managed_spin.phase != 'running':
+                goal_handle.cancel_goal_async()
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._spin_result)
 
@@ -2855,6 +2934,15 @@ class LocalizationManager(Node):
             f"status={result.status}, elapsed={elapsed:.1f}s, "
             f"heading_error={error_text}"
         )
+        managed = getattr(self, 'managed_spin', None)
+        if managed is not None:
+            managed.cancel_confirmed = True
+            if managed.phase == 'running':
+                managed.phase = 'stopping'
+                managed.reason = 'completed' if result.status == GoalStatus.STATUS_SUCCEEDED else 'action_failed'
+                managed.cancel_at = time.monotonic()
+            self.recovery_step = 'spin_supervised_stop'
+            return
         if result.status != GoalStatus.STATUS_SUCCEEDED:
             self.spin_pending_failure_reason = (
                 f"Spin 未安全完成（action status={result.status}）"
@@ -2866,6 +2954,86 @@ class LocalizationManager(Node):
         self.spin_waiting_for_stop = True
         self.spin_settle_started = time.monotonic()
         self.recovery_step = "spin_settle"
+
+    def _spin_collision_callback(self, message):
+        if message.polygon_name == 'NearFootprintStop' or message.action_type == 1:
+            self.spin_near_stop_at = time.monotonic()
+
+    def _stop_managed_spin(self, reason):
+        managed = self.managed_spin
+        if managed.phase == 'running':
+            managed.phase, managed.reason = 'stopping', reason
+            managed.cancel_at = time.monotonic()
+            if self.managed_spin_handle is not None:
+                self.managed_spin_handle.cancel_goal_async()
+        limit = Float32();limit.data = 0.
+        self.speed_limit_publisher.publish(limit)
+        self.recovery_step = 'spin_supervised_stop'
+
+    def _tick_managed_spin(self):
+        managed = getattr(self, 'managed_spin', None)
+        if managed is None:
+            return
+        now = time.monotonic()
+        blocked = now-getattr(self, 'spin_near_stop_at', -float('inf')) < .75
+        # Same source-stamp/receipt and four-wheel freshness rules as translation.
+        available = not self._lateral_sensor_blockers(now)
+        nav = getattr(self, 'navigation_health', None)
+        available = (available and nav is not None and nav.get('state') == 'ready'
+                     and 0 <= now-self.navigation_health_at <= 3.)
+        action = managed.tick(now, blocked=blocked, available=available)
+        if action in ('cancel_pause','cancel_endpoint','cancel_failed','fail'):
+            self._stop_managed_spin(managed.reason)
+        if managed.phase == 'running':
+            limit = Float32();limit.data = managed.speed_limit()
+            self.speed_limit_publisher.publish(limit)
+            return
+        limit = Float32();limit.data = 0.
+        self.speed_limit_publisher.publish(limit)
+        if not managed.cancel_confirmed:
+            if (managed.cancel_at is not None and now-managed.cancel_at > 5.
+                    and self.state != 'MANUAL_REQUIRED'):
+                self._require_manual('Spin 取消回應逾時，保持停車等待資料管線恢復')
+            return
+        stopped = (not self.commanded_motion and not self.odom_motion
+                   and self.recovery_stop.ready(now)
+                   and now-max(self.last_motion_command_at,self.last_odom_motion_at) >= 1.)
+        if not stopped:
+            return
+        failed = managed.reason in ('odom_jump','bounded_wait_exhausted','active_time_exhausted','action_failed','manual_stop')
+        if failed or self.state == 'MANUAL_REQUIRED':
+            reason = managed.reason
+            self.last_recovery_spin = managed.snapshot(now)
+            self.managed_spin = None
+            self.spin_in_progress = False
+            self.spin_sequence = []
+            if self.state != 'MANUAL_REQUIRED':
+                self._handle_spin_failure('定位旋轉已安全停止：'+reason)
+            return
+        if now-getattr(self, 'managed_spin_guard_at', -float('inf')) < .5:
+            return
+        self.managed_spin_guard_at = now
+        safe = available and not blocked and self._recovery_spin_clear(now)
+        result = managed.stopped(now, safe)
+        if result == 'complete':
+            self.last_recovery_spin = managed.snapshot(now)
+            self.get_logger().info(f'✅ 定位旋轉已停妥（累計 {math.degrees(managed.travel):.1f}°）')
+            self.managed_spin = None
+            self.spin_in_progress = False
+            self.spin_sequence = []
+            self._complete_spin_sequence()
+        elif result == 'resume':
+            self.spin_in_progress = False
+            self.managed_spin_resume = True
+            self.spin_sequence = [managed.sign*managed.remaining]
+            self.get_logger().warning(f'🔄 安全條件恢復，續轉剩餘 {math.degrees(managed.remaining):.1f}°')
+            self._send_next_spin()
+        elif result == 'fail':
+            self.last_recovery_spin = managed.snapshot(now)
+            self.managed_spin = None
+            self.spin_in_progress = False
+            self.spin_sequence = []
+            self._handle_spin_failure('定位旋轉續轉次數已達上限')
 
     def _tick_spin_settle(self, now):
         """Wait out velocity-smoother deceleration before measuring final yaw."""
@@ -3006,6 +3174,10 @@ class LocalizationManager(Node):
         )
 
     def _require_manual(self, reason):
+        managed = getattr(self, 'managed_spin', None)
+        if managed is not None:
+            self._stop_managed_spin('manual_stop')
+            managed.reason = 'manual_stop'
         self.pipeline_recheck = None
         self.manual_intervention_kind = ('pipeline' if any(word in reason for word in
             ('資料管線','底盤回授','回授確認','無新鮮回授','Nav2')) else 'pose')

@@ -126,6 +126,23 @@ def test_session_change_between_health_callback_and_timer_still_rejects_motion(m
     assert all(w==ZERO for w in ports[-1].writes)
 
 
+def test_tx_disarm_preserves_exact_feedback_age_and_reason(monkeypatch):
+    n,t,_,ports=transmitter(monkeypatch)
+    n.poll();t[0]=100.2
+    n.feedback_callback(String(data=json.dumps(payload(t[0]))));n.poll()
+    assert n.armed
+    for at in (100.3,100.4,100.5,100.6):
+        t[0]=at;n.poll()
+    data=n.health(t[0])
+    assert not data['armed'] and data['last_disarm']['reason']=='feedback_source_age'
+    assert data['last_disarm']['feedback']['source_age_sec'] > .35
+    assert data['disarm_counts']['feedback_source_age']==1
+    n.cmd_vel_callback(Twist())
+    assert n.health(t[0])['last_rejection']['reason']=='not_armed'
+    json.dumps(data,allow_nan=False)
+    assert ports[-1].writes[-1]==ZERO
+
+
 def test_frontend_preserves_jazzy_dictionary_source_timestamp_and_rejects_nan():
     from smart_delivery_core.cmd_vel_to_serial import CmdVelToSerialNode
     from smart_delivery_core.pipeline_health import DurationMetrics
