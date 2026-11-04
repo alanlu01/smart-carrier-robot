@@ -1,0 +1,2 @@
+source_id,task_id,event_id,event_time_local,received_local,status,reason
+S02,016edb4a-cd26-4ff4-99c7-71a0d6648d7f,8e00cdd9-7606-4505-b91f-8c8ab1d1e26b,2026-09-23T12:38:54.268+08:00,2026-09-23T12:39:44.645+08:00,cancelled,事件時間在此錄製視窗之外

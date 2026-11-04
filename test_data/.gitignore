@@ -1,0 +1,10 @@
+# Large recordings belong to Releases or private verified backups.
+*.mcap
+*.db3
+*.tar
+*.tar.gz
+*.tar.zst
+*.partial
+*.inspect.ndjson
+reproduced_quantitative/
+__pycache__/

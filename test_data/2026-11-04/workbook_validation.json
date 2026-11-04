@@ -1,0 +1,15 @@
+{
+  "saved_workbook_sheets": 8,
+  "rows_checked": 72,
+  "formula_errors": [],
+  "charts": 1,
+  "order_types": {
+    "borrow": 32,
+    "return": 40
+  },
+  "done_by_type": {
+    "borrow": 31,
+    "return": 38
+  },
+  "statistical_notes": "Nonuniform tests with human assistance; not autonomous accuracy or reliability trials."
+}

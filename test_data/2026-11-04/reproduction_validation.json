@@ -1,0 +1,8 @@
+{
+  "analysis_data_equal": true,
+  "sessions": 9,
+  "orders": 72,
+  "done": 69,
+  "cancelled": 3,
+  "scope": "entire analysis_data.json including all tables and summary"
+}
