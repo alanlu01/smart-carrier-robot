@@ -13,9 +13,11 @@
 六包公開 rosbag 存於 [測試資料 Release](https://github.com/alanlu01/smart-carrier-robot/releases/tag/test-data-2026-11-04)，不加入 Git 歷史。下載後先核對 SHA-256，再解開 `.public.tar.zst`。Linux 可使用：
 
 ```bash
-sha256sum -c SHA256SUMS.txt
+tr -d '\r' < SHA256SUMS.txt | sha256sum -c -
 tar --zstd -xf 20261103_201845_full_system_aiK4cq.public.tar.zst
 ```
+
+此校驗方式同時支援 LF 與 CRLF 清單。解開後也可在單包資料夾內用相同方式檢查各檔案。Git 內的檔案另有 `FILE_SHA256SUMS.txt`，以相同方式核對。
 
 每包含完整的原有 topic、metadata、參數快照、效能紀錄與校驗結果。原始 `rosbag_info.txt` 的檔案大小描述原件；重新封裝後的大小請以 `metadata.yaml`、`validation.json` 為準。
 
