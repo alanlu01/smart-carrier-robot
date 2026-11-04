@@ -2,15 +2,6 @@
 import math
 
 
-def map_odom_pose(map_pose, odom_pose):
-    if map_pose is None or odom_pose is None:
-        return None
-    yaw = map_pose[2]-odom_pose[2]
-    c, s = math.cos(yaw), math.sin(yaw)
-    return (map_pose[0]-c*odom_pose[0]+s*odom_pose[1],
-            map_pose[1]-s*odom_pose[0]-c*odom_pose[1], math.atan2(math.sin(yaw), math.cos(yaw)))
-
-
 class PipelineRecheck:
     def __init__(self, started, source_ns, reference, required=6,
                  timeout=30., verification_timeout=8., distance=.20, angle=.174533):

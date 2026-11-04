@@ -15,19 +15,25 @@ def protect_parent(stop, name):
     parent = os.getppid()
     libc = ctypes.CDLL(None)
     libc.prctl(15, name.encode(), 0, 0, 0)
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    requested = [False]
+    # Event.set() takes a non-reentrant process lock. A signal may interrupt
+    # Event.wait() while that same lock is held; never take it in a handler.
+    def request_stop(*_):
+        requested[0] = True
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
     libc.prctl(1, signal.SIGTERM, 0, 0, 0)
     if os.getppid() != parent or parent == 1:
-        stop.set()
+        requested[0] = True
+    return requested
 
 
 def receive_worker(path, baud, stop, wheel, health, raw):
-    protect_parent(stop, 'serial_rx_io')
+    requested = protect_parent(stop, 'serial_rx_io')
     engine = SerialReceiver(path, baud)
     last_health = last_raw = 0.
     try:
-        while not stop.is_set():
+        while not requested[0] and not stop.is_set():
             started = time.monotonic()
             try:
                 latest = engine.step(started)
@@ -52,11 +58,11 @@ def receive_worker(path, baud, stop, wheel, health, raw):
 
 
 def transmit_worker(path, baud, stop, commands, feedback, health):
-    protect_parent(stop, 'serial_tx_io')
+    requested = protect_parent(stop, 'serial_tx_io')
     engine = SerialTransmitter(path, baud)
     last_command = last_feedback = last_health = 0
     try:
-        while not stop.is_set():
+        while not requested[0] and not stop.is_set():
             started = time.monotonic()
             item = feedback.get(last_feedback)
             if item:
@@ -78,7 +84,7 @@ def transmit_worker(path, baud, stop, commands, feedback, health):
 
 def diagnostic_worker(role, stop, health, relay_metrics, raw=None, summary_period=5.):
     """A blocked reliable diagnostic publisher cannot block either I/O owner."""
-    protect_parent(stop, 'serial_'+role+'_diag')
+    requested = protect_parent(stop, 'serial_'+role+'_diag')
     import rclpy
     from rclpy.executors import ExternalShutdownException
     from std_msgs.msg import String
@@ -96,7 +102,7 @@ def diagnostic_worker(role, stop, health, relay_metrics, raw=None, summary_perio
     last_diag = last_summary = 0.
     previous_frames = 0
     try:
-        while rclpy.ok() and not stop.is_set():
+        while rclpy.ok() and not requested[0] and not stop.is_set():
             started = time.monotonic()
             captured = health.get()
             h = captured[1] if captured else {}

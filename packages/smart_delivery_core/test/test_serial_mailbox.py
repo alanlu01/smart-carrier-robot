@@ -23,3 +23,16 @@ def test_busy_or_crashed_reader_never_blocks_the_serial_owner():
     finally:slot.lock.release()
     assert slot.get()[1]==dict(old=True)
     with pytest.raises(ValueError):slot.put(dict(oversized='a'*2048))
+
+
+def test_worker_signal_does_not_take_the_shared_event_lock(monkeypatch):
+    from types import SimpleNamespace
+    from smart_delivery_core import serial_workers as module
+    handlers={}
+    monkeypatch.setattr(module.ctypes,'CDLL',lambda _:SimpleNamespace(prctl=lambda *args:0))
+    monkeypatch.setattr(module.os,'getppid',lambda:42)
+    monkeypatch.setattr(module.signal,'signal',lambda sig,callback:handlers.setdefault(sig,callback))
+    def forbidden():raise AssertionError('Signal handler must never acquire Event.set lock')
+    flag=module.protect_parent(SimpleNamespace(set=forbidden),'fake')
+    handlers[module.signal.SIGINT](module.signal.SIGINT,None)
+    assert flag==[True]

@@ -1,6 +1,7 @@
 """Production outage verifier: no hardware, no permissive pose or stale-data bypass."""
 import pytest
-from smart_delivery_core.pipeline_recheck import PipelineRecheck, map_odom_pose
+import math
+from smart_delivery_core.pipeline_recheck import PipelineRecheck
 
 
 def observe(guard, at, **changes):
@@ -60,9 +61,11 @@ def test_without_prior_trusted_reference_never_accept_a_high_score_alone():
     assert observe(g,109.)=='pose_recovery'
 
 
-def test_map_odom_reference_compensates_real_ordinary_motion():
-    assert map_odom_pose((2.,5.,0.),(1.,1.,0.))==pytest.approx((1.,4.,0.))
-    assert map_odom_pose((2.1,5.,0.),(1.1,1.,0.))==pytest.approx((1.,4.,0.))
+def test_wrapped_map_odom_heading_is_not_mistaken_for_a_full_turn():
+    g=PipelineRecheck(100.,100000000000,(0.,0.,math.pi-.02))
+    for at in range(101,106):
+        assert observe(g,float(at),transform=(0.,0.,-math.pi+.02))=='wait'
+    assert observe(g,106.,transform=(0.,0.,-math.pi+.02))=='resume'
 
 
 def test_waiting_for_data_pauses_verification_budget_but_not_total_deadline():
