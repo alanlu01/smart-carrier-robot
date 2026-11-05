@@ -41,3 +41,30 @@ def test_service_or_new_goal_rearms_an_exhausted_episode():
     policy.failed(102.0)
     policy.select_goal({**POINT, 'x': 2.4})
     assert policy.can_attempt(102.0)
+
+
+def test_unexpected_cancels_back_off_and_cannot_reset_by_changing_goal():
+    policy = StandbyRetryPolicy()
+    policy.select_goal(POINT)
+    policy.unexpected_cancel(100.0)
+    policy.select_goal({**POINT, 'x': 2.4})
+    assert policy.status(101.0) == 'retry_wait'
+    assert policy.can_attempt(110.0)
+    policy.unexpected_cancel(110.0)
+    assert not policy.can_attempt(129.9)
+    policy.unexpected_cancel(130.0)
+    policy.select_goal(POINT)
+    assert policy.unexpected_cancellations == policy.attempts == 3
+    assert policy.status(9999.0) == 'blocked'
+    policy.reset()
+    assert policy.can_attempt(9999.0)
+
+
+def test_failure_and_unexplained_cancel_share_three_attempt_limit():
+    policy = StandbyRetryPolicy()
+    policy.select_goal(POINT)
+    policy.failed(100.0)
+    policy.unexpected_cancel(110.0)
+    policy.failed(130.0)
+    assert policy.attempts == 3
+    assert policy.status(9999.0) == 'blocked'

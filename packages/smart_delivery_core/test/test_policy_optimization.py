@@ -10,7 +10,7 @@ from test_localization_recovery import manager
 from smart_delivery_core.localization_manager import LocalizationManager
 from tf2_ros import TransformException
 from geometry_msgs.msg import PoseStamped
-from action_msgs.msg import GoalStatus
+from nav2_simple_commander.robot_navigator import BasicNavigator
 
 
 def test_one_subscription_decodes_once_and_preserves_event_payload(monkeypatch):
@@ -54,11 +54,10 @@ def test_acceptance_timeout_keeps_pending_request_for_stop_cleanup():
     assert wait.request is not None
 
 
-def test_client_does_not_send_a_goal_cancelled_before_server_discovery():
-    node=object.__new__(DeliveryNavigator)
-    node.goToPose(PoseStamped());node.cancelTask()
-    assert node.isTaskComplete() and node.status==GoalStatus.STATUS_CANCELED
-    assert node.pending_goal_request is None
+def test_client_retains_native_executor_pumping_for_owned_actions():
+    assert DeliveryNavigator.goToPose is BasicNavigator.goToPose
+    assert DeliveryNavigator.isTaskComplete is BasicNavigator.isTaskComplete
+    assert DeliveryNavigator.cancelTask is BasicNavigator.cancelTask
 
 
 def test_standby_timeout_never_releases_the_guard(monkeypatch):

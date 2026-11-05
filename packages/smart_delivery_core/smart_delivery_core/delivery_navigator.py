@@ -7,9 +7,6 @@ from nav2_simple_commander.robot_navigator import BasicNavigator
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
 from smart_delivery_core.delivery_console import startup_status
-from smart_delivery_core.navigation_wait import NavigationWait, NavigationOwnershipUncertain
-from nav2_msgs.action import NavigateToPose
-from action_msgs.msg import GoalStatus
 
 
 class Nav2StartupUnavailable(RuntimeError):
@@ -17,58 +14,10 @@ class Nav2StartupUnavailable(RuntimeError):
 
 
 class DeliveryNavigator(BasicNavigator):
-    """Bound startup and poll owned actions without nesting executor waits."""
+    """Bound startup while retaining BasicNavigator's executor-driven actions."""
     STARTUP_TIMEOUT = 30.0
     RPC_TIMEOUT = 3.0
     RETRY_DELAY = 1.0
-
-    def goToPose(self, pose, behavior_tree=''):
-        previous = getattr(self,'_delivery_wait',None)
-        if previous is not None and previous.phase not in ('finished','rejected'):
-            raise RuntimeError('Previous navigation action has not drained')
-        if getattr(self,'result_future',None) is not None and not self.result_future.done():
-            raise NavigationOwnershipUncertain('Auxiliary navigation action has not drained')
-        self._delivery_wait = NavigationWait(time.monotonic())
-        self._delivery_pose, self._delivery_tree = pose, behavior_tree
-        self.goal_handle = self.result_future = None
-        self.status = GoalStatus.STATUS_UNKNOWN
-        self.pending_goal_request = None
-        return True
-
-    def isTaskComplete(self):
-        wait = getattr(self,'_delivery_wait',None)
-        if wait is not None and wait.phase not in ('finished','rejected'):
-            now = time.monotonic()
-            if wait.request is None and self.nav_to_pose_client.server_is_ready():
-                goal = NavigateToPose.Goal()
-                goal.pose, goal.behavior_tree = self._delivery_pose, self._delivery_tree
-                wait.request = self.nav_to_pose_client.send_goal_async(goal,self._feedbackCallback)
-                self.pending_goal_request = wait.request
-                wait.phase = 'waiting_acceptance'
-            done = wait.poll(now)
-            self.goal_handle, self.result_future = wait.handle, wait.result
-            if done:
-                self.pending_goal_request = None
-                self.status = (GoalStatus.STATUS_ABORTED if wait.phase == 'rejected'
-                               else wait.result.result().status)
-            return done
-        # Auxiliary motions own their request/deadline; only inspect their result.
-        result = getattr(self,'result_future',None)
-        if result is None:return True
-        if not result.done():return False
-        self.status = result.result().status
-        return True
-
-    def cancelTask(self):
-        wait = getattr(self,'_delivery_wait',None)
-        if wait is not None and wait.phase not in ('finished','rejected'):
-            if wait.request is None:
-                wait.phase = 'finished'
-                self.status = GoalStatus.STATUS_CANCELED
-                return
-            wait.cancel_once(time.monotonic())
-        elif getattr(self,'goal_handle',None) is not None and self.result_future is not None:
-            self.goal_handle.cancel_goal_async()
 
     def __init__(self):
         super().__init__()

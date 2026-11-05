@@ -556,7 +556,7 @@ def go_to_standby(
     if result != TaskResult.SUCCEEDED:
         if result == TaskResult.CANCELED:
             on_outcome(closest_standby, "interrupted_by_navigation")
-            navigator.get_logger().info("⏸️ 停靠導航已中斷，等待狀態同步後重試")
+            navigator.get_logger().info("⏸️ 停靠導航非預期中斷，尚未停妥")
             return None
         on_outcome(closest_standby, "failed")
         navigator.get_logger().warning(
@@ -756,7 +756,7 @@ def _run_delivery(runtime_holder):
             standby_retry.failed(now)
             state = standby_retry.status(now)
             navigator.get_logger().warning(
-                f"⚠️ 停靠未完成（{standby_retry.failures}/{standby_retry.max_attempts}）；"
+                f"⚠️ 停靠未完成（{standby_retry.attempts}/{standby_retry.max_attempts}）；"
                 + ("停止自動重試，新訂單仍可執行"
                    if state == "blocked" else
                    f"{standby_retry.retry_at - now:.0f} 秒後才可重試")
@@ -768,11 +768,19 @@ def _run_delivery(runtime_holder):
             if optional_runtime is not None and last_standby_status != (point['name'],'arrived',0):
                 optional_runtime.mark_parked(point)
         elif state == "interrupted_by_navigation":
-            standby_retry.retry_at = max(standby_retry.retry_at, now+1.)
+            standby_retry.unexpected_cancel(now)
+            state = standby_retry.status(now)
+            navigator.get_logger().warning(
+                f"⚠️ 停靠非預期取消（{standby_retry.attempts}/{standby_retry.max_attempts}）；"
+                + ("停止自動重試，新訂單仍可執行"
+                   if state == "blocked" else
+                   f"{standby_retry.retry_at - now:.0f} 秒後才可重試")
+            )
         payload = {
             "state": state, "name": point["name"],
             "x": point["x"], "y": point["y"], "yaw": point["yaw"],
             "failed_attempts": standby_retry.failures,
+            "unexpected_cancellations": standby_retry.unexpected_cancellations,
             "max_attempts": standby_retry.max_attempts,
             "retry_in_sec": (
                 round(max(0.0, standby_retry.retry_at - now), 1)
@@ -780,7 +788,7 @@ def _run_delivery(runtime_holder):
             ),
             "parked": state == "arrived",
         }
-        key = (point["name"], state, standby_retry.failures)
+        key = (point["name"], state, standby_retry.attempts)
         if key == last_standby_status and now - last_standby_status_at < 1.0:
             return
         message = String()
@@ -1501,7 +1509,7 @@ def _run_delivery(runtime_holder):
                     report_standby(point, standby_retry.status(time.monotonic()))
                     continue
                 print("\n🏁 無待處理任務，返回待機點")
-                print(f"🔁 停靠嘗試 {standby_retry.failures + 1}/{standby_retry.max_attempts}")
+                print(f"🔁 停靠嘗試 {standby_retry.attempts + 1}/{standby_retry.max_attempts}")
                 standby_pos = go_to_standby(
                     navigator,
                     current_pos,
