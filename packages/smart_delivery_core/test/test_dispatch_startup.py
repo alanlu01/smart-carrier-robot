@@ -48,8 +48,10 @@ def test_gate_is_observed_before_initial_work_can_be_cancelled_or_acked():
                 if isinstance(item, ast.FunctionDef) and item.name == '_run_delivery')
     loop = next(item for item in main.body if isinstance(item, ast.While)
                 and ast.unparse(item.test) == 'rclpy.ok()')
-    assert ast.unparse(loop.body[1]).startswith('startup_dispatch.observe(')
-    observation = ast.unparse(loop.body[1])
+    observation = next(ast.unparse(item) for item in loop.body
+                       if ast.unparse(item).startswith('startup_dispatch.observe('))
+    assert loop.body.index(next(item for item in loop.body if ast.unparse(item)==observation)) < next(
+        i for i,item in enumerate(loop.body) if isinstance(item,ast.If) and 'optional_runtime.poll' in ast.unparse(item.test))
     assert 'bool(pending_orders) and pending_result is None' in observation
     idle = next(item for item in loop.body if isinstance(item, ast.If)
                 and ast.unparse(item.test) == 'not pending_orders')

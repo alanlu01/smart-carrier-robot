@@ -18,7 +18,7 @@ def stop_after_failure(runtime, *, timeout=5., spin_once=None):
     navigator = runtime.navigator
     deadline = time.monotonic() + timeout
     last_cancel, stopped_since = -float('inf'), None
-    request = runtime.goal_request
+    request = runtime.goal_request or getattr(navigator,'pending_goal_request',None)
     handle = None if request is not None else getattr(navigator, 'goal_handle', None)
     result = None if request is not None else getattr(navigator, 'result_future', None)
     cancel = None

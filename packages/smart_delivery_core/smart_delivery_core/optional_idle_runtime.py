@@ -27,6 +27,7 @@ from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
 from smart_delivery_core.delivery_console import people_status, safety_status, reason_label
 from smart_delivery_core.pipeline_health import DurationMetrics, timed_operation
+from smart_delivery_core.delivery_inputs import shared_inputs, message_json
 
 STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -144,13 +145,13 @@ class OptionalIdleRuntime:
             self.admission_pub = None
         self.status_pub = navigator.create_publisher(String, '/smart_carrier/optional_idle_state', STATE_QOS)
         navigator.create_subscription(OccupancyGrid, '/map', self._map, STATE_QOS)
-        navigator.create_subscription(Odometry, '/odom', self._odom, 10)
+        shared_inputs(navigator).subscribe(Odometry, '/odom', self._odom, 10)
         navigator.create_subscription(Bool, '/localization/motion_inhibited', self._inhibited, STATE_QOS)
         self.inhibited = False
         if config['people']['enabled']:
-            navigator.create_subscription(LaserScan, '/scan_filtered', self._scan, qos_profile_sensor_data)
+            shared_inputs(navigator).subscribe(LaserScan, '/scan_filtered', self._scan, qos_profile_sensor_data)
             navigator.create_subscription(String, '/vision/semantic_info', self._vision, 10)
-            navigator.create_subscription(String, '/localization/state', self._localization, STATE_QOS)
+            shared_inputs(navigator).subscribe(String, '/localization/state', self._localization, STATE_QOS)
         navigator.create_timer(0.5, self._heartbeat)
         if config['people']['enabled']:
             navigator.create_timer(0.02, self._retry_scan_transform)
@@ -187,7 +188,7 @@ class OptionalIdleRuntime:
     def _localization(self, message):
         """Observe phase only; never publish localization readiness ourselves."""
         try:
-            payload = json.loads(message.data)
+            payload = message_json(message)
             stamp = payload['sample_ros_stamp_ns']
             age = (self.navigator.get_clock().now().nanoseconds-stamp)/1e9
             if (not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0
@@ -440,7 +441,7 @@ class OptionalIdleRuntime:
                                        'low_battery_stop_claim' if self.stop_accepting else 'battery_health'})
             self.admission_pub.publish(message)
         message = String()
-        message.data = json.dumps({'stamp_sec': stamp, 'state': self.state, 'reason': self.reason,
+        payload = {'stamp_sec': stamp, 'state': self.state, 'reason': self.reason,
                                    'home_latched': self.home_requested, 'map_matches': self.map_matches,
                                    'stop_claim_latched': self.stop_accepting,
                                    'accepting_tasks': self.accepting_tasks,
@@ -468,8 +469,7 @@ class OptionalIdleRuntime:
                                        self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed), 1),
                                    'idle_clock_reason': self.idle_clock.reason,
                                    'idle_elapsed_sec': round(self.idle_clock.elapsed,1),
-                                   'spin_guard': self.guard_report})
-        payload = json.loads(message.data)
+                                   'spin_guard': self.guard_report}
         payload['observed_heading_coverage'] = None if self.people is None else round(
             len(self.people.headings)/self.people.count, 3)
         payload['people_demand'] = (self.people.summary(self.config['people']['observation_pose'])

@@ -14,6 +14,8 @@ from nav2_simple_commander.robot_navigator import TaskResult
 from smart_delivery_core.delivery_navigator import DeliveryNavigator, Nav2StartupUnavailable
 from smart_delivery_core.delivery_console import localization_label, localization_wait_label, brief
 from smart_delivery_core.serial_recovery import fresh_feedback
+from smart_delivery_core.delivery_inputs import shared_inputs, message_json, PolicyCadence
+from smart_delivery_core.navigation_wait import NavigationOwnershipUncertain
 from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
@@ -503,6 +505,7 @@ def go_to_standby(
 
     on_outcome(closest_standby, "approaching")
     set_navigation_active(True)
+    terminal_confirmed = False
     try:
         navigator.goToPose(goal_pose)
         while not navigator.isTaskComplete():
@@ -512,6 +515,7 @@ def go_to_standby(
                 navigator.cancelTask()
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
+                terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_optional_feature")
                 return None
             if new_task_waiting():
@@ -519,6 +523,7 @@ def go_to_standby(
                 navigator.get_logger().info("📥 新任務優先，取消返回待機點")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
+                terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_order")
                 return None
             if not localization_is_ready():
@@ -526,8 +531,10 @@ def go_to_standby(
                 navigator.get_logger().warning("⏸️ 定位暫停，取消前往待機點")
                 while not navigator.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
+                terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_localization")
                 return None
+        terminal_confirmed = True
         result = navigator.getResult()
         if result != TaskResult.SUCCEEDED:
             # Drain late ready/order callbacks that can follow the action result.
@@ -535,7 +542,8 @@ def go_to_standby(
             while time.monotonic() < deadline:
                 rclpy.spin_once(navigator, timeout_sec=.05)
     finally:
-        set_navigation_active(False)
+        if terminal_confirmed:
+            set_navigation_active(False)
 
     # Cancel/ready callbacks may arrive with the terminal Nav2 result rather
     # than inside the loop. They are not failed parking attempts or arrivals.
@@ -579,6 +587,13 @@ def main():
                     else:
                         runtime.navigator.get_logger().warning('⚠️ 配送結束；停妥未確認，安全保護維持')
                 return
+    except NavigationOwnershipUncertain as exc:
+        if runtime_holder:
+            report = stop_after_failure(runtime_holder[0])
+            runtime_holder[0].navigator.get_logger().error(
+                '🛑 導航回應逾時，任務已保留；'+('已確認停車' if report['stopped'] else '停妥未確認，安全保護維持')
+                +'：'+brief(exc))
+        return 1
     except Exception:
         if runtime_holder:
             runtime = runtime_holder[0]
@@ -602,6 +617,7 @@ def _run_delivery(runtime_holder):
     from rclpy.signals import SignalHandlerOptions
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     navigator = DeliveryNavigator()
+    cadence = PolicyCadence()
     tf_buffer = Buffer()
     _tf_listener = TransformListener(tf_buffer, navigator)
     core_share = get_package_share_directory("smart_delivery_core")
@@ -679,10 +695,10 @@ def _run_delivery(runtime_holder):
         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
         retry_sensor_times[name] = (time.monotonic(), stamp)
 
-    navigator.create_subscription(LaserScan, "/scan_filtered",
+    shared_inputs(navigator).subscribe(LaserScan, "/scan_filtered",
                                   lambda msg: record_retry_sensor("scan", msg),
                                   qos_profile_sensor_data)
-    navigator.create_subscription(Odometry, "/odom",
+    shared_inputs(navigator).subscribe(Odometry, "/odom",
                                   lambda msg: record_retry_sensor("odom", msg), 10)
     def retry_feedback_callback(message):
         nonlocal retry_feedback, retry_feedback_at
@@ -773,6 +789,7 @@ def _run_delivery(runtime_holder):
         last_standby_status, last_standby_status_at = key, now
 
     def localization_ready_callback(message):
+        cadence.wake()
         nonlocal localization_ready, localization_ready_received
         nonlocal localization_ready_since, is_standby
         nonlocal localization_interrupt_generation
@@ -806,7 +823,7 @@ def _run_delivery(runtime_holder):
         nonlocal localization_mild
         nonlocal localization_state, localization_state_received, localization_dispatch_allowed
         try:
-            snapshot = json.loads(message.data)
+            snapshot = message_json(message)
             localization_state = snapshot.get("state", "UNKNOWN")
             localization_wait_detail = snapshot.get('pipeline_wait_detail','')
             localization_mild = snapshot.get('mild_map_observation') is True
@@ -821,14 +838,14 @@ def _run_delivery(runtime_holder):
     navigator.create_subscription(
         Bool, "/localization/ready", localization_ready_callback, STATE_QOS
     )
-    navigator.create_subscription(
+    shared_inputs(navigator).subscribe(
         String, "/localization/state", localization_state_callback, STATE_QOS
     )
 
     def refresh_current_position(fallback):
         try:
             transform = tf_buffer.lookup_transform(
-                "map", "base_footprint", Time(), timeout=Duration(seconds=0.2)
+                "map", "base_footprint", Time(), timeout=Duration(seconds=0.)
             )
         except TransformException as exc:
             navigator.get_logger().warning("⏳ 即時位置更新中，暫用上次位置")
@@ -980,6 +997,7 @@ def _run_delivery(runtime_holder):
         publish_task_state(task_state_publisher, task.get("task_id"), state, **details)
 
     def result_ack_callback(message):
+        cadence.wake()
         nonlocal active_task, pending_result, current_batch_id, route_planned
         try:
             ack = json.loads(message.data)
@@ -1044,6 +1062,7 @@ def _run_delivery(runtime_holder):
         )
 
     def power_status_callback(msg):
+        cadence.wake()
         nonlocal latest_power_banks, latest_power_status_at
         nonlocal latest_power_sequence, last_power_error_at
         latest_power_sequence += 1
@@ -1064,6 +1083,7 @@ def _run_delivery(runtime_holder):
     navigator.create_subscription(String, "power_status", power_status_callback, 10)
 
     def order_callback(msg):
+        cadence.wake()
         nonlocal current_batch_id, route_planned
         task_id = None
         try:
@@ -1135,6 +1155,7 @@ def _run_delivery(runtime_holder):
     navigator.create_subscription(String, "order", order_callback, COMMAND_QOS)
 
     def task_cancel_callback(msg):
+        cadence.wake()
         try:
             cancellation = json.loads(msg.data)
             task_id = str(cancellation["task_id"])
@@ -1342,7 +1363,9 @@ def _run_delivery(runtime_holder):
     print("\n🚀 智慧動態派車系統已啟動")
 
     while rclpy.ok():
-        rclpy.spin_once(navigator, timeout_sec=0.5)
+        rclpy.spin_once(navigator, timeout_sec=0.05)
+        if not cadence.due(time.monotonic()):
+            continue
 
         # Observe work before cancellations/results can remove the initial batch.
         # Only a matching-nonce response reaches dispatch_state (see callback).

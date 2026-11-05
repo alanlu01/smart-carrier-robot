@@ -118,3 +118,17 @@ def test_delivery_journal_round_trip(tmp_path):
     assert journal.load()["task_id"] == "task-1"
     journal.clear()
     assert journal.load() == {}
+
+
+def test_journal_skips_only_identical_successfully_saved_content(tmp_path,monkeypatch):
+    from smart_delivery_core import delivery_state as module
+    journal=DeliveryJournal(tmp_path/'deduplicated.json')
+    data={'pending_orders':[{'task_id':'one','state':'queued'}]}
+    journal.save(data)
+    replaced=[];replace=module.os.replace
+    monkeypatch.setattr(module.os,'replace',lambda a,b:(replaced.append(str(b)),replace(a,b))[1])
+    journal.save(data);assert not replaced
+    data['pending_orders'][0]['state']='waiting_localization'
+    journal.save(data);assert len(replaced)==1
+    journal.path.unlink();journal.save(data)
+    assert len(replaced)==2 and journal.load()==data

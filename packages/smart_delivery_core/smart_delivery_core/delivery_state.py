@@ -236,13 +236,25 @@ class DeliveryJournal:
         return data if isinstance(data, dict) else {}
 
     def save(self, data: dict[str, Any]) -> None:
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        try:
+            stamp = self.path.stat()
+            identity = (stamp.st_ino,stamp.st_mtime_ns,stamp.st_size)
+        except FileNotFoundError:
+            identity = None
+        if (identity is not None and identity == getattr(self,'_saved_identity',None)
+                and content == getattr(self,'_saved_content',None)):
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            content,
             encoding="utf-8",
         )
         os.replace(temporary, self.path)
+        stamp = self.path.stat()
+        self._saved_identity = (stamp.st_ino,stamp.st_mtime_ns,stamp.st_size)
+        self._saved_content = content
 
     def clear(self) -> None:
         try:

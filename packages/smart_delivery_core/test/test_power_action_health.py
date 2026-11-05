@@ -78,6 +78,7 @@ def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_
     events=[empty,empty,bad] if persistent else [empty,empty,bad,empty,empty,empty]
     h=PowerActionHealth();baseline=h.observe(payload(),100.)
     namespace=dict(PowerActionHealth=PowerActionHealth,power_health=h,
+        cadence=SimpleNamespace(wake=lambda:None),
         latest_power_banks=baseline,latest_power_status_at=100.,latest_power_sequence=1,
         last_power_error_at=0.,json=json,time=SimpleNamespace(monotonic=lambda:clock[0],time=lambda:clock[0]),
         datetime=datetime.datetime,UTC=datetime.UTC,uuid=uuid,

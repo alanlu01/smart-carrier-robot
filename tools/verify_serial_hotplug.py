@@ -27,9 +27,15 @@ def main():
         for node in (rx,tx,odom,manager,probe):executor.add_node(node)
         observed=bytearray();frames=0;masters=[master];slaves=[slave]
         feeding=[True];feed_stop=threading.Event()
+        health_cache={}
         def health(node):
             item=node.health.get()
-            return item[1] if item else {}
+            now=time.monotonic()
+            if item:health_cache[node]=(now,item[1])
+            cached=health_cache.get(node)
+            # The mailbox intentionally skips contended reads. Keep the last
+            # snapshot briefly, never confuse a skipped read with empty data.
+            return cached[1] if cached and now-cached[0]<=.35 else {}
         def feed():
             nonlocal frames
             while not feed_stop.wait(.5):

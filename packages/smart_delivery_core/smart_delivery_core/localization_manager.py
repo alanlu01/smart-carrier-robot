@@ -694,11 +694,27 @@ class LocalizationManager(Node):
     @timed_operation('state_heartbeat')
     def _publish_state(self):
         now = time.monotonic()
+        state_key=(self.state,self.state_reason,self.recovery_step,self.ready,
+                   self.mild_map_active,self.stationary_map_guard.active,self.lateral_phase)
+        if (state_key == getattr(self,'last_summary_key',None)
+                and now-self.last_state_publish_at < 1.):
+            return
+        self.last_summary_key=state_key
         if not hasattr(self, 'covariance_probe'):
             self.covariance_probe = CovarianceProbe()
         self.last_state_publish_at = now
         message = String()
         freshness = self._freshness_snapshot(now)
+        blockers = self._verification_data_blockers(now)
+        summary = self._state_summary(now, freshness, blockers)
+        detail_key = (self.state,self.recovery_step,self.global_attempts,self.lateral_phase)
+        detailed = (detail_key != getattr(self,'last_detail_key',None)
+                    or now-getattr(self,'last_detail_at',-float('inf')) >= 5.)
+        if not detailed:
+            message.data = json.dumps(summary, ensure_ascii=False)
+            self.state_publisher.publish(message)
+            return
+        self.last_detail_key, self.last_detail_at = detail_key, now
         payload = {
             'sample_ros_stamp_ns': self.get_clock().now().nanoseconds,
             "state": self.state,
@@ -710,7 +726,7 @@ class LocalizationManager(Node):
             'last_recovery_spin': getattr(self, 'last_recovery_spin', None),
             'lateral_settled_yaw_recheck': getattr(self, 'lateral_settled_yaw_recheck', False),
             'navigation_health': getattr(self,'navigation_health',None),
-            'pipeline_wait_detail': self._pipeline_wait_detail(now),
+            'pipeline_wait_detail': self._pipeline_wait_detail(now, blockers),
             "reason": self.state_reason,
             "scan_age_sec": (
                 None if not self.latest_scan_at else now - self.latest_scan_at
@@ -738,7 +754,7 @@ class LocalizationManager(Node):
             "stable_samples": self.stable_samples,
             "stable_samples_required": self.stable_samples_required,
             "verification_elapsed_sec": round(self.observation_clock.elapsed, 3),
-            "verification_blockers": self._verification_data_blockers(now),
+            "verification_blockers": blockers,
             "pipeline_outage_sec": round(self.pipeline_clock.blocked_for(now), 3),
             "tick_max_gap_sec": round(self.tick_max_gap, 3),
             "tick_max_duration_sec": round(self.tick_max_duration, 3),
@@ -772,7 +788,7 @@ class LocalizationManager(Node):
             },
             'second_guard_wait_elapsed_sec': (max(0.,now-self.second_guard_started_at)
                 if self.recovery_step=='second_guard_wait' else None),
-            'recovery_failure_checks': self._recovery_failure_checks(now),
+            'recovery_failure_checks': self._recovery_failure_checks(now, blockers),
             'stationary_update_requests': getattr(self,'nomotion_request_count',0),
         }
         if self.suspect_since is not None:
@@ -792,9 +808,33 @@ class LocalizationManager(Node):
             payload["map_match_error"] = self.last_map_match_error
         if self.state != "LOCALIZED" and self.recovery_diagnostics:
             payload["recovery_diagnostics"] = self.recovery_diagnostics
+        payload.update(summary)
+        payload['detail_included'] = True
         message.data = json.dumps(payload, ensure_ascii=False)
         with self.duration_metrics.measure('state_publish'):
             self.state_publisher.publish(message)
+
+    def _state_summary(self, now, freshness, blockers):
+        return dict(sample_ros_stamp_ns=self.get_clock().now().nanoseconds,
+            state=self.state,reason=self.state_reason,ready=self.ready,
+            dispatch_allowed=self.ready and not self.stationary_map_guard.active and not self.mild_map_active,
+            mild_map_observation=self.mild_map_active,
+            manual_intervention_kind=getattr(self,'manual_intervention_kind','pose'),
+            pipeline_wait_detail=self._pipeline_wait_detail(now,blockers),
+            recovery_step=self.recovery_step,global_attempts=self.global_attempts,
+            lateral_phase=self.lateral_phase,stable_samples=self.stable_samples,
+            recovery_spin=self.managed_spin.snapshot(now) if getattr(self,'managed_spin',None) else None,
+            last_recovery_spin=getattr(self,'last_recovery_spin',None),
+            pipeline_recheck=self.pipeline_recheck.snapshot(now) if getattr(self,'pipeline_recheck',None) else None,
+            stable_samples_required=self.stable_samples_required,
+            verification_blockers=blockers,scan_age_sec=now-self.latest_scan_at if self.latest_scan_at else None,
+            raw_scan_age_sec=freshness['raw_scan_receive_age_sec'],
+            scan_stamp_age_sec=freshness['scan_stamp_age_sec'],odom_age_sec=freshness['odom_age_sec'],
+            amcl_pose_age_sec=freshness['amcl_pose_age_sec'],
+            xy_std=self.latest_quality.xy_std if self.latest_quality else None,
+            yaw_std=self.latest_quality.yaw_std if self.latest_quality else None,
+            map_match_score=self.latest_map_score,map_match_raw_score=self.latest_map_score_raw,
+            detail_included=False)
 
     @staticmethod
     def _age_since(timestamp, now):
@@ -1374,7 +1414,7 @@ class LocalizationManager(Node):
             )
         return extend
 
-    def _recovery_failure_checks(self, now):
+    def _recovery_failure_checks(self, now, blockers=None):
         """Never describe a missing/expired score as a newly measured low score."""
         age = None if self.latest_map_score_at <= 0 else now-self.latest_map_score_at
         if self.latest_map_score is None or age is None:
@@ -1398,7 +1438,7 @@ class LocalizationManager(Node):
                 'stable_samples':self.stable_samples,'required_samples':self.stable_samples_required,
                 'global_geometry_required':getattr(self,'global_verification_required',False),
                 'global_geometry_verified':self._global_pose_is_verified(now),
-                'sensor_blockers':self._verification_data_blockers(now)}
+                'sensor_blockers':self._verification_data_blockers(now) if blockers is None else blockers}
 
     def _recovery_failure_reason(self):
         checks = self._recovery_failure_checks(time.monotonic())
@@ -1813,7 +1853,7 @@ class LocalizationManager(Node):
                 "map",
                 scan.header.frame_id,
                 Time.from_msg(scan.header.stamp),
-                timeout=RclpyDuration(seconds=0.05),
+                timeout=RclpyDuration(seconds=0.),
             )
         except TransformException as exc:
             self.map_match_tf_failures += 1
@@ -2118,8 +2158,8 @@ class LocalizationManager(Node):
         except (AttributeError, TransformException):
             return None
 
-    def _pipeline_wait_detail(self, now):
-        blockers = self._verification_data_blockers(now)
+    def _pipeline_wait_detail(self, now, blockers=None):
+        blockers = self._verification_data_blockers(now) if blockers is None else blockers
         if 'nav2_services_unavailable' in blockers:
             return '等待導航服務恢復'
         if 'chassis_feedback_unavailable' in blockers:
