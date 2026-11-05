@@ -43,6 +43,16 @@ def schedule_tf_retry(task, now):
     return True
 
 
+def transient_navigation_failure(error_code, error_msg):
+    """Explicit middleware/lifecycle failures only, never blocked-path failures."""
+    text = str(error_msg or '').lower()
+    return any(token in text for token in (
+        'timed out while waiting for action server', 'failed to get result for',
+        'action server is not available', 'server is inactive',
+        'server is down after not receiving a heartbeat',
+    ))
+
+
 def result_sync_message(status):
     """Describe the outcome without confusing local receipt with cloud success."""
     label = {'done': '操作已完成', 'failed': '任務失敗',

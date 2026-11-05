@@ -21,7 +21,9 @@ def localization_label(state, intervention_kind='pose'):
     }.get(state, brief(state))
 
 
-def localization_wait_label(state, intervention_kind='pose'):
+def localization_wait_label(state, intervention_kind='pose', detail=''):
+    if intervention_kind == 'pipeline' and detail:
+        return brief(detail)
     return '等待定位狀態同步' if state == 'LOCALIZED' else localization_label(state, intervention_kind)
 
 

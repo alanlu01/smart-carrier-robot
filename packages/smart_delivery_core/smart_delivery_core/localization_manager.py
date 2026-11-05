@@ -710,6 +710,7 @@ class LocalizationManager(Node):
             'last_recovery_spin': getattr(self, 'last_recovery_spin', None),
             'lateral_settled_yaw_recheck': getattr(self, 'lateral_settled_yaw_recheck', False),
             'navigation_health': getattr(self,'navigation_health',None),
+            'pipeline_wait_detail': self._pipeline_wait_detail(now),
             "reason": self.state_reason,
             "scan_age_sec": (
                 None if not self.latest_scan_at else now - self.latest_scan_at
@@ -1465,6 +1466,8 @@ class LocalizationManager(Node):
         self.mild_map_active = False
         if getattr(self, 'managed_spin', None) is not None:
             return
+        if self._tick_pipeline_bootstrap(now):
+            return
         if getattr(self, 'pipeline_recheck', None) is not None:
             self._tick_pipeline_recheck(now)
             return
@@ -2114,6 +2117,69 @@ class LocalizationManager(Node):
             return result if all(math.isfinite(v) for v in result) else None
         except (AttributeError, TransformException):
             return None
+
+    def _pipeline_wait_detail(self, now):
+        blockers = self._verification_data_blockers(now)
+        if 'nav2_services_unavailable' in blockers:
+            return '等待導航服務恢復'
+        if 'chassis_feedback_unavailable' in blockers:
+            return '等待底盤回授恢復'
+        if 'amcl_pose_unavailable' in blockers:
+            return '等待 AMCL 姿態恢復'
+        if any('map_match' in b for b in blockers):
+            return '等待地圖／TF 更新'
+        if blockers:
+            return '等待新鮮感測資料'
+        return '等待定位穩定驗證'
+
+    def _tick_pipeline_bootstrap(self, now):
+        """AMCL may be active after reset but need particles before publishing poses."""
+        started = getattr(self, 'pipeline_bootstrap_started', None)
+        if started is not None:
+            self._request_nomotion_if_due(now)
+            if (self.last_amcl_at > started and getattr(self,'latest_pose_observed_at',0.)*1e9
+                    > self.pipeline_bootstrap_source_ns):
+                self.pipeline_bootstrap_started = None
+                return False
+            if now-started >= 15.:
+                self.pipeline_bootstrap_started = None
+                self._require_manual('AMCL 重新初始化後仍無姿態，請檢查導航資料')
+            return True
+        eligible = (getattr(self,'pipeline_recheck',None) is not None
+            or (self.state == 'MANUAL_REQUIRED'
+                and getattr(self,'manual_intervention_kind','pose') == 'pipeline'))
+        if not eligible:
+            return False
+        nav = getattr(self,'navigation_health',None)
+        missing = self.last_amcl_at <= 0 or now-self.last_amcl_at > self.amcl_pose_timeout
+        safe = (missing and self.lateral_phase is None and nav is not None and nav.get('state') == 'ready'
+            and 0 <= now-self.navigation_health_at <= 3.
+            and not self._lateral_sensor_blockers(now) and self._lateral_stop_ready(now)
+            and self.global_localization_client.service_is_ready())
+        if not safe:
+            self.pipeline_bootstrap_safe_since = None
+            return False
+        since = getattr(self,'pipeline_bootstrap_safe_since',None)
+        if since is None:
+            self.pipeline_bootstrap_safe_since = now
+            return True
+        if now-since < 2.:
+            return True
+        self.pipeline_bootstrap_safe_since = None
+        self.pipeline_recheck = None
+        if not self.auto_motion_recovery:
+            self._require_manual('AMCL 姿態未恢復，自動定位動作已停用')
+            return True
+        self._cancel_navigation()
+        self.global_attempts = 0
+        self.verify_reference_required = False
+        self.verify_seed_retry_allowed = False
+        self.manual_intervention_kind = 'pose'
+        self._start_global_recovery()
+        self.pipeline_bootstrap_started = now
+        self.pipeline_bootstrap_source_ns = self.get_clock().now().nanoseconds
+        self.get_logger().warning('🔄 導航服務已恢復；全域重建定位，不沿用舊位置放行')
+        return True
 
     def _tick_pipeline_recheck(self, now):
         guard = self.pipeline_recheck
@@ -3033,7 +3099,8 @@ class LocalizationManager(Node):
             self.managed_spin = None
             self.spin_in_progress = False
             self.spin_sequence = []
-            self._handle_spin_failure('定位旋轉續轉次數已達上限')
+            self._handle_spin_failure('定位旋轉停穩後角度超限' if managed.reason == 'endpoint_overshoot'
+                                      else '定位旋轉續轉次數已達上限')
 
     def _tick_spin_settle(self, now):
         """Wait out velocity-smoother deceleration before measuring final yaw."""

@@ -33,9 +33,11 @@ class NavigationHealth(Node):
         self.bonds = {}
         self.last_probe = self.last_publish = -float('inf')
         self.publisher = self.create_publisher(String,'/navigation/pipeline_health',1)
-        qos = QoSProfile(depth=10,reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(Status,'/bond',self.observe_bond,qos)
-        self.create_subscription(TFMessage,'/tf',self.observe_tf,qos)
+        self.detail_publisher = self.create_publisher(String,'/navigation/diagnostics',
+            QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.last_detail = -float('inf')
+        # Raw bond/TF are already in rosbag. Do not deserialize every high-rate
+        # transport sample in another Python process during normal operation.
         self.create_timer(.1,self.poll)
 
     def observe_bond(self, message):
@@ -90,13 +92,17 @@ class NavigationHealth(Node):
             payload=navigation_snapshot(self.records,now)
             payload['sample_ros_stamp_ns']=self.get_clock().now().nanoseconds
             payload['diagnostic_only']=True
+            self.publisher.publish(String(data=json.dumps(payload)))
+        if now-self.last_detail>=5.:
+            self.last_detail=now
+            payload=dict(sample_ros_stamp_ns=self.get_clock().now().nanoseconds)
             payload['service_diagnostics']=dict(timeouts=dict(self.timeouts),errors=dict(self.errors),
                 response_max_sec=dict(self.response_max),pending_age_sec={n:now-start for n,(_,start) in self.pending.items()})
             payload['bonds']=[dict(node=name,instance=instance,age_sec=now-record['at'],**record)
                               for (name,instance),record in self.bonds.items()]
             payload['tf_receipts']=self.receipts.snapshot(now)
             payload['wall_durations']=self.duration_metrics.snapshot(now)
-            self.publisher.publish(String(data=json.dumps(payload)))
+            self.detail_publisher.publish(String(data=json.dumps(payload)))
 
 
 def main(args=None):

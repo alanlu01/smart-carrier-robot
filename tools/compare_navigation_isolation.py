@@ -83,7 +83,7 @@ def main():
                 goals=0,nonzero_commands=0,log=str(logpath))),flush=True)
             assert ready,(name,'Nav2 never activated')
             assert 'CRITICAL FAILURE' not in startup and 'Unable to start transition' not in startup
-            assert diagnostics['bond_instances']>0
+            assert diagnostics['bond_instances']==0
             assert all(all(v==0. for v in (m.linear.x,m.linear.y,m.angular.z)) for m in commands)
     finally:
         executor.shutdown();monitor.destroy_node();node.destroy_node();rclpy.shutdown()

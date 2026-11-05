@@ -52,6 +52,7 @@ TOPICS=(
   /chassis/odom_local /chassis/odometry_transport_health
   /chassis/serial_rx_health /chassis/serial_tx_health /navigation/pipeline_health
   /chassis/serial_io_diagnostics
+  /navigation/diagnostics
   /power_status /vehicle_battery_status
   /vision/semantic_info /visual_glass /semantic/speed_multiplier
   /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health

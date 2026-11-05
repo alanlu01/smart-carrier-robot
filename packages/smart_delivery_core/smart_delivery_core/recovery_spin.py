@@ -17,6 +17,7 @@ class RecoverySpin:
         self.cancel_confirmed = False
         self.blocked_since = self.clear_since = None
         self.tail_rate = 0.
+        self.finishing = False
 
     @property
     def remaining(self):
@@ -60,17 +61,25 @@ class RecoverySpin:
             self.reason = 'near_obstacle'
             return 'cancel_pause'
         # Predict only a small braking tail. Never send a reverse correction.
-        reserve = max(math.radians(.5), min(math.radians(3.), self.tail_rate*.20))
+        # Include smoother/fusion cancellation and measured braking tail.
+        reserve = max(math.radians(1.), min(math.radians(8.), self.tail_rate*.40))
+        if self.finishing:
+            reserve = math.radians(1.)
         if self.remaining <= reserve:
             self.reason = 'endpoint_braking'
             return 'cancel_endpoint'
         return 'run'
 
     def stopped(self, now, safe):
+        if self.travel-self.target > math.radians(3.):
+            self.reason = 'endpoint_overshoot'
+            return 'fail'  # no reverse correction, but never label overshoot precise
         if self.remaining <= math.radians(3.):
             self.phase = 'complete'
             return 'complete'
         self.phase = 'waiting'
+        if self.reason == 'endpoint_braking':
+            self.finishing = True
         self.clear_since = (self.clear_since if self.clear_since is not None else now) if safe else None
         if self.clear_since is not None and now-self.clear_since >= 1.:
             if self.resumes >= 2:
@@ -86,7 +95,11 @@ class RecoverySpin:
     def speed_limit(self):
         if self.phase != 'running':
             return 0.
-        return .7 if self.remaining < math.radians(25.) else 1.
+        if self.finishing:
+            return .25
+        if self.remaining < math.radians(12.):
+            return .45
+        return .65 if self.remaining < math.radians(45.) else 1.
 
     def snapshot(self, now):
         return dict(phase=self.phase, reason=self.reason, travel_deg=math.degrees(self.travel),

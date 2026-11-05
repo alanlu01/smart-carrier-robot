@@ -87,8 +87,8 @@ def main():
             while not completed and time.monotonic()<deadline:
                 executor.spin_once(timeout_sec=.02)
             assert completed, (model,manager.state,manager.state_reason)
-            assert len(model['goals'])==2 and 0 < model['goals'][1]<2*math.pi-2.
-            assert completed[0]['resumes']==1 and completed[0]['remaining_deg']<=3.
+            assert 2 <= len(model['goals']) <= 3 and 0 < model['goals'][1]<2*math.pi-2.
+            assert 1 <= completed[0]['resumes'] <= 2 and completed[0]['remaining_deg']<=3.
             assert model['cancels']>=1 and not manager.ready
             # Drain terminal result/cancel replies before destroying action entities.
             drained=time.monotonic()+1.

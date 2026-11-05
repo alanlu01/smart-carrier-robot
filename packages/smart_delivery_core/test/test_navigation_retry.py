@@ -100,9 +100,20 @@ def test_actual_delivery_retry_uses_latest_common_tf_without_starting_nodes():
         retry_sensor_times={'scan': (99.95, 9_950_000_000),
                             'odom': (99.98, 9_980_000_000)},
         retry_data_fresh=retry_data_fresh,
+        retry_odom_stopped=True,
+        retry_feedback=dict(healthy=True,connected=True,session='fake',stop_proven=True,
+            sample_ros_stamp_ns=9_980_000_000,complete_ros_stamp_ns=9_950_000_000,complete_sample_age_sec=.03),
+        retry_feedback_at=99.98,
+        fresh_feedback=__import__('smart_delivery_core.serial_recovery',fromlist=['fresh_feedback']).fresh_feedback,
     )
     exec(compile(ast.Module(body=[callback], type_ignores=[]), str(source), 'exec'), namespace)
     assert namespace['retry_data_ready']()
+    namespace['retry_feedback']['stop_proven']=False
+    assert not namespace['retry_data_ready']()
+    namespace['retry_feedback']['stop_proven']=True
+    namespace['retry_odom_stopped']=False
+    assert not namespace['retry_data_ready']()
+    namespace['retry_odom_stopped']=True
     # A connected but stale chain, missing chain, and delayed data stay blocked.
     namespace['time'].monotonic = lambda: 101.0
     assert not namespace['retry_data_ready']()
