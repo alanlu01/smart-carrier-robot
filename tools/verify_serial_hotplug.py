@@ -8,6 +8,8 @@ from smart_delivery_core.serial_to_ros import SerialToROS
 from smart_delivery_core.cmd_vel_to_serial import CmdVelToSerialNode,ZERO
 from smart_delivery_core.mecanum_odom_real import MecanumOdomReal
 from smart_delivery_core.localization_manager import LocalizationManager
+from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
+from std_msgs.msg import String
 
 
 def main():
@@ -23,6 +25,11 @@ def main():
         odom,manager=MecanumOdomReal(),LocalizationManager()
         probe=rclpy.create_node('codex_serial_zero_probe')
         pub=probe.create_publisher(Twist,'/chassis_cmd_vel',1)
+        control_ages=[]
+        def observe_control(message):
+            p=json.loads(message.data)
+            control_ages.append((time.time_ns()-p['sample_ros_stamp_ns'])/1e9)
+        probe.create_subscription(String,'/chassis/serial_feedback',observe_control,LOCAL_ODOM_QOS)
         executor=SingleThreadedExecutor()
         for node in (rx,tx,odom,manager,probe):executor.add_node(node)
         observed=bytearray();frames=0;masters=[master];slaves=[slave]
@@ -63,6 +70,17 @@ def main():
             assert manager.recovery_feedback.complete_sample_count>=3
             assert abs(odom.atomic_wheels.sequence-manager.atomic_wheels.sequence)<=1
             assert odom.x==0. and odom.y==0. and odom.th==0.
+            assert len(control_ages)>20
+            regular_feedback_max_age=max(control_ages)
+            assert regular_feedback_max_age < .35
+            # The old large health channel is diagnostic only. Losing its
+            # publications must not make TX consume a stale wheel snapshot.
+            original_health_publish=rx.health_pub.publish
+            rx.health_pub.publish=lambda _:None
+            arming=health(tx)['arming_count']
+            step(2.)
+            rx.health_pub.publish=original_health_publish
+            assert health(tx)['armed'] and health(tx)['arming_count']==arming
             first=health(rx)['session']
             def usage():
                 result={}
@@ -115,6 +133,8 @@ def main():
             assert observed and all(line+b'\n'==ZERO for line in observed.splitlines())
             print(json.dumps(dict(real_pty_reconnect=True,real_ros_feedback_gate=True,
                  diagnostic_process_stall_sec=3.,control_publish_stall_sec=2.,
+                 separate_control_feedback_verified=True,
+                 diagnostic_health_muted_sec=2.,regular_feedback_max_age_sec=regular_feedback_max_age,
                  worker_resource_usage=resource_usage,complete_groups=frames,rx_opens=health(rx)['open_count'],tx_opens=health(tx)['open_count'],
                  rx_io_max_gap_sec=health(rx)['io_tick_max_gap_sec'],
                  tx_io_max_gap_sec=health(tx)['io_tick_max_gap_sec'],

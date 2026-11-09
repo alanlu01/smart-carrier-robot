@@ -108,6 +108,22 @@ class SerialReceiver:
         data['healthy'] = bool(data['connected'] and data['healthy'] and self.complete_ros_ns)
         return data
 
+    def control_feedback(self, now):
+        """Capture small control evidence in the I/O owner, not the ROS relay.
+
+        The heartbeat stamp proves a recent I/O poll; complete_ros_stamp_ns
+        remains the real four-wheel acquisition time, even between samples.
+        """
+        link = self.link.snapshot(now)
+        evidence = self.feedback.snapshot(now)
+        return dict(schema_version=1, source='serial_rx_io',
+                    connected=link['connected'], session=self.session,
+                    healthy=bool(link['connected'] and evidence['healthy'] and self.complete_ros_ns),
+                    sample_ros_stamp_ns=time.time_ns(), complete_ros_stamp_ns=self.complete_ros_ns,
+                    complete_sample_age_sec=evidence['complete_sample_age_sec'],
+                    complete_sample_count=evidence['complete_sample_count'],
+                    stop_proven=evidence['stop_proven'])
+
 
 class SerialTransmitter:
     def __init__(self, path, baud, *, link=None, clock_ns=time.time_ns):

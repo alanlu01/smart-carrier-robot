@@ -27,7 +27,7 @@ class CmdVelToSerialNode(Node):
         self.commands, self.feedback, self.health, self.relay = [LatestMailbox(ctx) for _ in range(4)]
         self.metrics = DurationMetrics()
         self.subscription = self.create_subscription(Twist, '/chassis_cmd_vel', self.cmd_vel_callback, 1)
-        self.create_subscription(String, '/chassis/serial_rx_health', self.feedback_callback, LOCAL_ODOM_QOS)
+        self.create_subscription(String, '/chassis/serial_feedback', self.feedback_callback, LOCAL_ODOM_QOS)
         self.workers = [
             ctx.Process(target=transmit_worker, args=(str(self.get_parameter('serial_port').value),
                 int(self.get_parameter('baud_rate').value), self.stop, self.commands, self.feedback, self.health), daemon=True),

@@ -18,7 +18,13 @@ def navigation_snapshot(records, now):
               for name,record in records.items()}
     ready = len(states)==len(TARGETS) and all(
         p.get('id')==3 and 0 <= now-p.get('at',-1e6) <= 3. for p in states.values())
-    return dict(state='ready' if ready else 'unavailable', nodes=states)
+    inactive = [name for name,p in states.items() if p.get('id') != 3]
+    missing = [name for name in TARGETS if name not in states]
+    stale = [name for name,p in states.items() if not 0 <= now-p.get('at',-1e6) <= 3.]
+    reason = ('lifecycle_inactive' if inactive else 'awaiting_responses' if missing
+              else 'response_stale' if stale else 'ready')
+    return dict(state='ready' if ready else 'unavailable', nodes=states, reason=reason,
+                inactive_nodes=inactive, missing_nodes=missing, stale_nodes=stale)
 
 
 class NavigationHealth(Node):

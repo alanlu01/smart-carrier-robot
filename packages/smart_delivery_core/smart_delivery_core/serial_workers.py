@@ -28,7 +28,7 @@ def protect_parent(stop, name):
     return requested
 
 
-def receive_worker(path, baud, stop, wheel, health, raw):
+def receive_worker(path, baud, stop, wheel, health, raw, control=None):
     requested = protect_parent(stop, 'serial_rx_io')
     engine = SerialReceiver(path, baud)
     last_health = last_raw = 0.
@@ -46,6 +46,8 @@ def receive_worker(path, baud, stop, wheel, health, raw):
                 with engine.metrics.measure('wheel_ipc'):
                     wheel.put(latest)
             now = time.monotonic()
+            if control is not None:
+                control.put(engine.control_feedback(now))
             if latest is not None or now-last_health >= .2:
                 health.put(engine.health(now))
                 last_health = now

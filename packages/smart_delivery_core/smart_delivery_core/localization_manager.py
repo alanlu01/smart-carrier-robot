@@ -124,6 +124,9 @@ class LocalizationManager(Node):
         self.initial_y = float(self.get_parameter("initial_pose.y").value)
         self.initial_yaw = float(self.get_parameter("initial_pose.yaw").value)
         self.auto_initialize = bool(self.get_parameter("auto_initialize").value)
+        self.startup_pose_mode = str(self.get_parameter('startup_pose_mode').value)
+        if self.startup_pose_mode not in ('auto', 'configured'):
+            raise ValueError('startup_pose_mode must be auto or configured')
         self.reuse_same_boot_pose = bool(
             self.get_parameter("reuse_same_boot_pose").value
         )
@@ -508,9 +511,12 @@ class LocalizationManager(Node):
         self.create_subscription(CollisionMonitorState, '/collision_monitor_state', self._spin_collision_callback, 10)
         self.evidence_timer = self.create_timer(0.05, self._drain_recovery_scans)
         self.timer = self.create_timer(0.2, self._tick)
+        # Transient-local subscribers joining before the first successful pose
+        # must receive a real false state, not wait forever for a ready edge.
+        self.ready_publisher.publish(Bool(data=False))
         self._publish_state()
         self.get_logger().info(
-            "定位管理器已啟動；初始位置為 "
+            "📍 定位啟動；初始位置 "
             f"({self.initial_x:.2f}, {self.initial_y:.2f}, {self.initial_yaw:.2f})；"
             f"來源={self.initial_pose_source}；"
             f"實際底盤命令監看 {self.motion_cmd_topic}"
@@ -518,6 +524,10 @@ class LocalizationManager(Node):
         if self.startup_cache_error:
             self.get_logger().warning(
                 f"無法建立定位開機標記，重啟保護可能無法生效：{self.startup_cache_error}"
+            )
+        if self.initial_pose_source == 'same_boot_trusted_cache':
+            self.get_logger().info(
+                '📍 沿用同次開機可信位置；若已搬回原點，請手動定位或明確使用 startup_pose_mode:=configured'
             )
         if self.same_boot_pose_untrusted:
             self.get_logger().warning(
@@ -533,6 +543,7 @@ class LocalizationManager(Node):
             "initial_pose.xy_std": 0.25,
             "initial_pose.yaw_std": 0.26,
             "auto_initialize": True,
+            "startup_pose_mode": "auto",
             "reuse_same_boot_pose": True,
             "pose_cache_path": "~/.local/state/smart-carrier/localization_pose.json",
             "pose_cache_max_age_sec": 3600.0,
@@ -619,6 +630,14 @@ class LocalizationManager(Node):
     def _configure_startup_pose(self):
         """Reuse a trusted pose only when this is a same-boot Nav2 restart."""
         self.startup_cache_error = None
+        if getattr(self, 'startup_pose_mode', 'auto') == 'configured':
+            self.initial_pose_source = 'configured_explicit'
+            if self.boot_id is not None:
+                try:
+                    write_cache(self.pose_cache_path, self.boot_id, map_identity=self.map_identity)
+                except OSError as exc:
+                    self.startup_cache_error = str(exc)
+            return
         if not self.reuse_same_boot_pose or self.boot_id is None:
             return
 
@@ -817,6 +836,9 @@ class LocalizationManager(Node):
     def _state_summary(self, now, freshness, blockers):
         return dict(sample_ros_stamp_ns=self.get_clock().now().nanoseconds,
             state=self.state,reason=self.state_reason,ready=self.ready,
+            initial_pose_source=getattr(self,'initial_pose_source','unknown'),
+            startup_initial_pose=[getattr(self,'initial_x',None),getattr(self,'initial_y',None),
+                                     getattr(self,'initial_yaw',None)],
             dispatch_allowed=self.ready and not self.stationary_map_guard.active and not self.mild_map_active,
             mild_map_observation=self.mild_map_active,
             manual_intervention_kind=getattr(self,'manual_intervention_kind','pose'),
@@ -2161,6 +2183,11 @@ class LocalizationManager(Node):
     def _pipeline_wait_detail(self, now, blockers=None):
         blockers = self._verification_data_blockers(now) if blockers is None else blockers
         if 'nav2_services_unavailable' in blockers:
+            nav = getattr(self, 'navigation_health', {}) or {}
+            if nav.get('reason') == 'lifecycle_inactive':
+                return '等待導航節點啟用'
+            if nav.get('reason') == 'response_stale':
+                return '等待導航狀態回覆更新'
             return '等待導航服務恢復'
         if 'chassis_feedback_unavailable' in blockers:
             return '等待底盤回授恢復'

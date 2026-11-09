@@ -24,15 +24,19 @@ class SerialToROS(Node):
         ctx = multiprocessing.get_context('spawn')
         self.stop = ctx.Event()
         self.wheel, self.health, self.raw, self.relay = [LatestMailbox(ctx) for _ in range(4)]
+        self.control = LatestMailbox(ctx, capacity=4096)
+        self.control_pub = self.create_publisher(String, '/chassis/serial_feedback', LOCAL_ODOM_QOS)
         self.sample_pub = self.create_publisher(String, '/chassis/wheel_sample', LOCAL_ODOM_QOS)
         self.health_pub = self.create_publisher(String, '/chassis/serial_rx_health', LOCAL_ODOM_QOS)
         self.metrics = DurationMetrics()
         self.last_wheel = self.last_health = 0
+        self.last_control = 0
         self.last_relay_at = 0.
         self.dropped_stale = 0
         self.workers = [
             ctx.Process(target=receive_worker, args=(str(self.get_parameter('serial_port').value),
-                int(self.get_parameter('baud_rate').value), self.stop, self.wheel, self.health, self.raw), daemon=True),
+                int(self.get_parameter('baud_rate').value), self.stop, self.wheel, self.health, self.raw,
+                self.control), daemon=True),
             ctx.Process(target=diagnostic_worker, args=('rx', self.stop, self.health, self.relay, self.raw,
                 max(1., float(self.get_parameter('summary_log_period_sec').value))), daemon=True),
         ]
@@ -43,8 +47,9 @@ class SerialToROS(Node):
     def relay_samples(self):
         started = time.monotonic()
         for slot, attribute, publisher, limit, operation in (
-            (self.health, 'last_health', self.health_pub, .35, 'rx_health_publish'),
+            (self.control, 'last_control', self.control_pub, .35, 'control_feedback_publish'),
             (self.wheel, 'last_wheel', self.sample_pub, .65, 'wheel_publish'),
+            (self.health, 'last_health', self.health_pub, .35, 'rx_health_publish'),
         ):
             item = slot.get(getattr(self, attribute))
             if not item:

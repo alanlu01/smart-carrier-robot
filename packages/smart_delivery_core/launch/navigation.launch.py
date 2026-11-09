@@ -84,7 +84,8 @@ def generate_launch_description():
                 "map_yaml_file": LaunchConfiguration("map"),
                 "auto_initialize": ParameterValue(
                     LaunchConfiguration("auto_initialize"), value_type=bool
-                )
+                ),
+                'startup_pose_mode': LaunchConfiguration('startup_pose_mode'),
             },
         ],
     )
@@ -127,6 +128,8 @@ def generate_launch_description():
             behavior_tree_argument,
             use_sim_time_argument,
             auto_initialize_argument,
+            DeclareLaunchArgument('startup_pose_mode', default_value='auto',
+                description='auto preserves boot/cache protection; configured explicitly uses initial_pose parameters'),
             DeclareLaunchArgument('use_composition',default_value='True',
                                   description='Composed Nav2 by default; false is the standalone comparison'),
             DeclareLaunchArgument('nav_transport_profile',default_value='current',

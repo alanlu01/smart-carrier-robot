@@ -153,8 +153,11 @@ class OptionalIdleRuntime:
             navigator.create_subscription(String, '/vision/semantic_info', self._vision, 10)
             shared_inputs(navigator).subscribe(String, '/localization/state', self._localization, STATE_QOS)
         navigator.create_timer(0.5, self._heartbeat)
+        self.scan_retry_timer = None
         if config['people']['enabled']:
-            navigator.create_timer(0.02, self._retry_scan_transform)
+            self.scan_retry_timer = navigator.create_timer(0.02, self._retry_scan_transform)
+            if self.scan_retry_timer is not None:
+                self.scan_retry_timer.cancel()
 
     @property
     def home_requested(self):
@@ -310,8 +313,24 @@ class OptionalIdleRuntime:
         # old clear scan as permission while the latest one lacks its TF.
         self.pending_scan = None
         if self.state not in ('waiting_observation_stop', 'waiting_observation_retry', 'observing'):
+            self._sync_scan_retry_timer()
             return
-        self._transform_scan(message, now)
+        try:
+            self._transform_scan(message, now)
+        finally:
+            self._sync_scan_retry_timer()
+
+    def _sync_scan_retry_timer(self):
+        """Wake at 50 Hz only while an exact-stamp TF pairing is pending."""
+        timer = getattr(self, 'scan_retry_timer', None)
+        if timer is None:
+            return
+        needed = self.pending_scan is not None and self.state in (
+            'waiting_observation_stop', 'waiting_observation_retry', 'observing')
+        if needed and timer.is_canceled():
+            timer.reset()
+        elif not needed and not timer.is_canceled():
+            timer.cancel()
 
     def _transform_scan(self, message, received_at):
         if not self._stamp_fresh(received_at, message.header.stamp):
@@ -354,6 +373,12 @@ class OptionalIdleRuntime:
 
     def _retry_scan_transform(self):
         """Retry a future-TF pairing briefly, never restamp or extrapolate."""
+        try:
+            self._retry_scan_transform_once()
+        finally:
+            self._sync_scan_retry_timer()
+
+    def _retry_scan_transform_once(self):
         if self.pending_scan is None:
             return
         if self.state not in ('waiting_observation_stop', 'waiting_observation_retry', 'observing'):

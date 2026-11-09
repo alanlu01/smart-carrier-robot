@@ -50,7 +50,7 @@ TOPICS=(
   /smart_carrier/delivery_navigation_active /delivery/standby_state
   /delivery/startup_state
   /chassis/odom_local /chassis/odometry_transport_health
-  /chassis/serial_rx_health /chassis/serial_tx_health /navigation/pipeline_health
+  /chassis/serial_rx_health /chassis/serial_tx_health /chassis/serial_feedback /navigation/pipeline_health
   /chassis/serial_io_diagnostics
   /navigation/diagnostics
   /power_status /vehicle_battery_status
@@ -82,7 +82,7 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261029-global-gate-and-nav2-transcript\n'
+  printf 'diagnostic_schema=20261109-runtime-input-reliability\n'
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \
