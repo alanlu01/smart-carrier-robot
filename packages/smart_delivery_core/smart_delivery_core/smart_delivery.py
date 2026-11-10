@@ -506,36 +506,41 @@ def go_to_standby(
     on_outcome(closest_standby, "approaching")
     set_navigation_active(True)
     terminal_confirmed = False
+    motion = getattr(navigator, 'station_navigation', navigator)
     try:
-        navigator.goToPose(goal_pose)
-        while not navigator.isTaskComplete():
+        if motion is navigator:
+            navigator.goToPose(goal_pose)
+        else:
+            motion.start(goal_pose, lambda: localization_is_ready() and not new_task_waiting()
+                         and not optional_interrupt_requested())
+        while not motion.isTaskComplete():
             time.sleep(0.1)  # 釋放 CPU
             rclpy.spin_once(navigator, timeout_sec=0.05)
             if optional_interrupt_requested():
-                navigator.cancelTask()
-                while not navigator.isTaskComplete():
+                motion.cancelTask()
+                while not motion.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
                 terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_optional_feature")
                 return None
             if new_task_waiting():
-                navigator.cancelTask()
+                motion.cancelTask()
                 navigator.get_logger().info("📥 新任務優先，取消返回待機點")
-                while not navigator.isTaskComplete():
+                while not motion.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
                 terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_order")
                 return None
             if not localization_is_ready():
-                navigator.cancelTask()
+                motion.cancelTask()
                 navigator.get_logger().warning("⏸️ 定位暫停，取消前往待機點")
-                while not navigator.isTaskComplete():
+                while not motion.isTaskComplete():
                     rclpy.spin_once(navigator, timeout_sec=0.05)
                 terminal_confirmed = True
                 on_outcome(closest_standby, "interrupted_by_localization")
                 return None
         terminal_confirmed = True
-        result = navigator.getResult()
+        result = motion.getResult()
         if result != TaskResult.SUCCEEDED:
             # Drain late ready/order callbacks that can follow the action result.
             deadline = time.monotonic()+.3
@@ -547,6 +552,9 @@ def go_to_standby(
 
     # Cancel/ready callbacks may arrive with the terminal Nav2 result rather
     # than inside the loop. They are not failed parking attempts or arrivals.
+    if optional_interrupt_requested():
+        on_outcome(closest_standby, "interrupted_by_optional_feature")
+        return None
     if new_task_waiting():
         on_outcome(closest_standby, "interrupted_by_order")
         return None
@@ -621,6 +629,8 @@ def _run_delivery(runtime_holder):
     tf_buffer = Buffer()
     _tf_listener = TransformListener(tf_buffer, navigator)
     core_share = get_package_share_directory("smart_delivery_core")
+    from smart_delivery_core.station_navigation import StationNavigation
+    navigator.station_navigation = StationNavigation(navigator, tf_buffer, core_share)
     navigator.declare_parameter(
         "optional_idle_config", core_share + "/config/optional_idle_features.yaml"
     )
@@ -1636,30 +1646,33 @@ def _run_delivery(runtime_holder):
         navigation_localization_generation = localization_interrupt_generation
         navigation_started_at = time.monotonic()
         last_tf_failure = (0.0, "")
-        navigator.goToPose(goal_pose)
         active_task_id = target.get("task_id")
+        motion = navigator.station_navigation
+        motion.start(goal_pose, lambda: localization_ready is not False
+                     and active_task_id not in cancellation_requests
+                     and not (optional_runtime and optional_runtime.home_requested))
         cancel_sent = False
         localization_aborted = False
-        while not navigator.isTaskComplete():
+        while not motion.isTaskComplete():
             time.sleep(0.1)
             rclpy.spin_once(navigator, timeout_sec=0.05)
             if active_task_id in cancellation_requests and not cancel_sent:
-                navigator.cancelTask()
+                motion.cancelTask()
                 cancel_sent = True
             elif optional_runtime and optional_runtime.home_requested and not cancel_sent:
                 navigator.get_logger().warning('🔋 低電量返航，正在取消服務導航')
-                navigator.cancelTask()
+                motion.cancelTask()
                 cancel_sent = True
             elif localization_ready is False and not cancel_sent:
                 navigator.get_logger().error(
                     f"⏸️ {localization_wait_label(localization_state,localization_intervention_kind,localization_wait_detail)}，取消導航並保留任務"
                 )
-                navigator.cancelTask()
+                motion.cancelTask()
                 cancel_sent = True
                 localization_aborted = True
 
         set_navigation_active(False)
-        nav_result = navigator.getResult()
+        nav_result = motion.getResult()
         if nav_result == TaskResult.SUCCEEDED and localization_mild:
             # The existing goal may finish during bounded odometry continuation,
             # but no physical handover may be confirmed on degraded map evidence.
@@ -1670,13 +1683,7 @@ def _run_delivery(runtime_holder):
                     break
             if localization_mild or localization_ready is False:
                 localization_aborted = True
-        nav_error_code, nav_error_msg = 0, ""
-        try:
-            action_result = navigator.result_future.result().result
-            nav_error_code = int(action_result.error_code)
-            nav_error_msg = str(action_result.error_msg)
-        except (AttributeError, TypeError, ValueError):
-            pass
+        nav_error_code, nav_error_msg = motion.error_details()
         recent_tf_failure = (
             last_tf_failure[0] >= navigation_started_at
             and time.monotonic() - last_tf_failure[0] <= 3.0
@@ -1737,7 +1744,8 @@ def _run_delivery(runtime_holder):
                 "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else "Nav2 goal failed"
             )
             transient = (nav_result == TaskResult.FAILED and (
-                transient_tf_failure(nav_error_code, nav_error_msg)
+                motion.data_unavailable
+                or transient_tf_failure(nav_error_code, nav_error_msg)
                 or (nav_error_code == 0 and recent_tf_failure)
                 or transient_navigation_failure(nav_error_code,nav_error_msg)
                 or (last_navigation_transport_failure[0] >= navigation_started_at_for_result

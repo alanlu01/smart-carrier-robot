@@ -1,4 +1,4 @@
-"""Generate a home-only Nav2 overlay; disabled features use the original file."""
+"""Add station profiles and, when enabled, a separate precise home checker."""
 
 import hashlib
 import os
@@ -12,22 +12,26 @@ from launch.substitutions import LaunchConfiguration
 import yaml
 
 from smart_delivery_core.optional_idle import home_nav_parameters, load_idle_config
+from smart_delivery_core.station_nav_profile import station_parameters
 
 
 class OptionalNavParameters(Substitution):
-    """Resolve a precise home checker only after explicit feature configuration."""
+    """Resolve station controllers without changing ordinary navigation tuning."""
 
     def perform(self, context):
         source = LaunchConfiguration('params_file').perform(context)
         config = load_idle_config(LaunchConfiguration('optional_idle_config').perform(context))
-        if not (config['home']['enabled'] or config['people']['enabled']):
-            return source
-        map_path = LaunchConfiguration('map').perform(context)
-        if hashlib.sha256(Path(map_path).read_bytes()).hexdigest() != config['map']['yaml_sha256']:
-            raise ValueError('Optional poses are not verified for the selected map YAML')
+        parameters = station_parameters(yaml.safe_load(Path(source).read_text()))
+        if config['home']['enabled'] or config['people']['enabled']:
+            map_path = LaunchConfiguration('map').perform(context)
+            if hashlib.sha256(Path(map_path).read_bytes()).hexdigest() != config['map']['yaml_sha256']:
+                raise ValueError('Optional poses are not verified for the selected map YAML')
         if not config['home']['enabled']:
-            return source
-        parameters = home_nav_parameters(yaml.safe_load(Path(source).read_text()), config)
+            descriptor, path = tempfile.mkstemp(prefix='robot_station_', suffix='.yaml')
+            with os.fdopen(descriptor, 'w') as file:
+                yaml.safe_dump(parameters, file, allow_unicode=True)
+            return path
+        parameters = home_nav_parameters(parameters, config)
         # Multiple goal checkers require an explicit normal checker. Do not
         # silently change a user-supplied normal tree to use the home tolerance.
         normal = ElementTree.parse(LaunchConfiguration('behavior_tree').perform(context))

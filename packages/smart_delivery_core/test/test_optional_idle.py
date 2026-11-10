@@ -150,7 +150,7 @@ def test_home_checker_does_not_change_general_goal_tolerance_or_base_parameters(
     assert home_nav_parameters(base, load_idle_config(DEFAULT)) == original
 
 
-def test_disabled_navigation_substitution_returns_original_file_without_overlay():
+def test_disabled_optional_features_still_load_station_profiles_without_changing_normal_controller():
     from launch import LaunchContext
     from smart_delivery_core.optional_nav_profile import OptionalNavParameters
     context = LaunchContext()
@@ -160,8 +160,18 @@ def test_disabled_navigation_substitution_returns_original_file_without_overlay(
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder)/'disabled.yaml'
         path.write_text(yaml.safe_dump(config))
-        context.launch_configurations.update(params_file='original.yaml', optional_idle_config=str(path))
-        assert OptionalNavParameters().perform(context) == 'original.yaml'
+        original = ROOT/'config/my_nav2_params.yaml'
+        context.launch_configurations.update(params_file=str(original), optional_idle_config=str(path))
+        generated = Path(OptionalNavParameters().perform(context))
+        try:
+            actual = yaml.safe_load(generated.read_text())
+            normal = yaml.safe_load(original.read_text())
+            assert actual['controller_server']['ros__parameters']['FollowPath']==normal['controller_server']['ros__parameters']['FollowPath']
+            assert 'StationY' in actual['controller_server']['ros__parameters']['controller_plugins']
+            assert actual['collision_monitor']['ros__parameters']['NearFootprintStop']['type']=='velocity_polygon'
+            assert 'home_goal_checker' not in actual['controller_server']['ros__parameters']['goal_checker_plugins']
+        finally:
+            generated.unlink()
 
 
 def test_disabled_delivery_does_not_construct_optional_runtime_or_subscriptions():

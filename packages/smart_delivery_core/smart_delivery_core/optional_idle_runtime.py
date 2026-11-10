@@ -58,6 +58,7 @@ class OptionalIdleRuntime:
         self.suspend_lease = suspend_lease
         self.state = 'idle'
         self.motion = False
+        self.station_managed = False
         self.reason = ''
         self.goal = None
         self.deadline = 0.0
@@ -795,8 +796,16 @@ class OptionalIdleRuntime:
         request = NavigateToPose.Goal()
         request.pose, request.behavior_tree = goal, tree
         try:
-            self.goal_request = self.navigator.nav_to_pose_client.send_goal_async(
-                request, self.navigator._feedbackCallback)
+            self.station_managed = (state != 'observing'
+                                    and hasattr(self.navigator,'station_navigation'))
+            if self.station_managed:
+                self.goal_request = None
+                self.navigator.station_navigation.start(goal,
+                    lambda: not self.cancel_requested and self.ready() and not self.inhibited,
+                    park=state=='going_people_standby',behavior_tree=tree)
+            else:
+                self.goal_request = self.navigator.nav_to_pose_client.send_goal_async(
+                    request, self.navigator._feedbackCallback)
         except Exception:
             # A transport error does not prove the server never received the
             # goal. Leave the guard armed and stop renewing its lease.
@@ -1113,7 +1122,10 @@ class OptionalIdleRuntime:
                 return False
             self.navigator.goal_handle = handle
             self.navigator.result_future = handle.get_result_async()
-        if (self.cancel_requested and time.monotonic() - self.last_cancel_at >= 1.0
+        if (self.station_managed and self.cancel_requested
+                and not self.navigator.station_navigation.cancelled):
+            self.navigator.station_navigation.cancelTask()
+        if (not self.station_managed and self.cancel_requested and time.monotonic() - self.last_cancel_at >= 1.0
                 and (self.cancel_future is None or self.cancel_future.done())):
             self.last_cancel_at = time.monotonic()
             try:
@@ -1122,7 +1134,8 @@ class OptionalIdleRuntime:
                 self.suspend_lease()
                 self.reason = 'goal_cancel_error_manual_attention'
                 return True
-        if not self.navigator.isTaskComplete():
+        motion = self.navigator.station_navigation if self.station_managed else self.navigator
+        if not motion.isTaskComplete():
             # Stop renewing if cancellation stalls; the existing delivery goal
             # guard also cancels this NavigateToPose (including its Spin child).
             if self.cancel_started and time.monotonic() - self.cancel_started > 5:
@@ -1131,7 +1144,8 @@ class OptionalIdleRuntime:
             return True
         self.navigation_active(False)
         self.motion = False
-        succeeded = (not self.cancel_requested and self.navigator.getResult() == TaskResult.SUCCEEDED)
+        succeeded = (not self.cancel_requested and motion.getResult() == TaskResult.SUCCEEDED)
+        self.station_managed = False
         if not succeeded:
             self.settling_after_cancel = True
             self.stop_since = None

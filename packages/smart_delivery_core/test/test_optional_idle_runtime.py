@@ -20,6 +20,24 @@ from smart_delivery_core.optional_idle import home_pending_decision, load_idle_c
 ROOT = Path(__file__).parents[1]
 
 
+def test_selected_standby_and_departure_use_the_shared_station_owner(runtime):
+    manager,navigator,moment=runtime
+    calls=[]
+    navigator.station_navigation=SimpleNamespace(start=lambda *a,**k:calls.append((a,k)))
+    manager._safe=lambda:True
+    point={'x':1.,'y':0.,'yaw':0.}
+    assert manager._start(point,'going_people_standby','',60.)
+    assert manager.station_managed and not navigator.sent and manager.goal_request is None
+    assert calls[-1][1]['park'] is True
+    manager.cancel_requested=True
+    assert calls[-1][0][1]() is False
+    manager.cancel_requested=False
+    assert manager._start(point,'going_observation','',60.)
+    assert calls[-1][1]['park'] is False
+    assert manager._start(point,'observing','people_observe.xml',30.)
+    assert not manager.station_managed and len(navigator.sent)==1
+
+
 def test_data_waits_keep_localization_budget_and_original_deadline(runtime):
     manager,navigator,moment=runtime
     manager.observation_session_deadline=120.
