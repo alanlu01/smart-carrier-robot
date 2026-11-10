@@ -41,3 +41,14 @@ MPPI 仍 5 Hz，平滑器仍 20 Hz。Twirling、其他 critic 權重、定位門
 部署後需重新開 start_all、start_nav、start_delivery 才能完整載入新設定。錄製沿用 tools/record_full_system.sh。
 
 STM32／MPU6050／雷達轉速、里程計係數、INA 模型、API 與網頁契約未修改；網頁不需 migration。電機系 arrived／waiting_action 顯示問題另查，本提交沒有修復或宣稱通過該流程。
+
+## 本次驗證結果
+
+- 四套件功能回歸 770 項通過，含低頻輪速模擬與既有取消／停車握手測試；不含既有 ament 版權、flake8、PEP257 格式檢查。
+- smart_delivery_core colcon 建置成功。
+- localhost/domain231 的真實 ROS 假 Spin action 驗證通過，含近障取消、終態回覆、剩餘角度續轉；累計 odom 約 357.22°，符合原有 3°完成容忍，hardware_commands=0。
+- 實際 navigation.launch.py 隔離啟動通過：Nav2 ready、單一導航容器、正常退出、goals=0、nonzero_commands=0。此項驗證參數載入與生命週期，不宣稱已驗證實車 AMCL、弱網或行駛效果。
+- 車載備份：/home/kj0921/backups/conservative_motion_20261110_0gHLYu。
+- 測試紀錄：/home/kj0921/validation_20261110_conservative_motion_ka3d8o。
+
+尚需實車常規測試確認 S 型修正、轉彎時雷達吻合度、定位暫停次數及自旋停止拖尾；不能以隔離測試取代實際驗收。
