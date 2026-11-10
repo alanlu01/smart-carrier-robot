@@ -32,7 +32,8 @@ def main():
         completed=[]
         manager._recovery_spin_clear=lambda _:True  # geometry is tested separately
         manager._complete_spin_sequence=lambda:completed.append(manager.last_recovery_spin)
-        manager.recovery_feedback=SimpleNamespace(last_complete_at=0.,is_stale=lambda *_:False)
+        manager.recovery_feedback=SimpleNamespace(last_complete_at=0.,is_stale=lambda *_:False,
+                                                  sample_age=lambda *_:0.)
         manager.recovery_stop=SimpleNamespace(ready=lambda _:not model['busy'])
 
         def execute(handle):
@@ -47,7 +48,7 @@ def main():
                     handle.canceled();return Spin.Result()
                 now=time.monotonic()
                 cap=manager.managed_spin.speed_limit() if manager.managed_spin else 0.
-                model['rate']=min(1.,cap)
+                model['rate']=.6*cap
                 model['yaw']+=model['rate']*(now-previous);previous=now
                 time.sleep(.01)
             model['busy']=False;model['rate']=0.
@@ -83,7 +84,7 @@ def main():
             manager.state='RECOVERING_GLOBAL';manager.ready=False;manager.restore_heading=False
             manager.spin_sequence=[2*math.pi]
             manager._send_next_spin()
-            deadline=time.monotonic()+25.
+            deadline=time.monotonic()+35.
             while not completed and time.monotonic()<deadline:
                 executor.spin_once(timeout_sec=.02)
             assert completed, (model,manager.state,manager.state_reason)

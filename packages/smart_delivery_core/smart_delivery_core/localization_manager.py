@@ -580,7 +580,7 @@ class LocalizationManager(Node):
             "pre_global_wait_sec": 4.0,
             "lateral_recovery_enabled": True,
             "lateral_recovery_distance": 0.30,
-            "lateral_recovery_speed": 0.20,
+            "lateral_recovery_speed": 0.15,
             "lateral_footprint_half_x": 0.22,
             "lateral_footprint_half_y": 0.16,
             "self_mask_config_file": "",  # Same installed YAML as my_lidar.launch.py
@@ -3114,7 +3114,8 @@ class LocalizationManager(Node):
         nav = getattr(self, 'navigation_health', None)
         available = (available and nav is not None and nav.get('state') == 'ready'
                      and 0 <= now-self.navigation_health_at <= 3.)
-        action = managed.tick(now, blocked=blocked, available=available)
+        action = managed.tick(now, blocked=blocked, available=available,
+                              feedback_age_sec=self.recovery_feedback.sample_age(now))
         if action in ('cancel_pause','cancel_endpoint','cancel_failed','fail'):
             self._stop_managed_spin(managed.reason)
         if managed.phase == 'running':

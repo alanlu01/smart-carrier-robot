@@ -18,6 +18,7 @@ class RecoverySpin:
         self.blocked_since = self.clear_since = None
         self.tail_rate = 0.
         self.finishing = False
+        self.braking_reserve = math.radians(1.)
 
     @property
     def remaining(self):
@@ -36,7 +37,7 @@ class RecoverySpin:
         self.tail_rate = abs(rate)
         return True
 
-    def tick(self, now, *, blocked, available):
+    def tick(self, now, *, blocked, available, feedback_age_sec=0.):
         dt = max(0., now-self.last_tick)
         self.last_tick = now
         if self.phase == 'running':
@@ -60,12 +61,15 @@ class RecoverySpin:
         if self.blocked_since is not None and now-self.blocked_since >= .3:
             self.reason = 'near_obstacle'
             return 'cancel_pause'
-        # Predict only a small braking tail. Never send a reverse correction.
-        # Include smoother/fusion cancellation and measured braking tail.
-        reserve = max(math.radians(1.), min(math.radians(8.), self.tail_rate*.40))
-        if self.finishing:
-            reserve = math.radians(1.)
-        if self.remaining <= reserve:
+        # Account for held wheel velocity (currently about 2 Hz), the 5 Hz
+        # supervisor/cancel path and the configured Spin deceleration. This is
+        # an early-stop estimate, not a correction to measured odometry.
+        age = float(feedback_age_sec)
+        age = min(.65, max(0., age)) if math.isfinite(age) else .65
+        rate = self.tail_rate
+        reserve = rate*(.25+age) + rate*rate/(2.*.8)
+        self.braking_reserve = max(math.radians(1.), min(math.radians(30.), reserve))
+        if self.remaining <= self.braking_reserve:
             self.reason = 'endpoint_braking'
             return 'cancel_endpoint'
         return 'run'
@@ -93,16 +97,18 @@ class RecoverySpin:
         return 'wait'
 
     def speed_limit(self):
+        """Return a multiplier of the behavior server's configured 0.6 rad/s."""
         if self.phase != 'running':
             return 0.
         if self.finishing:
             return .25
-        if self.remaining < math.radians(12.):
-            return .45
-        return .65 if self.remaining < math.radians(45.) else 1.
+        if self.remaining < math.radians(20.):
+            return .35
+        return .65 if self.remaining < math.radians(60.) else 1.
 
     def snapshot(self, now):
         return dict(phase=self.phase, reason=self.reason, travel_deg=math.degrees(self.travel),
                     remaining_deg=math.degrees(self.remaining), resumes=self.resumes,
                     active_sec=self.active_elapsed, wait_sec=self.wait_elapsed,
-                    elapsed_sec=max(0., now-self.started), speed_limit=self.speed_limit())
+                    elapsed_sec=max(0., now-self.started), speed_limit=self.speed_limit(),
+                    braking_reserve_deg=math.degrees(self.braking_reserve))

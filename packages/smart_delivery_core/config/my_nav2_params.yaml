@@ -105,7 +105,7 @@ localization_manager:
     pre_global_wait_sec: 4.0
     lateral_recovery_enabled: true
     lateral_recovery_distance: 0.30
-    lateral_recovery_speed: 0.20
+    lateral_recovery_speed: 0.15
     lateral_footprint_half_x: 0.22
     lateral_footprint_half_y: 0.16
     local_recovery_wait_sec: 12.0
@@ -227,19 +227,20 @@ controller_server:
       time_steps: 20
       model_dt: 0.2 #0.05
       batch_size: 1000 #2000
-      ax_max: 3.0
-      ax_min: -3.0
-      ay_max: 3.0
-      ay_min: -3.0
-      az_max: 3.5
+      ax_max: 0.5
+      ax_min: -0.8
+      ay_max: 0.3
+      ay_min: -0.6
+      az_max: 1.2
       vx_std: 0.2
       vy_std: 0.05 #0.2
-      wz_std: 0.4
-      vx_max: 0.5
-      vx_min: -0.5
-      vy_max: 0.5
-      vy_min: -0.5
-      wz_max: 1.9
+      wz_std: 0.2
+      # Physical command gains are calibrated in STM32; limit motion here.
+      vx_max: 0.3
+      vx_min: -0.3
+      vy_max: 0.15
+      vy_min: -0.15
+      wz_max: 0.8
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.5
@@ -472,12 +473,11 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    # 0.35 rad/s caused the real chassis to miss a 360-degree goal's 35 s limit.
-    # Restore the previously calibrated sweep speed; fine heading restoration is
-    # damped separately by localization_manager.
-    max_rotational_vel: 1.0
+    # Revalidated after the STM32 command gains restored physical speed.
+    # Applies to localization and people-observation Spin actions.
+    max_rotational_vel: 0.6
     min_rotational_vel: 0.1 #0.4
-    rotational_acc_lim: 3.2
+    rotational_acc_lim: 0.8
 
 waypoint_follower:
   ros__parameters:
@@ -519,10 +519,10 @@ velocity_smoother:
     stamp_smoothed_velocity_with_smoothing_time: False
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.5, 0.5, 2.0]
-    min_velocity: [-0.5, -0.5, -2.0]
-    max_accel: [2.5, 2.5, 3.2]
-    max_decel: [-2.5, -2.5, -3.2]
+    max_velocity: [0.3, 0.15, 0.8]
+    min_velocity: [-0.3, -0.15, -0.8]
+    max_accel: [0.5, 0.3, 1.2]
+    max_decel: [-0.8, -0.6, -1.5]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
