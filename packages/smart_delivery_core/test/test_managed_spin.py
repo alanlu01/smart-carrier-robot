@@ -15,7 +15,8 @@ def prepare_turn(node, clock):
     node.latest_odom_stamp_ns=int(clock.now*1e9)
     node.last_motion_command_at=node.last_odom_motion_at=clock.now-2.
     node.get_clock=lambda:NS(now=lambda:NS(nanoseconds=int(clock.now*1e9)))
-    node.recovery_feedback=NS(last_complete_at=clock.now,is_stale=lambda *_:False)
+    node.recovery_feedback=NS(last_complete_at=clock.now,is_stale=lambda *_:False,
+                              sample_age=lambda *_:0.)
     node._heading_restore_command=lambda **_:None
     node._recovery_spin_clear=lambda _:True
     node._lateral_sensor_blockers=lambda _:[]
