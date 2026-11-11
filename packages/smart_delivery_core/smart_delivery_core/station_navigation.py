@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from nav2_simple_commander.robot_navigator import TaskResult
 from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -40,6 +40,7 @@ class StationNavigation:
         self.grid_error = ''
         self.preflight_wait_sec = 30.
         self.last_plan = None
+        self.chassis_command,self.chassis_command_at=None,-math.inf
         self.static_grid = None
         navigator.create_subscription(NavPath,'/plan',self._plan,1)
         navigator.create_subscription(OccupancyGrid,'/map',self._map,
@@ -48,6 +49,7 @@ class StationNavigation:
         navigator.create_subscription(OccupancyGrid,'/global_costmap/costmap',self._grid,
             QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         shared_inputs(navigator).subscribe(Odometry,'/odom',self._odom,10)
+        shared_inputs(navigator).subscribe(Twist,'/chassis_cmd_vel',self._chassis_command,1)
 
     def _plan(self, message):
         self.last_plan = time.monotonic(),message
@@ -68,6 +70,13 @@ class StationNavigation:
 
     def _odom(self, message):
         self.odom,self.odom_at = message,time.monotonic()
+
+    def _chassis_command(self, message):
+        now=time.monotonic();rate=message.angular.z
+        if self.phase=='aligning' and (now-self.chassis_command_at>.3
+                or not math.isfinite(rate) or rate*getattr(self,'align_sign',0.)<.12):
+            self.align_progress_at=now
+        self.chassis_command,self.chassis_command_at=rate,now
 
     def _fresh(self, receipt, stamp_ns, limit):
         age = (self.nav.get_clock().now().nanoseconds-stamp_ns)/1e9
@@ -420,6 +429,13 @@ class StationNavigation:
         if not self._fresh(self.odom_at,ns,.4):
             self.failure,self.data_unavailable='對正輪速資料過期',True
             self.cancelTask();return False
+        # No-progress is a chassis symptom only with continuous effective
+        # FINAL commands. Yielding/near-stop/expired command streams must not
+        # permanently block parking as if the actuator had stalled.
+        if (self.chassis_command is None or time.monotonic()-self.chassis_command_at>.3
+                or not math.isfinite(self.chassis_command)
+                or self.chassis_command*self.align_sign<.12):
+            self.align_progress_at=time.monotonic();return False
         progress=self.align_sign*angle_error(heading,self.align_odom_anchor)
         if progress-self.align_progress>=math.radians(.5):
             self.align_progress,self.align_progress_at=progress,time.monotonic()

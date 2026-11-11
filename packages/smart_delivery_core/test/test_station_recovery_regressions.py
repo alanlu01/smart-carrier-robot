@@ -3,7 +3,7 @@ import math
 from types import SimpleNamespace as NS
 import pytest
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_simple_commander.robot_navigator import TaskResult
 from test_station_navigation import motion,tick,finish_action,grid,obstacle
 from test_localization_recovery import manager
@@ -56,13 +56,31 @@ def test_rotation_stall_cancels_native_action_then_drains(motion):
     m.odom=Odometry();m.odom.pose.pose.orientation.w=1.
     m.odom.header.stamp.sec=int(c[0]);m.odom_at=c[0]
     tick(m,c);assert m.phase=='aligning'
-    c[0]+=2.6;m.odom.header.stamp.sec=int(c[0]);m.odom.header.stamp.nanosec=round((c[0]%1)*1e9);m.odom_at=c[0]
-    assert not m.isTaskComplete() and m.motion_stalled and n.cancels==1
+    command=Twist();command.angular.z=.20  # Positive target correction.
+    for _ in range(15):
+        c[0]+=.2;m.odom.header.stamp.sec=int(c[0]);m.odom.header.stamp.nanosec=round((c[0]%1)*1e9);m.odom_at=c[0]
+        m._chassis_command(command)
+        assert not m.isTaskComplete()
+        if m.motion_stalled:break
+    assert m.motion_stalled and n.cancels==1
     n.complete=True;n.result=TaskResult.CANCELED
     assert m.isTaskComplete() and m.getResult()==TaskResult.FAILED
     retry=StandbyRetryPolicy();retry.block_motion()
     assert not retry.can_attempt(c[0]+100.) and retry.status(c[0])=='blocked'
     retry.reset();assert retry.can_attempt(c[0])
+
+
+@pytest.mark.parametrize('command',[0.,.09])
+def test_safety_zero_or_reduced_final_command_does_not_claim_rotation_stall(motion,command):
+    m,n,c,p,_,_=motion;m.mode='station';tick(m,c)
+    p[0]=(*n.sent[-1][0][:2],-.125);n.complete=True
+    m.odom=Odometry();m.odom.pose.pose.orientation.w=1.
+    tick(m,c);assert m.phase=='aligning'
+    value=Twist();value.angular.z=command
+    for _ in range(20):
+        c[0]+=.2;m.odom.header.stamp.sec=int(c[0]);m.odom.header.stamp.nanosec=round((c[0]%1)*1e9);m.odom_at=c[0]
+        m._chassis_command(value);assert not m.isTaskComplete()
+    assert not m.motion_stalled and n.cancels==0
 
 
 @pytest.mark.parametrize('remaining',[3.1,5.1,8.8,19.])
