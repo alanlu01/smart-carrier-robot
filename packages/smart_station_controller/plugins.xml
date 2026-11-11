@@ -1,0 +1,5 @@
+<library path="station_controller">
+  <class type="smart_station_controller::StationMPPI" base_class_type="nav2_core::Controller">
+    <description>Station-only MPPI with a continuous goal-distance speed envelope.</description>
+  </class>
+</library>

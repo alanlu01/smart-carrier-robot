@@ -563,9 +563,9 @@ def go_to_standby(
         on_outcome(closest_standby, "interrupted_by_localization")
         return None
     if result != TaskResult.SUCCEEDED:
-        if motion is not navigator and motion.preflight_timeout:
-            on_outcome(closest_standby, "waiting_data")
-            navigator.get_logger().info("⏳ 待機導航尚未送出，等待資料恢復")
+        if motion is not navigator and (motion.preflight_timeout or getattr(motion,'clearance_timeout',False)):
+            on_outcome(closest_standby, "waiting_clearance" if getattr(motion,'clearance_timeout',False) else "waiting_data")
+            navigator.get_logger().info("⏳ 待機導航暫緩，等待資料或通道恢復")
             return None
         if result == TaskResult.CANCELED:
             on_outcome(closest_standby, "interrupted_by_navigation")
@@ -767,7 +767,7 @@ def _run_delivery(runtime_holder):
     def report_standby(point, state):
         nonlocal last_standby_status_at, last_standby_status
         now = time.monotonic()
-        waiting_data = state == "waiting_data"
+        waiting_data = state in ("waiting_data", "waiting_clearance")
         if waiting_data:
             standby_retry.waiting_data(now)
             state = standby_retry.status(now)

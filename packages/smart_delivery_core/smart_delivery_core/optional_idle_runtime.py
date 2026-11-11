@@ -1145,8 +1145,9 @@ class OptionalIdleRuntime:
         self.navigation_active(False)
         self.motion = False
         succeeded = (not self.cancel_requested and motion.getResult() == TaskResult.SUCCEEDED)
-        station_preflight_timeout = (self.station_managed and motion.goals_submitted==0
-            and (motion.preflight_timeout or self.interrupt_reason=='observation_or_navigation_timeout'))
+        station_preflight_timeout = (self.station_managed and
+            (getattr(motion,'clearance_timeout',False) or (motion.goals_submitted==0
+             and (motion.preflight_timeout or self.interrupt_reason=='observation_or_navigation_timeout'))))
         self.station_managed = False
         if not succeeded:
             self.settling_after_cancel = True
@@ -1154,8 +1155,8 @@ class OptionalIdleRuntime:
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
             elif self.state == 'going_people_standby' and station_preflight_timeout:
-                # No accepted route existed. Keep the selected parking point
-                # and its original total deadline, not a failed-nav budget.
+                # Waiting for fresh data or a temporarily blocked station is
+                # not another failed route. Preserve the point and total deadline.
                 self.parking_attempts = max(0,self.parking_attempts-1)
                 self.parking_retry.waiting_data(time.monotonic())
                 self.state,self.reason = 'people_parking_retry_wait','station_preflight_data_timeout'

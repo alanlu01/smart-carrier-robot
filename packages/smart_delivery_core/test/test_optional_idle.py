@@ -161,7 +161,8 @@ def test_disabled_optional_features_still_load_station_profiles_without_changing
         path = Path(folder)/'disabled.yaml'
         path.write_text(yaml.safe_dump(config))
         original = ROOT/'config/my_nav2_params.yaml'
-        context.launch_configurations.update(params_file=str(original), optional_idle_config=str(path))
+        context.launch_configurations.update(params_file=str(original), optional_idle_config=str(path),
+            behavior_tree=str(ROOT/'behavior_trees/smart_delivery_navigate.xml'))
         generated = Path(OptionalNavParameters().perform(context))
         try:
             actual = yaml.safe_load(generated.read_text())
@@ -170,6 +171,11 @@ def test_disabled_optional_features_still_load_station_profiles_without_changing
             assert 'StationY' in actual['controller_server']['ros__parameters']['controller_plugins']
             assert actual['collision_monitor']['ros__parameters']['NearFootprintStop']['type']=='velocity_polygon'
             assert 'home_goal_checker' not in actual['controller_server']['ros__parameters']['goal_checker_plugins']
+            from xml.etree import ElementTree
+            through=Path(actual['bt_navigator']['ros__parameters']['default_nav_through_poses_bt_xml'])
+            assert all(n.get('goal_checker_id')=='general_goal_checker'
+                for n in ElementTree.parse(through).findall('.//FollowPath'))
+            through.unlink()
         finally:
             generated.unlink()
 
@@ -196,7 +202,8 @@ def test_optional_bt_ports_match_installed_jazzy_manifest():
     if not manifest.exists():
         pytest.skip('Requires the actual Jazzy behavior-tree manifest')
     descriptions = ElementTree.parse(manifest).getroot()
-    for name in ('smart_home_navigate.xml', 'people_observe.xml', 'smart_delivery_navigate.xml'):
+    for name in ('smart_home_navigate.xml', 'people_observe.xml', 'smart_delivery_navigate.xml',
+                 'station_x.xml','station_y.xml','station_exit_x.xml','station_exit_y.xml','station_align.xml'):
         for node in ElementTree.parse(ROOT / 'behavior_trees' / name).iter():
             if node.tag in {'Spin', 'FollowPath', 'Wait', 'ComputePathToPose'}:
                 description = descriptions.find(f".//*[@ID='{node.tag}']")

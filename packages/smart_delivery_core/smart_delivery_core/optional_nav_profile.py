@@ -26,12 +26,9 @@ class OptionalNavParameters(Substitution):
             map_path = LaunchConfiguration('map').perform(context)
             if hashlib.sha256(Path(map_path).read_bytes()).hexdigest() != config['map']['yaml_sha256']:
                 raise ValueError('Optional poses are not verified for the selected map YAML')
-        if not config['home']['enabled']:
-            descriptor, path = tempfile.mkstemp(prefix='robot_station_', suffix='.yaml')
-            with os.fdopen(descriptor, 'w') as file:
-                yaml.safe_dump(parameters, file, allow_unicode=True)
-            return path
-        parameters = home_nav_parameters(parameters, config)
+        if config['home']['enabled']:
+            parameters = home_nav_parameters(parameters, config)
+        # Station alignment also adds a checker even when home is disabled.
         # Multiple goal checkers require an explicit normal checker. Do not
         # silently change a user-supplied normal tree to use the home tolerance.
         normal = ElementTree.parse(LaunchConfiguration('behavior_tree').perform(context))

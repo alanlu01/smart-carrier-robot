@@ -33,16 +33,31 @@ def station_parameters(source):
     station['TwirlingCritic']['cost_weight'] = 10.
     station['ConstraintCritic']['cost_weight'] = 10.
     for axis in ('X','Y'):
-        for slow in (False,True):
+        for departure in (False,True):
             profile = deepcopy(station)
-            cap,cross = (.06,.02) if slow else (.15,.04)
+            cap,cross = .15,.04
             main = math.sqrt(cap*cap-cross*cross)
             vx,vy = (main,cross) if axis=='X' else (cross,main)
             profile.update(vx_max=vx,vx_min=-vx,vy_max=vy,vy_min=-vy)
-            name = 'Station'+axis+('Slow' if slow else '')
+            name = 'Station'+('Exit' if departure else '')+axis
+            if not departure:
+                profile['plugin'] = 'smart_station_controller::StationMPPI'
+                profile['station'] = dict(maximum_speed=.15,slow_speed=.06,
+                                          slow_distance=.20,ramp_distance=.40)
             controller[name] = profile
             if name not in controller['controller_plugins']:
                 controller['controller_plugins'].append(name)
+
+    align = deepcopy(station)
+    align.update(vx_max=.02,vx_min=-.02,vy_max=.02,vy_min=-.02,wz_max=.10,
+                 vx_std=.02,vy_std=.02,wz_std=.04,az_max=.25)
+    controller['StationAlign'] = align
+    if 'StationAlign' not in controller['controller_plugins']:
+        controller['controller_plugins'].append('StationAlign')
+    controller['station_alignment_checker'] = dict(plugin='nav2_controller::SimpleGoalChecker',
+        xy_goal_tolerance=.05,yaw_goal_tolerance=.025,stateful=False)
+    if 'station_alignment_checker' not in controller['goal_checker_plugins']:
+        controller['goal_checker_plugins'].append('station_alignment_checker')
 
     # Selecting one polygon is native CollisionMonitor work. Only its selected
     # outline is checked against scans; this is not 73 separate scan consumers.

@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>smart_station_controller</name><version>0.1.0</version>
+  <description>Goal-distance speed envelope for station-only MPPI controllers.</description>
+  <maintainer email="kj0921@todo.todo">kj0921</maintainer><license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>nav2_core</depend><depend>nav2_mppi_controller</depend>
+  <depend>nav2_costmap_2d</depend><depend>pluginlib</depend>
+  <depend>rclcpp</depend><depend>rclcpp_lifecycle</depend>
+  <depend>tf2_geometry_msgs</depend><depend>std_msgs</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
