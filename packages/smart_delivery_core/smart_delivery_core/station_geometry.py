@@ -28,23 +28,39 @@ class StationGrid:
         c, s = math.cos(self.yaw), math.sin(self.yaw)
         gx, gy = c*(x-self.x)+s*(y-self.y), -s*(x-self.x)+c*(y-self.y)
         radius = math.hypot(.25, .19)
-        half_cell = self.resolution*math.sqrt(2)/2
-        extent = radius+half_cell
-        lo_x, hi_x = math.floor((gx-extent)/self.resolution), math.floor((gx+extent)/self.resolution)
-        lo_y, hi_y = math.floor((gy-extent)/self.resolution), math.floor((gy+extent)/self.resolution)
+        half_cell = self.resolution/2
+        c, s = math.cos(yaw-self.yaw), math.sin(yaw-self.yaw)
+        ac, ass = abs(c), abs(s)
+        extent_x = radius if rotation else .25*ac+.19*ass
+        extent_y = radius if rotation else .25*ass+.19*ac
+        lo_x, hi_x = math.floor((gx-extent_x)/self.resolution-1e-9), math.floor((gx+extent_x)/self.resolution+1e-9)
+        lo_y, hi_y = math.floor((gy-extent_y)/self.resolution-1e-9), math.floor((gy+extent_y)/self.resolution+1e-9)
         if lo_x < 0 or lo_y < 0 or hi_x >= self.width or hi_y >= self.height:
             return False
-        c, s = math.cos(yaw-self.yaw), math.sin(yaw-self.yaw)
         for row in range(lo_y, hi_y+1):
             for col in range(lo_x, hi_x+1):
-                dx, dy = (col+.5)*self.resolution-gx, (row+.5)*self.resolution-gy
-                inside = (math.hypot(dx,dy) <= radius+half_cell if rotation else
-                          abs(c*dx+s*dy) <= .25+half_cell and abs(-s*dx+c*dy) <= .19+half_cell)
                 value = self.data[row*self.width+col]
                 # In nav_msgs/OccupancyGrid the lethal cost is 100. Inscribed
                 # inflation (99) is not a physical wall; full-body checks below
                 # and MPPI retain footprint collision and inflation penalties.
-                if inside and (value < 0 or value >= 100):
+                if 0 <= value < 100:
+                    continue
+                dx, dy = (col+.5)*self.resolution-gx, (row+.5)*self.resolution-gy
+                if rotation:
+                    # Distance to the square itself, not its circumscribed
+                    # circle. Preserve the complete rotational body sweep.
+                    inside = (max(abs(dx)-half_cell,0.)**2
+                              + max(abs(dy)-half_cell,0.)**2 <= radius**2+1e-12)
+                else:
+                    # Separating axes for an oriented body and axis-aligned
+                    # cell: both grid axes AND both body axes must overlap.
+                    # Using the cell half-diagonal on each axis falsely blocked
+                    # the recorded (-3,5) station despite >3 cm clearance.
+                    inside = (abs(dx) <= extent_x+half_cell+1e-12
+                              and abs(dy) <= extent_y+half_cell+1e-12
+                              and abs(c*dx+s*dy) <= .25+half_cell*(ac+ass)+1e-12
+                              and abs(-s*dx+c*dy) <= .19+half_cell*(ac+ass)+1e-12)
+                if inside:
                     return False
         return True
 

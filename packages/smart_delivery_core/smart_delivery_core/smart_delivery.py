@@ -514,8 +514,9 @@ def go_to_standby(
             motion.start(goal_pose, lambda: localization_is_ready() and not new_task_waiting()
                          and not optional_interrupt_requested())
         while not motion.isTaskComplete():
-            time.sleep(0.1)  # 釋放 CPU
-            rclpy.spin_once(navigator, timeout_sec=0.05)
+            if motion is navigator:
+                time.sleep(0.1)  # Legacy navigator path retains its native action pump.
+                rclpy.spin_once(navigator, timeout_sec=0.05)
             if optional_interrupt_requested():
                 motion.cancelTask()
                 while not motion.isTaskComplete():
@@ -562,6 +563,10 @@ def go_to_standby(
         on_outcome(closest_standby, "interrupted_by_localization")
         return None
     if result != TaskResult.SUCCEEDED:
+        if motion is not navigator and motion.preflight_timeout:
+            on_outcome(closest_standby, "waiting_data")
+            navigator.get_logger().info("⏳ 待機導航尚未送出，等待資料恢復")
+            return None
         if result == TaskResult.CANCELED:
             on_outcome(closest_standby, "interrupted_by_navigation")
             navigator.get_logger().info("⏸️ 停靠導航非預期中斷，尚未停妥")
@@ -762,6 +767,10 @@ def _run_delivery(runtime_holder):
     def report_standby(point, state):
         nonlocal last_standby_status_at, last_standby_status
         now = time.monotonic()
+        waiting_data = state == "waiting_data"
+        if waiting_data:
+            standby_retry.waiting_data(now)
+            state = standby_retry.status(now)
         if state == "failed":
             standby_retry.failed(now)
             state = standby_retry.status(now)
@@ -1654,8 +1663,6 @@ def _run_delivery(runtime_holder):
         cancel_sent = False
         localization_aborted = False
         while not motion.isTaskComplete():
-            time.sleep(0.1)
-            rclpy.spin_once(navigator, timeout_sec=0.05)
             if active_task_id in cancellation_requests and not cancel_sent:
                 motion.cancelTask()
                 cancel_sent = True
@@ -1741,9 +1748,11 @@ def _run_delivery(runtime_holder):
             keep_pending = True
         elif nav_result != TaskResult.SUCCEEDED:
             note = (
-                "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else "Nav2 goal failed"
+                "Nav2 goal cancelled" if nav_result == TaskResult.CANCELED else
+                "進出站前置檢查失敗（尚未送出導航）" if motion.goals_submitted == 0 else
+                "Nav2 goal failed"
             )
-            transient = (nav_result == TaskResult.FAILED and (
+            transient = (nav_result == TaskResult.FAILED and motion.goals_submitted > 0 and (
                 motion.data_unavailable
                 or transient_tf_failure(nav_error_code, nav_error_msg)
                 or (nav_error_code == 0 and recent_tf_failure)

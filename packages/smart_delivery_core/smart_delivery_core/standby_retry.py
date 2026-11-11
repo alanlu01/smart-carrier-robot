@@ -49,6 +49,10 @@ class StandbyRetryPolicy:
         self.failures += 1
         self.retry_at = float(now) + self.retry_delay * 2 ** (self.attempts - 1)
 
+    def waiting_data(self, now):
+        """Back off before a goal exists without charging a navigation failure."""
+        self.retry_at = max(self.retry_at,float(now)+self.retry_delay)
+
     def can_attempt(self, now):
         """Return permission without sleeping or claiming the robot is parked."""
         return self.attempts < self.max_attempts and now >= self.retry_at

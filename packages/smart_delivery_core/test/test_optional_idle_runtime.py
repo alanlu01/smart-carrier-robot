@@ -38,6 +38,25 @@ def test_selected_standby_and_departure_use_the_shared_station_owner(runtime):
     assert not manager.station_managed and len(navigator.sent)==1
 
 
+@pytest.mark.parametrize('outer_deadline',[False,True])
+def test_selected_parking_input_timeout_keeps_target_deadline_and_navigation_budget(runtime,outer_deadline):
+    manager,navigator,moment=runtime
+    manager._safe=lambda:True
+    point=manager.config['people']['standby_points'][0]
+    adapter=SimpleNamespace(start=lambda *a,**k:None,preflight_timeout=not outer_deadline,
+        goals_submitted=0,isTaskComplete=lambda:True,getResult=lambda:TaskResult.FAILED,cancelled=False)
+    adapter.cancelTask=lambda:setattr(adapter,'cancelled',True)
+    navigator.station_navigation=adapter
+    assert manager._start(point,'going_people_standby','',60.)
+    manager.selected_standby=dict(point);manager.parking_attempts=1
+    manager.parking_deadline=220.
+    if outer_deadline:manager.deadline=moment[0]-1.
+    manager.poll(False)
+    assert manager.state=='people_parking_retry_wait'
+    assert manager.parking_attempts==0 and manager.parking_retry.attempts==0
+    assert manager.selected_standby==point and manager.parking_deadline==220.
+
+
 def test_data_waits_keep_localization_budget_and_original_deadline(runtime):
     manager,navigator,moment=runtime
     manager.observation_session_deadline=120.

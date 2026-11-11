@@ -39,6 +39,7 @@ def reason_label(reason):
         'localization_suspect':'等待定位恢復','observation_wait_unsafe':'安全條件尚未恢復',
         'people_localization_wait_timeout':'等待定位／感測恢復逾時',
         'selected_standby_safety_pause':'等待定位／感測恢復',
+        'station_preflight_data_timeout':'等待進出站資料，尚未送出導航',
         'selected_standby_recovery_timeout':'等待停靠恢復逾時',
         'insufficient_rotation_coverage':'旋轉覆蓋不足','nav2_failed':'導航未完成',
         'goal_rejected':'導航目標被拒絕','waiting_fresh_safety_data':'等待新鮮定位資料',

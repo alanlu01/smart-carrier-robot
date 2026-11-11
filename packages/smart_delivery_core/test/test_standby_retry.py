@@ -6,6 +6,15 @@ from smart_delivery_core.standby_retry import StandbyRetryPolicy
 POINT = {'name': 'seat', 'x': 1.2, 'y': -5.0, 'yaw': 0.0}
 
 
+def test_waiting_for_inputs_backs_off_without_spending_navigation_attempts():
+    policy=StandbyRetryPolicy();policy.select_goal(POINT)
+    policy.waiting_data(100.)
+    assert policy.attempts==0 and policy.status(105.)=='retry_wait'
+    assert policy.can_attempt(110.)
+    policy.failed(110.);policy.waiting_data(112.)
+    assert policy.attempts==1 and policy.retry_at>=122.
+
+
 def test_three_attempts_have_ten_and_twenty_second_backoff():
     policy = StandbyRetryPolicy()
     policy.select_goal(POINT)

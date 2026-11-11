@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from nav2_simple_commander.robot_navigator import TaskResult
 from power_monitor.power_status import build_slot, payload_to_slots
 from smart_delivery_core.smart_delivery import (
@@ -51,6 +52,17 @@ class _CompletedNavigator:
 @pytest.fixture(autouse=True)
 def standby_executor(monkeypatch):
     monkeypatch.setattr('smart_delivery_core.smart_delivery.rclpy.spin_once',lambda *_args,**_kwargs:None)
+
+
+def test_standby_input_timeout_is_reported_as_waiting_not_failed_navigation():
+    node=_CompletedNavigator(TaskResult.FAILED)
+    node.station_navigation=SimpleNamespace(start=lambda *_:None,isTaskComplete=lambda:True,
+        getResult=lambda:TaskResult.FAILED,preflight_timeout=True)
+    outcomes=[];lease=[]
+    assert go_to_standby(node,dict(x=0.,y=0.),
+        on_outcome=lambda point,state:outcomes.append(state),set_navigation_active=lease.append) is None
+    assert outcomes==['approaching','waiting_data']
+    assert node.goal is None and lease==[True,False]
 
 
 def test_standby_only_reports_arrival_after_nav2_success():

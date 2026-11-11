@@ -10,6 +10,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from nav2_simple_commander.robot_navigator import TaskResult
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.time import Time
+from rclpy.task import Future
 from std_msgs.msg import String
 from tf2_ros import TransformException
 
@@ -34,6 +35,10 @@ class StationNavigation:
         self.stage,self.stop_since = None,None
         self.active_goal = False
         self.last_report = None
+        self.last_wait_publish = self.last_console_at = -math.inf
+        self.grid_gate,self.pose_gate,self.odom_gate = {},{},{}
+        self.grid_error = ''
+        self.preflight_wait_sec = 30.
         self.publisher = navigator.create_publisher(String,'/delivery/station_state',10)
         navigator.create_subscription(OccupancyGrid,'/global_costmap/costmap',self._grid,
             QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -44,8 +49,10 @@ class StationNavigation:
             self.grid = StationGrid(message) if message.header.frame_id=='map' else None
             self.grid_at = time.monotonic()
             self.grid_stamp = message.header.stamp.sec*10**9+message.header.stamp.nanosec
-        except (ValueError,AttributeError):
+            self.grid_error = '' if self.grid is not None else 'frame_not_map'
+        except (ValueError,AttributeError) as exc:
             self.grid = None
+            self.grid_error = str(exc)
 
     def _odom(self, message):
         self.odom,self.odom_at = message,time.monotonic()
@@ -54,40 +61,104 @@ class StationNavigation:
         age = (self.nav.get_clock().now().nanoseconds-stamp_ns)/1e9
         return time.monotonic()-receipt <= limit and -.1 <= age <= limit
 
+    def _ages(self, receipt, stamp_ns, limit):
+        receipt_age = time.monotonic()-receipt
+        source_age = (self.nav.get_clock().now().nanoseconds-stamp_ns)/1e9
+        return dict(receipt_age_sec=round(receipt_age,4) if math.isfinite(receipt_age) else None,
+                    source_age_sec=round(source_age,4) if stamp_ns>0 else None,
+                    max_age_sec=limit)
+
     def _pose(self):
         try:
             tr = self.buffer.lookup_transform('map','base_footprint',Time())
             ns = tr.header.stamp.sec*10**9+tr.header.stamp.nanosec
+            age = self._ages(time.monotonic(),ns,1.)
+            age.pop('receipt_age_sec')  # Buffer lookup does not expose receipt time.
+            self.pose_gate = dict(available=True,receipt_age_observed=False,**age)
             if not self._fresh(time.monotonic(),ns,1.): return None
             p,q = tr.transform.translation,tr.transform.rotation
             pose = (p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
-            return pose if all(math.isfinite(v) for v in pose) else None
-        except TransformException:
+            self.pose_gate['finite'] = all(math.isfinite(v) for v in pose)
+            return pose if self.pose_gate['finite'] else None
+        except TransformException as exc:
+            self.pose_gate = dict(available=False,error=str(exc)[:250])
             return None
 
     def _stopped(self):
-        if self.odom is None: return False
+        if self.odom is None:
+            self.odom_gate = dict(available=False)
+            return False
         stamp = self.odom.header.stamp
-        if not self._fresh(self.odom_at,stamp.sec*10**9+stamp.nanosec,.4): return False
+        ns = stamp.sec*10**9+stamp.nanosec
+        self.odom_gate = dict(available=True,**self._ages(self.odom_at,ns,.4))
+        if not self._fresh(self.odom_at,ns,.4):
+            self.odom_gate['fresh'] = False
+            return False
         v = self.odom.twist.twist
+        finite = all(math.isfinite(value) for value in (v.linear.x,v.linear.y,v.angular.z))
+        self.odom_gate.update(fresh=True,finite=finite)
+        if not finite: return False
+        self.odom_gate.update(linear_speed_mps=round(math.hypot(v.linear.x,v.linear.y),4),
+                              angular_speed_rad_s=round(v.angular.z,4))
         return (math.hypot(v.linear.x,v.linear.y) <= .02 and abs(v.angular.z) <= .03)
 
     def _data(self):
+        self.grid_gate = dict(available=self.grid is not None,error=self.grid_error,
+                              **self._ages(self.grid_at,self.grid_stamp,2.5))
         return self.grid is not None and self._fresh(self.grid_at,self.grid_stamp,2.5)
 
-    def _report(self, phase, reason=''):
+    def _report(self, phase, reason='', *, force=False):
         self.phase = phase
-        if (phase,reason)==self.last_report: return
+        transition = self.last_report is None or self.last_report[0]!=phase
+        same = (phase,reason)==self.last_report
+        if same and not force: return
         self.last_report = phase,reason
         labels = {'waiting_data':'⏳ 進出站等待資料','departure':'↔️ 低速出站',
             'staging':'➡️ 前往進站準備點','entry':'↔️ 低速進站','endpoint':'🐢 末段停靠',
             'settling':'⏳ 確認停妥','arrived':'✅ 停靠完成','failed':'⚠️ 進出站中止',
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
-        self.nav.get_logger().info(labels.get(phase,phase)+(f'：{reason}' if reason else ''))
+        if transition or time.monotonic()-self.last_console_at>=5.:
+            self.nav.get_logger().info(labels.get(phase,phase)+(f'：{reason}' if reason else ''))
+            self.last_console_at = time.monotonic()
         import json
         self.publisher.publish(String(data=json.dumps(dict(phase=phase,reason=reason,
             target=getattr(self,'target',None),stage=self.stage,
+            goals_submitted=getattr(self,'goals_submitted',0),
+            preflight_timeout=getattr(self,'preflight_timeout',False),
+            inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
+            wait_blockers=getattr(self,'wait_blockers',[]),
+            deadline_remaining_sec=round(max(0.,getattr(self,'deadline',0.)-time.monotonic()),2),
             stamp_ns=self.nav.get_clock().now().nanoseconds),ensure_ascii=False)))
+
+    def _waiting(self, pose, data_ok, stopped, *, position_ok=True):
+        blockers = []
+        if not data_ok: blockers.append('costmap_missing' if self.grid is None else 'costmap_stale')
+        if pose is None: blockers.append('tf_missing_or_stale')
+        if not stopped:
+            blockers.append('odom_missing' if self.odom is None else
+                            'odom_stale' if self.odom_gate.get('fresh') is False else
+                            'odom_invalid' if self.odom_gate.get('finite') is False else 'vehicle_not_stopped')
+        if not position_ok: blockers.append('stage_pose_pending')
+        self.wait_blockers = blockers or ['continuous_stopped_confirmation']
+        if time.monotonic()-self.last_wait_publish<1.: return
+        self.last_wait_publish = time.monotonic()
+        labels = {'costmap_missing':'等待代價地圖','costmap_stale':'等待代價地圖更新',
+                  'tf_missing_or_stale':'等待車輛座標更新','odom_missing':'等待里程計',
+                  'odom_stale':'等待里程計更新','vehicle_not_stopped':'等待車輛停妥',
+                  'odom_invalid':'等待有效里程計',
+                  'stage_pose_pending':'等待實際位置確認',
+                  'continuous_stopped_confirmation':'確認連續停妥'}
+        self._report(self.phase,'、'.join(labels[b] for b in self.wait_blockers),force=True)
+
+    def _pump_callbacks(self):
+        # spin_once executes ONE callback, even with a nonzero timeout. Drain
+        # inputs/timers for a bounded interval instead, like BasicNavigator's
+        # native action wait. No new executor/thread and no polling sleep.
+        pending = Future()
+        try:
+            rclpy.spin_until_future_complete(self.nav,pending,timeout_sec=.10)
+        finally:
+            pending.cancel()
 
     def start(self, goal, permitted=lambda:True, *, park=True, behavior_tree=''):
         if self.running: raise RuntimeError('station navigation still owns an action')
@@ -98,10 +169,14 @@ class StationNavigation:
         self.running,self.cancelled,self.active_goal = True,False,False
         self.result,self.stage,self.stop_since = TaskResult.UNKNOWN,None,None
         self.failure = ''
+        self.preflight_timeout = False
+        self.goals_submitted = 0
+        self.wait_blockers = []
+        self.last_wait_publish = -math.inf
         self.data_unavailable = False
         self.translation_start = None
         self.native_error = (0,'')
-        self.after_stop,self.start_at,self.deadline = 'prepare',time.monotonic(),time.monotonic()+6.
+        self.after_stop,self.start_at,self.deadline = 'prepare',time.monotonic(),time.monotonic()+self.preflight_wait_sec
         self._report('waiting_data')
 
     def _pose_message(self, point):
@@ -120,6 +195,7 @@ class StationNavigation:
         self.native_error = (0,'')
         self.stop_since = None
         self.deadline = time.monotonic()+(25. if phase in ('departure','entry','endpoint') else 180.)
+        self.goals_submitted += 1
         self._report(phase)
         accepted = self.nav.goToPose(self._pose_message(point),behavior_tree=tree)
         self.active_goal = accepted is not False
@@ -206,15 +282,23 @@ class StationNavigation:
 
     def isTaskComplete(self):
         if not self.running: return True
+        # Process queued sensor and cancellation callbacks BEFORE evaluating
+        # freshness. The production caller has many more inputs than a fake
+        # three-topic fixture and must never age its own queued messages.
+        completed = self.nav.isTaskComplete() if self.active_goal else None
+        if not self.active_goal: self._pump_callbacks()
+        if not self.running: return True
+        pose,data_ok = self._pose(),self._data()
         # Pump native actions even when cancelling; do not release the mission
         # lease or submit a successor until the server reports a terminal state.
         if not self.cancelled and time.monotonic()>self.deadline:
-            self.failure = '階段逾時，未確認停妥'
-            self.data_unavailable = not self._data() or self._pose() is None
+            self.preflight_timeout = self.goals_submitted==0 and self.phase=='waiting_data'
+            self.failure = ('導航前置確認逾時，尚未送出目標' if self.preflight_timeout
+                            else '階段逾時，未確認停妥')
+            self.data_unavailable = not data_ok or pose is None
             self.cancelTask()
         if self.active_goal and self.phase in ('departure','entry','endpoint') and not self.cancelled:
-            pose = self._pose()
-            if pose is None or not self._data():
+            if pose is None or not data_ok:
                 self.failure,self.data_unavailable = '平移資料逾時',True
                 self.cancelTask()
             elif abs(angle_error(pose[2],self.stage[2]))>.20:
@@ -232,7 +316,7 @@ class StationNavigation:
         if not self.cancelled and not self.permitted():
             self.cancelTask()
         if self.active_goal:
-            if not self.nav.isTaskComplete():
+            if not completed:
                 return False
             self.active_goal = False
             result = self.nav.getResult()
@@ -249,16 +333,15 @@ class StationNavigation:
             self.after_stop,self.stop_since = self.next_phase,None
             self.deadline = time.monotonic()+6.
             self._report('settling')
-        rclpy.spin_once(self.nav,timeout_sec=.01)
         if self.cancelled or not self.permitted():
             self._finish(TaskResult.FAILED if self.failure else TaskResult.CANCELED,
                          'failed' if self.failure else 'cancelled',self.failure); return True
-        pose = self._pose()
-        if pose is None or not self._data(): return False
-        if not self._stopped():
-            self.stop_since = None; return False
-        if self.stage is not None and (math.hypot(pose[0]-self.stage[0],pose[1]-self.stage[1])>.10
-                or abs(angle_error(pose[2],self.stage[2]))>.10):
+        stopped = self._stopped()
+        position_ok = self.stage is None or (pose is not None
+            and math.hypot(pose[0]-self.stage[0],pose[1]-self.stage[1])<=.10
+            and abs(angle_error(pose[2],self.stage[2]))<=.10)
+        self._waiting(pose,data_ok,stopped,position_ok=position_ok)
+        if pose is None or not data_ok or not stopped or not position_ok:
             # Action results and TF are separate DDS streams. Wait inside the
             # bounded settling phase rather than treating their arrival order
             # as physical failure (or accepting an old pose as arrival).

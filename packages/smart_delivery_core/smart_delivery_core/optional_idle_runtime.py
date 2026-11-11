@@ -1145,12 +1145,23 @@ class OptionalIdleRuntime:
         self.navigation_active(False)
         self.motion = False
         succeeded = (not self.cancel_requested and motion.getResult() == TaskResult.SUCCEEDED)
+        station_preflight_timeout = (self.station_managed and motion.goals_submitted==0
+            and (motion.preflight_timeout or self.interrupt_reason=='observation_or_navigation_timeout'))
         self.station_managed = False
         if not succeeded:
             self.settling_after_cancel = True
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
+            elif self.state == 'going_people_standby' and station_preflight_timeout:
+                # No accepted route existed. Keep the selected parking point
+                # and its original total deadline, not a failed-nav budget.
+                self.parking_attempts = max(0,self.parking_attempts-1)
+                self.parking_retry.waiting_data(time.monotonic())
+                self.state,self.reason = 'people_parking_retry_wait','station_preflight_data_timeout'
+                self.parking_outcome = 'waiting_data'
+                self.parking_stop_since = None
+                self._log_people_state()
             elif self.interrupt_reason in ('localization_suspect','people_data_pause'):
                 self.state, self.reason = 'waiting_people_localization', self.interrupt_reason
                 self._reset_spin_ready()
