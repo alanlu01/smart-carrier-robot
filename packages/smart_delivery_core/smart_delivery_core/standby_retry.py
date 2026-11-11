@@ -13,6 +13,7 @@ class StandbyRetryPolicy:
     failures: int = 0
     unexpected_cancellations: int = 0
     retry_at: float = 0.0
+    motion_blocked: bool = False
 
     def __post_init__(self):
         if self.max_attempts < 1 or self.retry_delay <= 0:
@@ -24,6 +25,7 @@ class StandbyRetryPolicy:
         self.failures = 0
         self.unexpected_cancellations = 0
         self.retry_at = 0.0
+        self.motion_blocked = False
 
     def select_goal(self, point):
         """Keep one retry budget for the same actual parking pose."""
@@ -55,10 +57,14 @@ class StandbyRetryPolicy:
 
     def can_attempt(self, now):
         """Return permission without sleeping or claiming the robot is parked."""
-        return self.attempts < self.max_attempts and now >= self.retry_at
+        return not self.motion_blocked and self.attempts < self.max_attempts and now >= self.retry_at
+
+    def block_motion(self):
+        """No blind reattempt after a fresh-feedback rotation stalls."""
+        self.motion_blocked = True
 
     def status(self, now):
         """Expose a small machine-readable reason while remaining interruptible."""
-        if self.attempts >= self.max_attempts:
+        if self.motion_blocked or self.attempts >= self.max_attempts:
             return 'blocked'
         return 'retry_wait' if now < self.retry_at else 'available'

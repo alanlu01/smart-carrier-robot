@@ -19,6 +19,7 @@ class RecoverySpin:
         self.tail_rate = 0.
         self.finishing = False
         self.braking_reserve = math.radians(1.)
+        self.progress_value,self.progress_at=0.,now
 
     @property
     def remaining(self):
@@ -57,6 +58,11 @@ class RecoverySpin:
         if not available:
             self.reason = 'data_unavailable'
             return 'cancel_pause'
+        if self.travel-self.progress_value>=math.radians(.5):
+            self.progress_value,self.progress_at=self.travel,now
+        elif now-self.progress_at>=2.5:
+            self.reason='rotation_no_progress'
+            return 'cancel_failed'
         self.blocked_since = (self.blocked_since if self.blocked_since is not None else now) if blocked else None
         if self.blocked_since is not None and now-self.blocked_since >= .3:
             self.reason = 'near_obstacle'
@@ -91,6 +97,7 @@ class RecoverySpin:
                 return 'fail'
             self.resumes += 1
             self.phase = 'running'
+            self.progress_value,self.progress_at=self.travel,now
             self.cancel_confirmed = False
             self.cancel_at = self.blocked_since = self.clear_since = None
             return 'resume'
@@ -100,10 +107,12 @@ class RecoverySpin:
         """Return a multiplier of the behavior server's configured 0.6 rad/s."""
         if self.phase != 'running':
             return 0.
-        if self.finishing:
-            return .25
-        if self.remaining < math.radians(20.):
-            return .35
+        if self.finishing or self.remaining < math.radians(20.):
+            # Native Spin already brakes with sqrt(2*a*angle). Multiplying
+            # that by .25 made recorded 3-5 degree tails stall at .07-.09.
+            # Cap the native command near .20 instead; never amplify it.
+            native=max(.1,min(.6,math.sqrt(2*.8*self.remaining)))
+            return min(1.,.20/native)
         return .65 if self.remaining < math.radians(60.) else 1.
 
     def snapshot(self, now):

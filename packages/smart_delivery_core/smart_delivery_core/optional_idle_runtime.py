@@ -802,7 +802,7 @@ class OptionalIdleRuntime:
                 self.goal_request = None
                 self.navigator.station_navigation.start(goal,
                     lambda: not self.cancel_requested and self.ready() and not self.inhibited,
-                    park=state=='going_people_standby',behavior_tree=tree)
+                    park=state=='going_people_standby',behavior_tree=tree,label=point.get('name',''))
             else:
                 self.goal_request = self.navigator.nav_to_pose_client.send_goal_async(
                     request, self.navigator._feedbackCallback)
@@ -1148,12 +1148,16 @@ class OptionalIdleRuntime:
         station_preflight_timeout = (self.station_managed and
             (getattr(motion,'clearance_timeout',False) or (motion.goals_submitted==0
              and (motion.preflight_timeout or self.interrupt_reason=='observation_or_navigation_timeout'))))
+        station_motion_stalled=self.station_managed and getattr(motion,'motion_stalled',False)
         self.station_managed = False
         if not succeeded:
             self.settling_after_cancel = True
             self.stop_since = None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
+            elif self.state=='going_people_standby' and station_motion_stalled:
+                self.parking_retry.block_motion()
+                self._people_finished('station_rotation_no_progress',terminal_state='people_parking_blocked')
             elif self.state == 'going_people_standby' and station_preflight_timeout:
                 # Waiting for fresh data or a temporarily blocked station is
                 # not another failed route. Preserve the point and total deadline.

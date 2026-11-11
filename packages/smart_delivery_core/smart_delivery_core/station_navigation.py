@@ -40,7 +40,10 @@ class StationNavigation:
         self.grid_error = ''
         self.preflight_wait_sec = 30.
         self.last_plan = None
+        self.static_grid = None
         navigator.create_subscription(NavPath,'/plan',self._plan,1)
+        navigator.create_subscription(OccupancyGrid,'/map',self._map,
+            QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.publisher = navigator.create_publisher(String,'/delivery/station_state',10)
         navigator.create_subscription(OccupancyGrid,'/global_costmap/costmap',self._grid,
             QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -48,6 +51,10 @@ class StationNavigation:
 
     def _plan(self, message):
         self.last_plan = time.monotonic(),message
+
+    def _map(self, message):
+        try:self.static_grid=StationGrid(message) if message.header.frame_id=='map' else None
+        except (ValueError,AttributeError):self.static_grid=None
 
     def _grid(self, message):
         try:
@@ -125,11 +132,14 @@ class StationNavigation:
             'settling':'⏳ 確認停妥','arrived':'✅ 停靠完成','failed':'⚠️ 進出站中止',
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
         if transition or time.monotonic()-self.last_console_at>=5.:
-            self.nav.get_logger().info(labels.get(phase,phase)+(f'：{reason}' if reason else ''))
+            label=getattr(self,'target_label','')
+            suffix=(f'：{label}' if label else '')+(f'｜{reason}' if reason else '')
+            self.nav.get_logger().info(labels.get(phase,phase)+suffix)
             self.last_console_at = time.monotonic()
         import json
         self.publisher.publish(String(data=json.dumps(dict(phase=phase,reason=reason,
             target=getattr(self,'target',None),stage=self.stage,
+            target_name=getattr(self,'target_label',''),
             goals_submitted=getattr(self,'goals_submitted',0),
             preflight_timeout=getattr(self,'preflight_timeout',False),
             mode=getattr(self,'mode',None),mode_reason=getattr(self,'mode_reason',''),
@@ -137,6 +147,10 @@ class StationNavigation:
             decision_time_ms=getattr(self,'decision_time_ms',None),
             alignment_attempts=getattr(self,'alignment_attempts',0),
             final_corrections=getattr(self,'final_corrections',0),
+            remote_preparation=getattr(self,'remote_preparation',False),
+            clearance_scope=getattr(self,'clearance_scope',''),
+            clearance_kind=getattr(self,'clearance_kind',''),
+            motion_stalled=getattr(self,'motion_stalled',False),
             clearance_timeout=getattr(self,'clearance_timeout',False),
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
             wait_blockers=getattr(self,'wait_blockers',[]),
@@ -160,7 +174,7 @@ class StationNavigation:
                   'tf_missing_or_stale':'等待車輛座標更新','odom_missing':'等待里程計',
                   'odom_stale':'等待里程計更新','vehicle_not_stopped':'等待車輛停妥',
                   'odom_invalid':'等待有效里程計',
-                  'station_clearance':'等待進出站通道',
+                  'station_clearance':getattr(self,'clearance_detail','等待進出站通道'),
                   'stage_pose_pending':'等待實際位置確認',
                   'continuous_stopped_confirmation':'確認連續停妥'}
         self._report(self.phase,'、'.join(labels[b] for b in self.wait_blockers),force=True)
@@ -175,12 +189,13 @@ class StationNavigation:
         finally:
             pending.cancel()
 
-    def start(self, goal, permitted=lambda:True, *, park=True, behavior_tree=''):
+    def start(self, goal, permitted=lambda:True, *, park=True, behavior_tree='',label=''):
         if self.running: raise RuntimeError('station navigation still owns an action')
         self.goal,self.target,self.permitted = deepcopy(goal),coordinates(goal),permitted
         if goal.header.frame_id!='map' or not all(math.isfinite(v) for v in self.target):
             raise ValueError('station target must be finite and in map frame')
         self.park,self.tree = park,behavior_tree
+        self.target_label=' '.join(str(label).split())[:40]
         self.running,self.cancelled,self.active_goal = True,False,False
         self.result,self.stage,self.stop_since = TaskResult.UNKNOWN,None,None
         self.failure = ''
@@ -196,6 +211,11 @@ class StationNavigation:
         self.checked_plan = None
         self.alignment_attempts,self.final_corrections = 0,0
         self.align_anchor = None
+        self.align_odom_anchor = None
+        self.align_progress,self.align_progress_at = 0.,0.
+        self.motion_stalled = False
+        self.remote_preparation = False
+        self.clearance_scope,self.clearance_detail,self.clearance_kind = '','',''
         self.clearance_timeout = False
         self.clearance_deadline,self.clearance_grid_stamp = None,None
         self.sequence_deadline = time.monotonic()+240.
@@ -221,6 +241,7 @@ class StationNavigation:
         allowance = 12. if phase=='aligning' else 25. if phase in ('departure','entry') else 180.
         self.deadline = min(self.sequence_deadline,time.monotonic()+allowance)
         self.clearance_deadline = None
+        self.clearance_scope,self.clearance_detail,self.clearance_kind='','',''
         self.route_origin = self._pose()
         self.route_sent_at = time.monotonic()
         self.goals_submitted += 1
@@ -241,12 +262,16 @@ class StationNavigation:
         tree = str(self.share/'behavior_trees'/f'station_{"exit_" if phase=="departure" else ""}{axis}.xml')
         self._send(end,phase,tree,next_phase)
 
-    def _wait_clearance(self, reason, resume):
+    def _wait_clearance(self, reason, resume, scope='local_departure'):
         if self.clearance_deadline is None:
             self.clearance_deadline = min(self.sequence_deadline,time.monotonic()+30.)
         self.deadline = self.clearance_deadline
         self.clearance_grid_stamp = self.grid_stamp
         self.clearance_resume = resume
+        self.clearance_scope,self.clearance_detail=scope,reason
+        point=self.target if scope.startswith('destination') else self._pose()
+        self.clearance_kind=('static_map_unavailable' if self.static_grid is None else
+            'static_or_unknown' if point and not self.static_grid.clear(point) else 'dynamic_costmap')
         self.after_stop = 'clearance'
         self._report('waiting_clearance',reason)
 
@@ -258,6 +283,9 @@ class StationNavigation:
                 'final_align' if resume=='final_translation' else resume);return
         self.alignment_attempts += 1
         self.align_anchor = pose
+        self.align_odom_anchor = self._odom_heading()
+        self.align_sign = 1. if angle_error(self.target[2],pose[2])>0 else -1.
+        self.align_progress,self.align_progress_at=0.,time.monotonic()
         self._send((pose[0],pose[1],self.target[2]),'aligning',
             str(self.share/'behavior_trees/station_align.xml'),resume)
 
@@ -296,15 +324,22 @@ class StationNavigation:
             if not self.grid.clear(pose,rotation=True) and not self.grid.aligned_route(pose,self.target):
                 self._wait_clearance('等待安全轉向空間','prepare');return
             self._send(self.target,'transit',self.tree,'finish'); return
-        stage = self.grid.staging(self.target,pose)
+        self.remote_preparation=math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])>1.
+        coarse=self.remote_preparation and self.static_grid is not None
+        stage = self.grid.staging(self.target,pose,final_clear=not coarse,
+                                  static_grid=self.static_grid)
         if stage is None:
-            self._wait_clearance('等待安全進站方向','approach'); return
+            self._wait_clearance('目的地準備區受阻','approach','destination_preparation'); return
         if (math.hypot(pose[0]-stage[0],pose[1]-stage[1])<=.20
+                and math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.75
                 and self.grid.turn_clear(pose,self.target[2])):
             self.after_stop = 'entry'
             self._advance(pose)
             return
-        self._send(stage,'staging','', 'entry')
+        distant=math.hypot(stage[0]-self.target[0],stage[1]-self.target[1])>.65+1e-6
+        if distant and math.hypot(pose[0]-stage[0],pose[1]-stage[1])<=.20:
+            self._wait_clearance('等待目的地重新觀測','approach','destination_preparation');return
+        self._send(stage,'staging','', 'approach' if distant else 'entry')
 
     def _advance(self, pose):
         phase = self.after_stop
@@ -318,6 +353,9 @@ class StationNavigation:
             length = math.hypot(self.target[0]-pose[0],self.target[1]-pose[1])
             if length>.75:
                 self._finish(TaskResult.FAILED,'failed','準備點偏離過遠');return
+            self.remote_preparation=False
+            if not self.grid.segment(pose,self.target):
+                self._wait_clearance('目的地末段通道受阻','entry','destination_final');return
             self._translation(pose,self.target,'entry','finish')
         elif phase=='final_translation':
             if (math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.10
@@ -341,7 +379,8 @@ class StationNavigation:
         self.checked_plan=key
         points=[(p.pose.position.x,p.pose.position.y) for p in path.poses]
         if math.hypot(points[-1][0]-self.target[0],points[-1][1]-self.target[1])>.15:return False
-        if self.park and not self.grid.clear(self.target,rotation=True):
+        if (self.park and math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=1.
+                and not self.grid.clear(self.target,rotation=True)):
             near=next((p for p in reversed(points[:-1])
                        if math.hypot(p[0]-points[-1][0],p[1]-points[-1][1])>.20),None)
             if near:
@@ -368,6 +407,23 @@ class StationNavigation:
     def _finish(self, result, phase, reason=''):
         self.running,self.active_goal,self.result = False,False,result
         self._report(phase,reason)
+
+    def _odom_heading(self):
+        if self.odom is None:return None
+        q=self.odom.pose.pose.orientation
+        return math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
+
+    def _alignment_stalled(self):
+        heading=self._odom_heading()
+        if heading is None or self.align_odom_anchor is None:return False
+        stamp=self.odom.header.stamp;ns=stamp.sec*10**9+stamp.nanosec
+        if not self._fresh(self.odom_at,ns,.4):
+            self.failure,self.data_unavailable='對正輪速資料過期',True
+            self.cancelTask();return False
+        progress=self.align_sign*angle_error(heading,self.align_odom_anchor)
+        if progress-self.align_progress>=math.radians(.5):
+            self.align_progress,self.align_progress_at=progress,time.monotonic()
+        return time.monotonic()-self.align_progress_at>=2.5
 
     def cancelTask(self):
         self.cancelled = True
@@ -420,6 +476,11 @@ class StationNavigation:
                      or not self.grid.turn_clear(pose,self.stage[2]))):
             self.failure = '對正位置或資料未通過檢查'
             self.data_unavailable = pose is None or not data_ok
+            self.cancelTask()
+        if (self.active_goal and not completed and self.phase=='aligning' and not self.cancelled
+                and self._alignment_stalled()):
+            self.motion_stalled=True
+            self.failure='對正命令無有效輪速進展，停止補停'
             self.cancelTask()
         if not self.cancelled and not self.permitted():
             self.cancelTask()

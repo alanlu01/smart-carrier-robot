@@ -1088,6 +1088,10 @@ class LocalizationManager(Node):
     @timed_operation('amcl_callback')
     def _amcl_pose_callback(self, message):
         now = time.monotonic()
+        seed_ns=getattr(self,'manual_seed_after_ns',0)
+        stamp_ns=message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+        if seed_ns and stamp_ns<seed_ns:return
+        if seed_ns:self.manual_seed_after_ns=0
         self._record_receipt("amcl_pose", message, now)
         pose = message.pose.pose
         current = (
@@ -1253,24 +1257,30 @@ class LocalizationManager(Node):
         if self.manual_initial_pose_pending:
             self.manual_initial_pose_pending = False
             return
-        if getattr(self, 'pipeline_recheck', None) is not None:
-            self.pipeline_recheck = None
-            self.stable_samples = 0
-            self._reset_map_match_history()
-            self.verify_reference_required = False
-            self.verify_seed_retry_allowed = False
-            self._set_state('VERIFYING', '收到人工初始位置，正在驗證')
+        if self.commanded_motion or self.odom_motion or self.spin_waiting_for_stop:
+            self._require_manual('收到人工位置，先停妥後再提供位置')
+            return
         self.global_verification_required = False  # Human seed still needs existing six-sample verification.
         self.verify_seed_retry_allowed = False
-        if self.state == "MANUAL_REQUIRED":
-            if (getattr(self,'manual_intervention_kind','pose') == 'pipeline'
-                    and self._verification_data_blockers(time.monotonic())):
-                self.get_logger().warning('🛠️ 初始位置已收到，先恢復底盤／導航資料再驗證')
-                return
-            self.stable_samples = 0
-            self._reset_map_match_history()
-            self.verify_reference_required = False
-            self._set_state("VERIFYING", "收到人工初始位置，正在驗證")
+        if (getattr(self,'manual_intervention_kind','pose') == 'pipeline'
+                and self._verification_data_blockers(time.monotonic())):
+            self.get_logger().warning('🛠️ 初始位置已收到，先恢復底盤／導航資料再驗證')
+            return
+        self._cancel_navigation()
+        self.pipeline_recheck=None
+        self.recovery_step=None
+        self.spin_sequence=[]
+        self.stable_samples=0
+        self._reset_map_match_history()
+        self.convergence_samples.clear()
+        self.observation_phase=None
+        self.observation_clock=EvidenceWaitClock()
+        self.verify_reference_required=False
+        self.manual_intervention_kind='pose'
+        self.last_amcl_at=0.
+        self.initial_pose_last_published=time.monotonic()
+        self.manual_seed_after_ns=self.get_clock().now().nanoseconds
+        self._set_state('VERIFYING','收到人工位置，重新驗證')
 
     def _scan_is_fresh(self, now=None):
         now = time.monotonic() if now is None else now
@@ -2520,6 +2530,16 @@ class LocalizationManager(Node):
             self.last_lateral_probe_at=now
             if self._try_lateral_recovery(now):
                 return
+        # Let independent stopped scans fill transient sidestep holes within
+        # the ORIGINAL wall-clock budget, instead of immediately spinning.
+        paths=getattr(self,'lateral_path_reports',{})
+        visibility_pending=(not paths or any(not any(
+            isinstance(layer,dict) and layer.get('reason') in
+                ('obstacle_or_occlusion','recent_obstacle_or_occlusion')
+            for layer in direction.values()) for direction in paths.values()))
+        if (self.lateral_enabled and not self.lateral_attempted and visibility_pending
+                and now-self.second_guard_started_at<self.second_guard_wait):
+            return
         if self._recovery_spin_clear(now):
             self.get_logger().warning('🔄 橫移不可用，改用第二輪原地定位')
             self._start_global_recovery()
@@ -2597,9 +2617,10 @@ class LocalizationManager(Node):
 
     def _queue_recovery_scan(self, name, scan, receipt):
         # Callback-rate collection only during recovery, with a fixed memory cap.
+        translating=getattr(self,'lateral_phase',None) in ('arming','authorize','moving')
         if (getattr(self, 'state', '') not in ('RECOVERING_LOCAL', 'RECOVERING_GLOBAL')
-                or getattr(self, 'commanded_motion', False)
-                or getattr(self, 'odom_motion', False)):
+                or ((getattr(self, 'commanded_motion', False)
+                     or getattr(self, 'odom_motion', False)) and not translating)):
             return
         if not hasattr(self, 'recovery_pending_scans'):
             self.recovery_pending_scans = {key: deque(maxlen=5)
@@ -2616,7 +2637,8 @@ class LocalizationManager(Node):
             for queue in pending.values():
                 queue.clear()
             return
-        if self.commanded_motion or self.odom_motion:
+        translating=getattr(self,'lateral_phase',None) in ('arming','authorize','moving')
+        if (self.commanded_motion or self.odom_motion) and not translating:
             for queue in pending.values():
                 queue.clear()
             return
@@ -2749,6 +2771,8 @@ class LocalizationManager(Node):
             if not -0.1 <= age <= 0.30:
                 reports['reason'] = 'odom_tf_stale'
                 return False
+            base_pose=(transform.transform.translation.x,transform.transform.translation.y,
+                       quaternion_to_yaw(transform.transform.rotation))
             clear = True
             for name, scan in (('scan', self.latest_raw_scan), ('scan_filtered', self.latest_scan)):
                 transform = self.tf_buffer.lookup_transform(
@@ -2765,6 +2789,14 @@ class LocalizationManager(Node):
                     scan, sensor_pose, direction, distance, self.lateral_half_x, self.lateral_half_y,
                     self_mask=self.lateral_self_mask, sensor_z=t.translation.z,
                 )
+                if (reports[name].get('reason')=='unknown_coverage'
+                        and reports[name].get('valid_fraction',0.)>=.80
+                        and hasattr(self,'recovery_scan_evidence')):
+                    history=self.recovery_scan_evidence.translation_report(name,base_pose,
+                        time.monotonic(),self.get_clock().now().nanoseconds/1e9,
+                        direction,distance,self.lateral_half_x,self.lateral_half_y)
+                    reports[name]['recent_evidence']=history
+                    if history['clear']:reports[name].update(clear=True,reason='recent_measured_sweep')
                 clear = clear and reports[name]['clear']
         except (TransformException, ValueError, TypeError, AttributeError) as exc:
             reports['reason'] = f'transform_or_geometry_error: {exc}'
@@ -2785,7 +2817,16 @@ class LocalizationManager(Node):
             return False
         directions = [d for d in (1, -1) if self._lateral_path_clear(d, self.lateral_distance)]
         if not directions:
-            self.get_logger().warning('⏳ 橫移等待：雷達視野不足')
+            if now-getattr(self,'last_lateral_wait_log',-float('inf'))>=2.:
+                details=[]
+                for d,label in (('1','左'),('-1','右')):
+                    direction_report=self.lateral_path_reports.get(d,{})
+                    report=direction_report.get('scan_filtered',direction_report.get('scan',{}))
+                    if report.get('reason')=='unknown_coverage':
+                        details.append(f"{label}覆蓋 {100*report.get('valid_fraction',0.):.0f}%／未知 {report.get('missing_arc_deg',0.):.1f}°")
+                    else:details.append(label+reason_label(report.get('reason',direction_report.get('reason','安全資料不足'))))
+                self.get_logger().warning('⏳ 橫移觀測：'+'，'.join(details))
+                self.last_lateral_wait_log=now
             return False
         self._cancel_navigation()
         self.lateral_attempted = True
@@ -3134,7 +3175,8 @@ class LocalizationManager(Node):
                    and now-max(self.last_motion_command_at,self.last_odom_motion_at) >= 1.)
         if not stopped:
             return
-        failed = managed.reason in ('odom_jump','bounded_wait_exhausted','active_time_exhausted','action_failed','manual_stop')
+        failed = managed.reason in ('odom_jump','bounded_wait_exhausted','active_time_exhausted',
+                                    'rotation_no_progress','action_failed','manual_stop')
         if failed or self.state == 'MANUAL_REQUIRED':
             reason = managed.reason
             self.last_recovery_spin = managed.snapshot(now)
@@ -3142,7 +3184,7 @@ class LocalizationManager(Node):
             self.spin_in_progress = False
             self.spin_sequence = []
             if self.state != 'MANUAL_REQUIRED':
-                self._handle_spin_failure('定位旋轉已安全停止：'+reason)
+                self._handle_spin_failure('定位旋轉已安全停止：'+reason_label(reason))
             return
         if now-getattr(self, 'managed_spin_guard_at', -float('inf')) < .5:
             return

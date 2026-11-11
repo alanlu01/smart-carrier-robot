@@ -145,15 +145,23 @@ class StationGrid:
         return ((self.clear(start,rotation=True) and self.clear(end,rotation=True))
                 or self.aligned_route(start,end))
 
-    def staging(self, target, current):
+    def staging(self, target, current, *, final_clear=True, static_grid=None):
         """Try all four body directions; never invent permanent site coordinates."""
+        # Remote preparation may defer dynamic FINAL clearance, never the
+        # preparation pose or the static wall/unknown-space sweep.
+        if not final_clear and static_grid is None:return None
         candidates = []
-        for distance in (.35, .50):
+        distances=(.35,.50) if final_clear else (.35,.50,.65,.90,1.20)
+        for distance in distances:
             for direction in (0., math.pi/2, -math.pi/2, math.pi):
                 a = target[2]+direction
                 point = (target[0]+distance*math.cos(a), target[1]+distance*math.sin(a), target[2])
-                if self.clear(point, rotation=True) and self.segment(point, target):
+                if (self.clear(point, rotation=True)
+                        and (static_grid is None or (static_grid.clear(point,rotation=True)
+                             and static_grid.segment(point,target)))
+                        and (not final_clear or self.segment(point,target))):
                     candidates.append(point)
+            if distance>=.50 and candidates:break
         return min(candidates, key=lambda p:math.hypot(p[0]-current[0],p[1]-current[1])) if candidates else None
 
     def departure(self, current, target):

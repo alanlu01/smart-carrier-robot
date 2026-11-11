@@ -512,7 +512,7 @@ def go_to_standby(
             navigator.goToPose(goal_pose)
         else:
             motion.start(goal_pose, lambda: localization_is_ready() and not new_task_waiting()
-                         and not optional_interrupt_requested())
+                         and not optional_interrupt_requested(),label=closest_standby['name'])
         while not motion.isTaskComplete():
             if motion is navigator:
                 time.sleep(0.1)  # Legacy navigator path retains its native action pump.
@@ -563,6 +563,10 @@ def go_to_standby(
         on_outcome(closest_standby, "interrupted_by_localization")
         return None
     if result != TaskResult.SUCCEEDED:
+        if motion is not navigator and getattr(motion,'motion_stalled',False):
+            on_outcome(closest_standby,'motion_stalled')
+            navigator.get_logger().warning('⚠️ 對正無進展，停止補停；新任務仍可接管')
+            return None
         if motion is not navigator and (motion.preflight_timeout or getattr(motion,'clearance_timeout',False)):
             on_outcome(closest_standby, "waiting_clearance" if getattr(motion,'clearance_timeout',False) else "waiting_data")
             navigator.get_logger().info("⏳ 待機導航暫緩，等待資料或通道恢復")
@@ -767,6 +771,9 @@ def _run_delivery(runtime_holder):
     def report_standby(point, state):
         nonlocal last_standby_status_at, last_standby_status
         now = time.monotonic()
+        if state=='motion_stalled':
+            standby_retry.block_motion()
+            state='blocked'
         waiting_data = state in ("waiting_data", "waiting_clearance")
         if waiting_data:
             standby_retry.waiting_data(now)
@@ -1659,7 +1666,7 @@ def _run_delivery(runtime_holder):
         motion = navigator.station_navigation
         motion.start(goal_pose, lambda: localization_ready is not False
                      and active_task_id not in cancellation_requests
-                     and not (optional_runtime and optional_runtime.home_requested))
+                     and not (optional_runtime and optional_runtime.home_requested),label=target['name'])
         cancel_sent = False
         localization_aborted = False
         while not motion.isTaskComplete():

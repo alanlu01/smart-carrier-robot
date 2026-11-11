@@ -56,7 +56,7 @@ def standby_executor(monkeypatch):
 
 def test_standby_input_timeout_is_reported_as_waiting_not_failed_navigation():
     node=_CompletedNavigator(TaskResult.FAILED)
-    node.station_navigation=SimpleNamespace(start=lambda *_:None,isTaskComplete=lambda:True,
+    node.station_navigation=SimpleNamespace(start=lambda *_args,**_kwargs:None,isTaskComplete=lambda:True,
         getResult=lambda:TaskResult.FAILED,preflight_timeout=True)
     outcomes=[];lease=[]
     assert go_to_standby(node,dict(x=0.,y=0.),

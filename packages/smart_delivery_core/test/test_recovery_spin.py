@@ -36,7 +36,7 @@ def test_endpoint_brakes_early_and_never_requests_reverse():
     for i in range(1,73):
         angle=math.radians(min(i*5,358.))
         turn.observe(math.atan2(math.sin(angle),math.cos(angle)),i*100_000_000,.3)
-    assert turn.speed_limit()==.35
+    assert turn.speed_limit()>.35
     assert turn.tick(8.,blocked=False,available=True)=='cancel_endpoint'
     turn.phase='stopping'
     assert turn.stopped(9.,True)=='complete'

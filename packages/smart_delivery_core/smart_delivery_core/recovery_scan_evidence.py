@@ -3,6 +3,7 @@ from collections import deque
 import math
 import numpy as np
 from smart_delivery_core.spin_evidence import ScanEvidence, aligned_spin_report
+from smart_delivery_core.swept_evidence import aligned_swept_report
 
 
 class RecoveryScanEvidence:
@@ -35,3 +36,7 @@ class RecoveryScanEvidence:
         return aligned_spin_report(frames, base_pose, now, ros_now,
                                    math.hypot(.22, .16) + .10, 20.,
                                    current_min=.73, union_min=.80 if fraction < .75 else .75)
+
+    def translation_report(self,name,base_pose,now,ros_now,direction,distance,half_x,half_y):
+        return aligned_swept_report(self.frames[name],base_pose,now,ros_now,
+                                    direction,distance,half_x,half_y)

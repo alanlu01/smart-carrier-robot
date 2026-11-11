@@ -33,6 +33,7 @@ def fixture():
     from rclpy.executors import MultiThreadedExecutor
     rclpy.init();node=rclpy.create_node('codex_station_action_fixture');guard=DeliveryGoalGuard()
     loaded='--loaded' in sys.argv
+    remote='--remote-obstacle' in sys.argv
     state=dict(pose=(0.,0.,0.),hold=False,grid_enabled=True,goals=[],cancels=0)
     node.create_subscription(Bool,'/codex/station_hold',lambda m:state.update(hold=m.data),10)
     node.create_subscription(Bool,'/codex/station_grid_enabled',lambda m:state.update(grid_enabled=m.data),10)
@@ -66,6 +67,13 @@ def fixture():
         message=Odometry();message.header.stamp=stamp;message.pose.pose.orientation.w=1.;odom.publish(message)
     def publish_grid():
         if not state['grid_enabled']:return
+        if remote and loaded:
+            # One stale dynamic cell over the remote service goal, while the
+            # static map/preparation area stay free. Reobserve only nearby.
+            col=math.floor((-2.83-map_message.info.origin.position.x)/map_message.info.resolution)
+            row=math.floor((4.924-map_message.info.origin.position.y)/map_message.info.resolution)
+            map_message.data[row*map_message.info.width+col]=(100 if math.hypot(
+                state['pose'][0]+3.,state['pose'][1]-5.)>1. else 0)
         map_message.header.stamp=node.get_clock().now().to_msg();grid.publish(map_message)
     node.create_timer(.05,publish);node.create_timer(2. if loaded else .5,publish_grid)
     if loaded:
@@ -143,7 +151,8 @@ def main():
         manager_type=module.StationNavigation
     root=Path(os.environ['ROS_LOG_DIR']);root.mkdir(parents=True,exist_ok=True)
     with (root/'action_fixture.log').open('w') as log:
-        child=subprocess.Popen([sys.executable,__file__,'--fixture']+(['--loaded'] if loaded else []),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        child=subprocess.Popen([sys.executable,__file__,'--fixture']+(['--loaded'] if loaded else [])+
+            (['--remote-obstacle'] if '--remote-obstacle' in sys.argv else []),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         rclpy.init();node=DeliveryNavigator();buffer=Buffer();listener=TransformListener(buffer,node)
         share=get_package_share_directory('smart_delivery_core')
         manager=manager_type(node,buffer,share);node.station_navigation=manager

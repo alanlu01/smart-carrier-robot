@@ -73,7 +73,7 @@ def test_person_blockage_waits_for_new_costmap_then_rechecks(motion):
 
 def test_persistent_blockage_is_finite_and_not_a_preflight_data_error(motion):
     manager,node,clock,pose,stopped,permission=motion
-    manager.mode='station';manager.grid.staging=lambda *_:None
+    manager.mode='station';manager.grid.staging=lambda *_a,**_k:None
     tick(manager,clock)
     assert manager.phase=='waiting_clearance'
     clock[0]+=31.

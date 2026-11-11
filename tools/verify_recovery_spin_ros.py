@@ -28,42 +28,48 @@ def main():
         probe=rclpy.create_node('codex_simulated_spin_server')
         executor=MultiThreadedExecutor(num_threads=3)
         executor.add_node(manager);executor.add_node(probe)
-        model=dict(yaw=0.,rate=0.,busy=False,goals=[],cancels=0,blocked=False,closing=False)
+        model=dict(yaw=0.,rate=0.,command=0.,last=time.monotonic(),busy=False,
+                   goals=[],cancels=0,blocked=False,closing=False)
         completed=[]
         manager._recovery_spin_clear=lambda _:True  # geometry is tested separately
         manager._complete_spin_sequence=lambda:completed.append(manager.last_recovery_spin)
         manager.recovery_feedback=SimpleNamespace(last_complete_at=0.,is_stale=lambda *_:False,
                                                   sample_age=lambda *_:0.)
-        manager.recovery_stop=SimpleNamespace(ready=lambda _:not model['busy'])
+        manager.recovery_stop=SimpleNamespace(ready=lambda _:not model['busy'] and abs(model['rate'])<.01)
 
         def execute(handle):
             target=abs(handle.request.target_yaw)
             model['goals'].append(target)
-            start=model['yaw'];previous=time.monotonic();model['busy']=True
+            start=model['yaw'];model['busy']=True
             while abs(model['yaw']-start)<target:
                 if model['closing']:
                     handle.abort();return Spin.Result()
                 if handle.is_cancel_requested:
-                    model['busy']=False;model['rate']=0.;model['cancels']+=1
+                    model['busy']=False;model['command']=0.;model['cancels']+=1
                     handle.canceled();return Spin.Result()
-                now=time.monotonic()
                 cap=manager.managed_spin.speed_limit() if manager.managed_spin else 0.
-                model['rate']=.6*cap
-                model['yaw']+=model['rate']*(now-previous);previous=now
+                # Mirror the configured native Spin braking law; a constant
+                # .6 fake speed cannot validate a distance-dependent tail cap.
+                native=max(.1,min(.6,math.sqrt(2*.8*max(0.,target-abs(model['yaw']-start)))))
+                model['command']=native*cap
                 time.sleep(.01)
-            model['busy']=False;model['rate']=0.
+            model['busy']=False;model['command']=0.
             handle.succeed();return Spin.Result()
 
         server=ActionServer(probe,Spin,'/spin',execute,
             cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=ReentrantCallbackGroup())
         def sensors():
             now=time.monotonic();stamp=manager.get_clock().now().to_msg()
+            dt=min(.1,now-model['last']);model['last']=now
+            desired=model['command'] if abs(model['command'])>.11 else 0.
+            model['rate']+=max(-.8*dt,min(.8*dt,desired-model['rate']))
+            model['yaw']+=model['rate']*dt
             odom=Odometry();odom.header.stamp=stamp
             odom.pose.pose.orientation.z=math.sin(model['yaw']/2)
             odom.pose.pose.orientation.w=math.cos(model['yaw']/2)
             odom.twist.twist.angular.z=model['rate']
             manager._odom_callback(odom)
-            command=Twist();command.angular.z=model['rate'];manager._cmd_vel_callback(command)
+            command=Twist();command.angular.z=model['command'];manager._cmd_vel_callback(command)
             scan=LaserScan();scan.header.stamp=stamp
             manager.latest_scan=manager.latest_raw_scan=scan
             manager.latest_scan_at=manager.latest_raw_scan_at=now
@@ -95,7 +101,8 @@ def main():
             drained=time.monotonic()+1.
             while time.monotonic()<drained:executor.spin_once(timeout_sec=.02)
             print(json.dumps(dict(real_ros_action=True,goals_deg=[math.degrees(x) for x in model['goals']],
-                cancellations=model['cancels'],final=completed[0],hardware_commands=0)))
+                cancellations=model['cancels'],final=completed[0],hardware_commands=0,
+                software_dead_zone_rad_s=.11,software_angular_accel=.8)))
         finally:
             model['closing']=True
             for entity in manager.timers:entity.cancel()

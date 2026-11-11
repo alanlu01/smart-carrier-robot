@@ -49,13 +49,19 @@ def station_parameters(source):
                 controller['controller_plugins'].append(name)
 
     align = deepcopy(station)
-    align.update(vx_max=.02,vx_min=-.02,vy_max=.02,vy_min=-.02,wz_max=.10,
-                 vx_std=.02,vy_std=.02,wz_std=.04,az_max=.25)
+    align.update(vx_max=.02,vx_min=-.02,vy_max=.02,vy_min=-.02,wz_max=.20,
+                 vx_std=.02,vy_std=.02,wz_std=.08,az_max=.4,
+                 plugin='nav2_rotation_shim_controller::RotationShimController',
+                 primary_controller='nav2_mppi_controller::MPPIController',
+                 rotate_to_goal_heading=True,rotate_to_heading_once=True,
+                 rotate_to_heading_angular_vel=.20,max_angular_accel=.8,
+                 angular_dist_threshold=.10,angular_disengage_threshold=.06,
+                 simulate_ahead_time=1.,closed_loop=False)
     controller['StationAlign'] = align
     if 'StationAlign' not in controller['controller_plugins']:
         controller['controller_plugins'].append('StationAlign')
     controller['station_alignment_checker'] = dict(plugin='nav2_controller::SimpleGoalChecker',
-        xy_goal_tolerance=.05,yaw_goal_tolerance=.025,stateful=False)
+        xy_goal_tolerance=.05,yaw_goal_tolerance=.06,stateful=False)
     if 'station_alignment_checker' not in controller['goal_checker_plugins']:
         controller['goal_checker_plugins'].append('station_alignment_checker')
 
