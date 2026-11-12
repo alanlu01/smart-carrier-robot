@@ -409,6 +409,7 @@ def lateral_harness(manager):
     import json
     from hailo_vision.recovery_lease import RecoveryLease
     node, clock = manager
+    node.recovery_feedback=SimpleNamespace(sample_age=lambda now:0.)
     node.lateral_enabled = node.auto_motion_recovery = True
     node.lateral_attempted = False
     node.lateral_distance, node.lateral_cap = .30, .20

@@ -69,6 +69,15 @@ class StationNavigation:
             self.grid_error = str(exc)
 
     def _odom(self, message):
+        stamp=message.header.stamp.sec*10**9+message.header.stamp.nanosec
+        if self.odom is not None:
+            old=self.odom.header.stamp.sec*10**9+self.odom.header.stamp.nanosec
+            if stamp<=old:
+                if self.nav.get_clock().now().nanoseconds>=old-100_000_000:return
+                # Clock epoch changed: never compare a new pose to an old anchor.
+                if self.running:
+                    self.failure,self.data_unavailable='里程計時間基準更新，等待資料恢復',True
+                    self.cancelTask()
         self.odom,self.odom_at = message,time.monotonic()
 
     def _chassis_command(self, message):
@@ -80,7 +89,7 @@ class StationNavigation:
 
     def _fresh(self, receipt, stamp_ns, limit):
         age = (self.nav.get_clock().now().nanoseconds-stamp_ns)/1e9
-        return time.monotonic()-receipt <= limit and -.1 <= age <= limit
+        return 0 <= time.monotonic()-receipt <= limit and -.1 <= age <= limit
 
     def _ages(self, receipt, stamp_ns, limit):
         receipt_age = time.monotonic()-receipt
@@ -143,6 +152,10 @@ class StationNavigation:
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
         if transition or time.monotonic()-self.last_console_at>=5.:
             label=getattr(self,'target_label','')
+            if phase=='departure':
+                source=getattr(self,'source_station',None)
+                label=(f'離開 ({source[0]:.2f}, {source[1]:.2f}) → {label}'
+                       if source else f'離開目前位置 → {label}')
             suffix=(f'：{label}' if label else '')+(f'｜{reason}' if reason else '')
             self.nav.get_logger().info(labels.get(phase,phase)+suffix)
             self.last_console_at = time.monotonic()
@@ -154,6 +167,7 @@ class StationNavigation:
             preflight_timeout=getattr(self,'preflight_timeout',False),
             mode=getattr(self,'mode',None),mode_reason=getattr(self,'mode_reason',''),
             mode_switches=getattr(self,'mode_switches',0),
+            mode_switch_scope=getattr(self,'mode_switch_scope',None),
             decision_time_ms=getattr(self,'decision_time_ms',None),
             alignment_attempts=getattr(self,'alignment_attempts',0),
             final_corrections=getattr(self,'final_corrections',0),
@@ -164,6 +178,8 @@ class StationNavigation:
             clearance_timeout=getattr(self,'clearance_timeout',False),
             native_error=getattr(self,'native_error',(0,'')),
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
+            motion_check=getattr(self,'motion_check',{}),
+            clearance_retries=getattr(self,'clearance_retries',0),
             wait_blockers=getattr(self,'wait_blockers',[]),
             deadline_remaining_sec=round(max(0.,getattr(self,'deadline',0.)-time.monotonic()),2),
             stamp_ns=self.nav.get_clock().now().nanoseconds),ensure_ascii=False)))
@@ -205,6 +221,7 @@ class StationNavigation:
         self.goal,self.target,self.permitted = deepcopy(goal),coordinates(goal),permitted
         if goal.header.frame_id!='map' or not all(math.isfinite(v) for v in self.target):
             raise ValueError('station target must be finite and in map frame')
+        self.source_station = self.parked
         self.park,self.tree = park,behavior_tree
         self.target_label=' '.join(str(label).split())[:40]
         self.running,self.cancelled,self.active_goal = True,False,False
@@ -216,12 +233,17 @@ class StationNavigation:
         self.last_wait_publish = -math.inf
         self.data_unavailable = False
         self.translation_start = None
+        self.motion_odom_anchor = None
+        self.motion_check = {}
+        self.clearance_retries = 0
+        self.clearance_pending = None
         self.mode,self.mode_reason,self.mode_switches = None,'',0
         self.decision_time_ms = None
         self.replan_pending = False
         self.final_heading_pending = False
         self.final_heading_since = None
         self.checked_plan = None
+        self.mode_switch_scope = None
         self.alignment_attempts,self.final_corrections = 0,0
         self.align_anchor = None
         self.align_odom_anchor = None
@@ -276,6 +298,7 @@ class StationNavigation:
         across = -math.sin(end[2])*dx+math.cos(end[2])*dy
         axis = 'x' if abs(along)>=abs(across) else 'y'
         self.translation_start = start
+        self.motion_odom_anchor = self._odom_pose()
         tree = str(self.share/'behavior_trees'/f'station_{"exit_" if phase=="departure" else ""}{axis}.xml')
         self._send(end,phase,tree,next_phase)
 
@@ -300,6 +323,7 @@ class StationNavigation:
                 'final_align' if resume=='final_translation' else resume);return
         self.alignment_attempts += 1
         self.align_anchor = pose
+        self.motion_odom_anchor = self._odom_pose()
         self.align_odom_anchor = self._odom_heading()
         self.align_sign = 1. if angle_error(self.target[2],pose[2])>0 else -1.
         self.align_progress,self.align_progress_at=0.,time.monotonic()
@@ -380,6 +404,14 @@ class StationNavigation:
                 self._advance_finish()
             else:self._translation(pose,self.target,'entry','finish')
         elif phase=='final_align':self._align(pose,'final_translation')
+        elif phase=='translation_clearance':
+            self._wait_clearance('等待平移通道恢復','translation_resume','local_translation')
+        elif phase=='translation_resume':
+            moving,end,resume=self.clearance_pending
+            if not self.grid.segment(pose,end):
+                self._wait_clearance('等待平移通道恢復','translation_resume','local_translation');return
+            self.clearance_pending=None
+            self._translation(pose,end,moving,resume)
         elif phase=='finish':
             self._advance_finish()
 
@@ -402,10 +434,14 @@ class StationNavigation:
                        if math.hypot(p[0]-points[-1][0],p[1]-points[-1][1])>.20),None)
             if near:
                 heading=math.atan2(points[-1][1]-near[1],points[-1][0]-near[0])
-                if not self.grid.turn_clear((self.target[0],self.target[1],heading),self.target[2]):return True
+                if not self.grid.turn_clear((self.target[0],self.target[1],heading),self.target[2]):
+                    self.mode_switch_scope='destination'
+                    return True
         if self.route_origin and math.hypot(pose[0]-self.route_origin[0],pose[1]-self.route_origin[1])<.6:
             ahead=next((p for p in points if math.hypot(p[0]-pose[0],p[1]-pose[1])>.25),None)
-            if ahead and not self.grid.turn_clear(pose,math.atan2(ahead[1]-pose[1],ahead[0]-pose[0])):return True
+            if ahead and not self.grid.turn_clear(pose,math.atan2(ahead[1]-pose[1],ahead[0]-pose[0])):
+                self.mode_switch_scope='departure'
+                return True
         return False
 
     def _request_station_fallback(self):
@@ -439,6 +475,43 @@ class StationNavigation:
     def _finish(self, result, phase, reason=''):
         self.running,self.active_goal,self.result = False,False,result
         self._report(phase,reason)
+
+    def _odom_pose(self):
+        if self.odom is None:return None
+        stamp=self.odom.header.stamp
+        if not self._fresh(self.odom_at,stamp.sec*10**9+stamp.nanosec,.4):return None
+        p,q=self.odom.pose.pose.position,self.odom.pose.pose.orientation
+        pose=(p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
+        return pose if all(math.isfinite(v) for v in pose) else None
+
+    def _physical_pose(self, anchor):
+        origin=getattr(self,'motion_odom_anchor',None)
+        if origin is None:return self._pose()  # Conservative legacy map-only guard.
+        current=self._odom_pose()
+        if current is None:return None
+        offset=anchor[2]-origin[2];c,s=math.cos(offset),math.sin(offset)
+        dx,dy=current[0]-origin[0],current[1]-origin[1]
+        return (anchor[0]+c*dx-s*dy,anchor[1]+s*dx+c*dy,
+                anchor[2]+angle_error(current[2],origin[2]))
+
+    def _translation_blocker(self, start, end):
+        if abs(angle_error(start[2],end[2]))>.12:
+            return dict(reason='heading_mismatch',yaw_error_rad=angle_error(start[2],end[2]))
+        steps=max(1,math.ceil(math.hypot(end[0]-start[0],end[1]-start[1])/.02))
+        for i in range(steps+1):
+            p=(start[0]+(end[0]-start[0])*i/steps,start[1]+(end[1]-start[1])*i/steps,end[2])
+            if not self.grid.clear(p):
+                return dict(reason='occupied_or_unknown_sweep',pose=p,
+                    static_clear=self.static_grid.clear(p) if self.static_grid else None)
+        return dict(reason='changed_snapshot')
+
+    def _pause_translation(self):
+        if self.clearance_retries>=2:
+            self.failure='平移通道持續受阻';self.cancelTask();return
+        self.clearance_retries+=1
+        self.clearance_pending=(self.phase,self.stage,self.next_phase)
+        self.replan_pending=True
+        self.nav.cancelTask()
 
     def _odom_heading(self):
         if self.odom is None:return None
@@ -501,7 +574,7 @@ class StationNavigation:
             self.data_unavailable = not data_ok or pose is None
             self.cancelTask()
         if (self.active_goal and not completed and self.phase in ('departure','entry')
-                and not self.cancelled):
+                and not self.cancelled and not self.replan_pending):
             if pose is None or not data_ok:
                 self.failure,self.data_unavailable = '平移資料逾時',True
                 self.cancelTask()
@@ -509,24 +582,37 @@ class StationNavigation:
                 self.failure = '平移車頭方向未通過檢查'
                 self.cancelTask()
             else:
+                physical=self._physical_pose(self.translation_start)
+                if physical is None:
+                    self.failure,self.data_unavailable='平移輪速資料過期',True
+                    self.cancelTask();return False
                 sx,sy,_ = self.translation_start
                 dx,dy = self.stage[0]-sx,self.stage[1]-sy
                 length = math.hypot(dx,dy)
-                along = ((pose[0]-sx)*dx+(pose[1]-sy)*dy)/max(length,1e-6)
-                across = abs((pose[0]-sx)*dy-(pose[1]-sy)*dx)/max(length,1e-6)
+                along = ((physical[0]-sx)*dx+(physical[1]-sy)*dy)/max(length,1e-6)
+                across = abs((physical[0]-sx)*dy-(physical[1]-sy)*dx)/max(length,1e-6)
+                self.motion_check=dict(along_m=round(along,4),cross_m=round(across,4),
+                    source='odom' if self.motion_odom_anchor else 'map',
+                    costmap_stamp_ns=self.grid_stamp)
                 if across>.10 or not -.10<=along<=length+.10:
                     self.failure = '平移偏離已檢查通道'
                     self.cancelTask()
                 elif not self.grid.segment(pose,self.stage):
-                    self.failure = '平移通道出現障礙'
-                    self.cancelTask()
+                    self.motion_check.update(blocker=self._translation_blocker(pose,self.stage))
+                    self._pause_translation()
+        align_physical=(self._physical_pose(self.align_anchor)
+                        if self.phase=='aligning' and self.align_anchor else None)
         if (self.active_goal and not completed and self.phase=='aligning' and not self.cancelled
                 and (pose is None or not data_ok or
-                     math.hypot(pose[0]-self.align_anchor[0],pose[1]-self.align_anchor[1])>.05
+                     align_physical is None or
+                     math.hypot(align_physical[0]-self.align_anchor[0],
+                                align_physical[1]-self.align_anchor[1])>.05
                      or not self.grid.turn_clear(pose,self.stage[2]))):
             self.failure = '對正位置或資料未通過檢查'
-            self.data_unavailable = pose is None or not data_ok
+            self.data_unavailable = pose is None or not data_ok or align_physical is None
             self.cancelTask()
+        align_physical=(self._physical_pose(self.align_anchor)
+                        if self.phase=='aligning' and self.align_anchor else None)
         if (self.active_goal and not completed and self.phase=='aligning' and not self.cancelled
                 and self._alignment_stalled()):
             self.motion_stalled=True
@@ -576,9 +662,12 @@ class StationNavigation:
             if self.replan_pending and not self.cancelled:
                 self.replan_pending=False
                 self.stage=None
-                self.after_stop,self.stop_since=('final_align' if self.final_heading_pending else 'prepare'),None
+                self.after_stop,self.stop_since=('translation_clearance' if self.clearance_pending else
+                    'final_align' if self.final_heading_pending else
+                    'approach' if self.mode_switch_scope=='destination' else 'prepare'),None
                 self.deadline=min(self.sequence_deadline,time.monotonic()+6.)
-                self._report('settling','確認停妥後改用進出站模式')
+                self._report('settling','通道受阻，確認停妥後重驗' if self.clearance_pending
+                             else '確認停妥後改用進出站模式')
             elif self.cancelled or result != TaskResult.SUCCEEDED:
                 self._finish(TaskResult.FAILED if self.failure else TaskResult.CANCELED if self.cancelled else result,
                              'failed' if self.failure or not self.cancelled else 'cancelled',self.failure)
@@ -599,8 +688,8 @@ class StationNavigation:
                 self.after_stop=self.clearance_resume
                 self._advance(pose)
             return not self.running
-        intermediate = self.after_stop in ('entry','approach','prepare')
-        position_ok = self.stage is None or (pose is not None
+        intermediate = self.after_stop in ('entry','approach','prepare','translation_clearance')
+        position_ok = self.after_stop=='translation_clearance' or self.stage is None or (pose is not None
             and math.hypot(pose[0]-self.stage[0],pose[1]-self.stage[1])<=(.20 if intermediate else .10)
             and (intermediate or abs(angle_error(pose[2],self.stage[2]))<=.10))
         if (not position_ok and self.after_stop=='finish' and self.park and self.final_corrections<1

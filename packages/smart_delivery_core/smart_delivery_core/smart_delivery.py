@@ -1216,6 +1216,24 @@ def _run_delivery(runtime_holder):
         if not power_health.valid:
             queue_result(target, fsm, 'failed', power_health.note or '槽位資料尚未就緒')
             return
+        if not power_health.action_ready(baseline_slots):
+            navigator.get_logger().warning('⏳ 等待槽位基準，請暫勿取還')
+            set_motion_inhibited(True)
+            baseline_deadline=time.monotonic()+10.
+            try:
+                while rclpy.ok() and time.monotonic()<baseline_deadline:
+                    rclpy.spin_once(navigator,timeout_sec=.2)
+                    if active_task_id in cancellation_requests:
+                        queue_result(target,fsm,'cancelled','等待槽位基準時收到取消');return
+                    if (not resumed and power_health.valid and
+                            time.monotonic()-latest_power_status_at<=2. and
+                            power_health.action_ready(latest_power_banks)):
+                        baseline_slots=latest_power_banks
+                        break
+                else:
+                    queue_result(target,fsm,'failed','槽位基準仍不確定，未開始實體取還');return
+            finally:
+                set_motion_inhibited(False)
         try:
             verifier = SlotActionVerifier(
                 target["type"],
@@ -1388,9 +1406,7 @@ def _run_delivery(runtime_holder):
     while latest_power_banks is None and time.monotonic() < deadline:
         rclpy.spin_once(navigator, timeout_sec=0.2)
     if latest_power_banks is None:
-        navigator.get_logger().error("❌ 等待行充感測資料逾時")
-        rclpy.shutdown()
-        return
+        navigator.get_logger().warning("⏳ 行充資料尚未就緒，保持上線等待恢復")
 
     current_pos = {"x": 0.0, "y": 0.0}
     last_stale_warning_at = 0.0

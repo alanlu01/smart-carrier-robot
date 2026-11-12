@@ -121,14 +121,19 @@ def swept_scan_report(scan, sensor_pose, direction, distance, half_x, half_y,
     return report
 
 
-def lateral_speed(progress, distance=0.30, cap=0.20, feedback_age=0.):
+def lateral_speed(progress, distance=0.30, cap=0.20, feedback_age=0., measured_speed=0.):
     """Reserve a 25 mm tail and a 3 mm completion tolerance before the target."""
     remaining = distance - progress
     if remaining <= 0.028:
         return 0.0
     # v*t + v²/(2*a) <= available distance. Actual stop still needs wheel proof.
     deceleration = .25
-    reaction = .20 + max(0., min(.25, feedback_age))
+    reaction = .35 + max(0., min(.65, feedback_age))
+    # Recorded stop travelled 66.8 mm after zero. Reserve measured momentum
+    # as well as held-wheel sample age, not the fresh 20 Hz odom timer age.
+    rate=abs(measured_speed)
+    if not math.isfinite(rate):return 0.
+    if rate>0 and remaining <= .025+rate*reaction+rate*rate/(2*deceleration):return 0.
     at = deceleration * reaction
     return min(cap, math.sqrt(at*at + 2*deceleration*(remaining-.025)) - at)
 

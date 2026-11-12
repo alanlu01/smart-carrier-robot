@@ -102,8 +102,10 @@ def test_new_obstacle_cancels_checked_translation_without_releasing_action(motio
     obstacle(manager.grid,.85,0.)
     assert not manager.isTaskComplete() and node.cancels==1
     node.complete=True;node.result=TaskResult.CANCELED
+    assert not tick(manager,clock) and manager.phase=='waiting_clearance'
+    clock[0]+=31.
     assert manager.isTaskComplete() and manager.getResult()==TaskResult.FAILED
-    assert '障礙' in manager.error_details()[1]
+    assert manager.clearance_timeout
 
 
 def test_tf_failure_does_not_trigger_station_fallback(motion):

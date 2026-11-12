@@ -1056,6 +1056,7 @@ class LocalizationManager(Node):
             quaternion_to_yaw(pose.orientation),
         )
         twist = message.twist.twist
+        self.latest_lateral_velocity=float(twist.linear.y)
         self.latest_odom_valid = all(math.isfinite(v) for v in (
             *current, twist.linear.x, twist.linear.y, twist.angular.z))
         self.odom_motion = (
@@ -1537,6 +1538,8 @@ class LocalizationManager(Node):
         now = time.monotonic()
         self.mild_map_active = False
         if getattr(self, 'managed_spin', None) is not None:
+            return
+        if self._refresh_pipeline_amcl(now):
             return
         if self._tick_pipeline_bootstrap(now):
             return
@@ -2208,6 +2211,37 @@ class LocalizationManager(Node):
         if blockers:
             return '等待新鮮感測資料'
         return '等待定位穩定驗證'
+
+    def _refresh_pipeline_amcl(self, now):
+        """Refresh a stopped AMCL before asking it to satisfy its own age gate."""
+        eligible=(getattr(self,'pipeline_recheck',None) is not None or
+            (self.state=='MANUAL_REQUIRED' and getattr(self,'manual_intervention_kind','pose')=='pipeline'))
+        missing=self.last_amcl_at<=0 or now-self.last_amcl_at>self.amcl_pose_timeout
+        if not eligible or not missing:
+            self.pipeline_pose_refresh_started=None
+            self.pipeline_pose_refresh_exhausted=False
+            return False
+        nav=getattr(self,'navigation_health',{}) or {}
+        # A stale ZERO command need not be republished by an idle navigator.
+        # This only requests a sensor update, never grants motion or readiness.
+        safe=(nav.get('state')=='ready' and 0<=now-self.navigation_health_at<=3.
+            and self.lateral_phase is None and not self._lateral_sensor_blockers(now)
+            and not self.commanded_motion and not self.odom_motion
+            and self.recovery_stop.ready(now))
+        if not safe:return False
+        started=getattr(self,'pipeline_pose_refresh_started',None)
+        if getattr(self,'pipeline_pose_refresh_exhausted',False):return False
+        if started is None:
+            self.pipeline_pose_refresh_started=now
+            self.pipeline_pose_refresh_source_ns=self.get_clock().now().nanoseconds
+            started=now
+            self.get_logger().warning('⏳ 回授已恢復，請求 AMCL 靜止更新')
+        if now-started<8.:
+            self._request_nomotion_if_due(now)
+            return True
+        self.pipeline_pose_refresh_exhausted=True
+        self.get_logger().warning('🛠️ AMCL 靜止更新逾時，保持停車並檢查導航資料')
+        return False
 
     def _tick_pipeline_bootstrap(self, now):
         """AMCL may be active after reset but need particles before publishing poses."""
@@ -2984,7 +3018,8 @@ class LocalizationManager(Node):
             self._stop_lateral("里程計軌跡偏移或旋轉超出限制")
             return
         speed = lateral_speed(progress, self.lateral_distance, self.lateral_cap,
-                              feedback_age=max(0., now-self.latest_odom_at))
+                              feedback_age=max(0., now-self.latest_odom_at, self.recovery_feedback.sample_age(now)),
+                              measured_speed=abs(getattr(self,'latest_lateral_velocity',0.)))
         if not hasattr(self,'lateral_progress_value') or abs(progress-self.lateral_progress_value) >= .001:
             self.lateral_progress_value, self.lateral_progress_at = progress,now
         if speed <= .02 and now-self.lateral_progress_at >= 1.:
@@ -3041,7 +3076,8 @@ class LocalizationManager(Node):
             if not getattr(self, 'managed_spin_resume', False):
                 self.near_convergence_announced = False
                 self.managed_spin = RecoverySpin(goal.target_yaw, time.monotonic(),
-                    self.last_odom_pose[2], self.latest_odom_stamp_ns, self.spin_time_allowance)
+                    self.last_odom_pose[2], self.latest_odom_stamp_ns, self.spin_time_allowance,
+                    allow_scan_completion=True)
             self.managed_spin_resume = False
             self.managed_spin_handle = None
             goal.target_yaw = self.managed_spin.sign*self.managed_spin.remaining

@@ -55,7 +55,8 @@ def test_recovery_metadata_cannot_extend_confirmation_forever():
 
 
 @pytest.mark.parametrize('persistent',[False,True])
-def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_fault(persistent):
+@pytest.mark.parametrize('uncertain_baseline',[False,True])
+def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_fault(persistent,uncertain_baseline):
     import ast
     import datetime
     import uuid
@@ -77,6 +78,10 @@ def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_
     bad=payload('unknown',slot_supply=dict(healthy=False,fault_confirmed=persistent))
     events=[empty,empty,bad] if persistent else [empty,empty,bad,empty,empty,empty]
     h=PowerActionHealth();baseline=h.observe(payload(),100.)
+    if uncertain_baseline:
+        uncertain=json.loads(payload());uncertain['ch2']['status']='unknown'
+        baseline=h.observe(json.dumps(uncertain),100.)
+        events.insert(0,payload())
     namespace=dict(PowerActionHealth=PowerActionHealth,power_health=h,
         cadence=SimpleNamespace(wake=lambda:None),
         latest_power_banks=baseline,latest_power_status_at=100.,latest_power_sequence=1,
@@ -84,7 +89,7 @@ def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_
         datetime=datetime.datetime,UTC=datetime.UTC,uuid=uuid,
         SlotActionVerifier=SlotActionVerifier,confirmation_samples=3,warning_seconds=30.,timeout_seconds=60.,
         POWER_STATUS_TIMEOUT_SECONDS=10.,active_task_id='test',cancellation_requests={},brief=str,
-        navigator=SimpleNamespace(get_logger=lambda:SimpleNamespace(error=lambda *_:None,info=lambda *_:None)),
+        navigator=SimpleNamespace(get_logger=lambda:SimpleNamespace(error=lambda *_:None,info=lambda *_:None,warning=lambda *_:None)),
         set_motion_inhibited=inhibits.append,
         progress=lambda *args,**kwargs:None,publish_task_state=lambda *args,**kwargs:None,
         task_state_publisher=None,
@@ -98,8 +103,8 @@ def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_
     exec(code,namespace)
     namespace['wait_for_slot_action'](dict(type='borrow',slot_number=1,task_id='test'),
                                     SimpleNamespace(state='waiting_action'),baseline)
-    assert inhibits==[True,False] and len(results)==1
+    assert inhibits==([True,False,True,False] if uncertain_baseline else [True,False]) and len(results)==1
     if persistent:
         assert results[0][0]=='failed' and '供電不足' in results[0][1]
     else:
-        assert results[0][0]=='done' and len(samples)==6
+        assert results[0][0]=='done' and len(samples)==(7 if uncertain_baseline else 6)

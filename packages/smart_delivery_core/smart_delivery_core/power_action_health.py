@@ -1,5 +1,6 @@
 """Invalidate action evidence on every bad sample, including legacy payloads."""
 import json
+import math
 from power_monitor.power_status import payload_to_slots
 from power_monitor.supply_health import supply_failure
 
@@ -26,7 +27,17 @@ class PowerActionHealth:
                 self.recovery_expected = True
             elif supply.get('state') != 'healthy':
                 self.recovery_expected = False
-            slots = payload_to_slots(text, require_healthy=True)
+            slots = payload_to_slots(text)
+            # Uncertain presence in a different slot must not block travel to
+            # service a confirmed slot. Electrical validity remains global;
+            # SlotActionVerifier still checks physical action evidence.
+            if any(slot.get('enabled',True) and (not slot.get('sensor_ok',True)
+                    or slot.get('current') is None or not math.isfinite(slot['current'])
+                    or (slot.get('voltage') is not None and not math.isfinite(slot['voltage'])))
+                   for slot in slots):
+                raise ValueError('槽位感測資料無效')
+            if not any(slot.get('status') not in {'unknown','disabled'} for slot in slots):
+                raise ValueError('尚無已確認槽位')
             if self.note:
                 raise ValueError(self.note)
         except (ValueError, TypeError, AttributeError) as exc:
@@ -39,6 +50,14 @@ class PowerActionHealth:
         self.confirmed_fault = False
         self.recovery_expected = False
         return slots
+
+    @staticmethod
+    def action_ready(slots):
+        # Navigation can use known inventory while other presence is uncertain.
+        # Physical wrong-slot verification needs a trustworthy baseline first.
+        return all(not slot.get('enabled',True) or
+                   (slot.get('sensor_ok',True) and slot.get('status') not in {'unknown','disabled'})
+                   for slot in slots)
 
     def failure(self, now):
         if self.valid or self.received_at is None or not 0 <= now-self.received_at <= 2.:

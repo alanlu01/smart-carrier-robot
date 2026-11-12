@@ -3,7 +3,7 @@ import math
 
 
 class RecoverySpin:
-    def __init__(self, target, now, yaw, stamp_ns, active_limit=35.):
+    def __init__(self, target, now, yaw, stamp_ns, active_limit=35., allow_scan_completion=False):
         self.target = abs(target)
         self.sign = 1. if target >= 0 else -1.
         self.started = self.last_tick = now
@@ -13,6 +13,7 @@ class RecoverySpin:
         self.reason = ''
         self.resumes = 0
         self.active_limit = active_limit
+        self.allow_scan_completion=allow_scan_completion
         self.cancel_at = None
         self.cancel_confirmed = False
         self.blocked_since = self.clear_since = None
@@ -84,7 +85,12 @@ class RecoverySpin:
         if self.travel-self.target > math.radians(3.):
             self.reason = 'endpoint_overshoot'
             return 'fail'  # no reverse correction, but never label overshoot precise
-        if self.remaining <= math.radians(3.):
+        if (self.remaining <= math.radians(3.) or
+                (self.allow_scan_completion and self.target>=math.pi and self.reason=='endpoint_braking'
+                 and self.remaining<=math.radians(15.))):
+            # No extra motion to perfect a diagnostic sweep. Downstream AMCL
+            # covariance + global geometry still must pass before dispatch.
+            if self.remaining>math.radians(3.):self.reason='settled_scan_coverage'
             self.phase = 'complete'
             return 'complete'
         self.phase = 'waiting'
@@ -120,4 +126,5 @@ class RecoverySpin:
                     remaining_deg=math.degrees(self.remaining), resumes=self.resumes,
                     active_sec=self.active_elapsed, wait_sec=self.wait_elapsed,
                     elapsed_sec=max(0., now-self.started), speed_limit=self.speed_limit(),
-                    braking_reserve_deg=math.degrees(self.braking_reserve))
+                    braking_reserve_deg=math.degrees(self.braking_reserve),
+                    precise_endpoint=abs(self.travel-self.target)<=math.radians(3.))
