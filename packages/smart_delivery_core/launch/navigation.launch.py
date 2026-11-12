@@ -104,7 +104,9 @@ def generate_launch_description():
         if LaunchConfiguration('use_composition').perform(context).lower() not in ('true','false'):
             raise ValueError('use_composition must be true or false')
         lease = NavigationLaunchLease().acquire()
-        transcript = NavigationTranscript(launch_config.log_dir, multi_process=True)
+        action_health_file=os.path.join(launch_config.log_dir,'navigation_action_health.json')
+        transcript = NavigationTranscript(launch_config.log_dir, multi_process=True,
+                                          action_health_file=action_health_file)
         def release(context):
             lease.close()
             return []
@@ -118,7 +120,8 @@ def generate_launch_description():
                 RegisterEventHandler(OnProcessIO(on_stdout=transcript.output,on_stderr=transcript.output)),
                 RegisterEventHandler(OnProcessExit(on_exit=transcript.exited)),
                 GroupAction(actions=nav_actions), localization_manager, delivery_goal_guard,
-                Node(package='smart_delivery_core',executable='navigation_health',output='screen')]
+                Node(package='smart_delivery_core',executable='navigation_health',output='screen',
+                     parameters=[{'action_health_file':action_health_file}])]
 
     return LaunchDescription(
         [

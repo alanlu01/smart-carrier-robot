@@ -10,8 +10,11 @@ import time
 class NavigationTranscript:
     MAX_PENDING = 2*1024*1024
 
-    def __init__(self, directory, multi_process=False):
+    def __init__(self, directory, multi_process=False, action_health_file=None):
         self.directory=Path(directory)
+        self.action_health_file = Path(action_health_file) if action_health_file else None
+        self.action_sequence = 0
+        self.fragments = {}
         self.multi_process = multi_process
         if multi_process:
             atexit.register(self.close)
@@ -87,6 +90,8 @@ class NavigationTranscript:
                 suffix,data=self.pending.popleft()
                 self.pending_bytes-=len(data)
             try:
+                if self.action_health_file is not None and suffix.endswith(('.stderr.log','.stdout.log')):
+                    self._observe_action(suffix,data)
                 if suffix.endswith('.exit.json'):
                     payload=json.loads(data)
                     with self.condition:
@@ -101,3 +106,20 @@ class NavigationTranscript:
                 with self.condition:
                     self.error=str(exc)[:300]
                     self.dropped_bytes+=len(data)
+
+    def _observe_action(self, suffix, data):
+        text = self.fragments.get(suffix,'')+data.decode(errors='replace')
+        lines = text.split('\n')
+        self.fragments[suffix] = lines.pop()[-8192:]
+        for line in lines:
+            if ('Timed out while waiting for action server to acknowledge goal request' not in line
+                    and 'Failed to cancel action server for' not in line
+                    and 'Delivery policy did not match the stamped goal' not in line):
+                continue
+            self.action_sequence += 1
+            payload=dict(sequence=self.action_sequence,wall_time=time.time(),
+                         reason=line[-1000:],source=suffix)
+            self.action_health_file.parent.mkdir(parents=True,exist_ok=True)
+            temporary=self.action_health_file.with_suffix('.tmp')
+            temporary.write_text(json.dumps(payload))
+            temporary.replace(self.action_health_file)

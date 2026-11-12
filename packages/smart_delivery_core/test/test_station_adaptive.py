@@ -84,6 +84,7 @@ def test_persistent_blockage_is_finite_and_not_a_preflight_data_error(motion):
 
 def test_mode_switch_waits_for_native_terminal_and_happens_only_once(motion):
     manager,node,clock,pose,stopped,permission=motion
+    node.navigation_actions_ready=lambda:True
     tick(manager,clock)
     manager._normal_plan_unsafe=lambda *_:True
     assert not manager.isTaskComplete() and node.cancels==1 and len(node.sent)==1
@@ -110,3 +111,27 @@ def test_tf_failure_does_not_trigger_station_fallback(motion):
     tick(manager,clock);node.complete=True;node.result=TaskResult.FAILED
     node.result_future=NS(result=lambda:NS(result=NS(error_code=102,error_msg='TF error')))
     assert manager.isTaskComplete() and manager.mode_switches==0 and len(node.sent)==1
+
+
+def test_stopped_ordinary_yaw_tail_drains_then_uses_bounded_alignment(motion):
+    manager,node,clock,pose,stopped,permission=motion
+    node.navigation_actions_ready=lambda:True
+    tick(manager,clock);pose[0]=(.95,0.,.125)
+    assert not manager.isTaskComplete() and not node.cancels
+    clock[0]+=.6
+    assert not manager.isTaskComplete() and node.cancels==1 and len(node.sent)==1
+    assert manager.final_heading_pending and manager.replan_pending
+    node.complete=True;node.result=TaskResult.CANCELED
+    tick(manager,clock)
+    assert manager.phase=='aligning' and 'station_align.xml' in node.sent[-1][1]
+    node.result=TaskResult.SUCCEEDED
+    finish_action(manager,node,clock,pose)
+    assert manager.getResult()==TaskResult.SUCCEEDED and len(node.sent)==2
+
+
+def test_moving_or_unsafe_heading_tail_does_not_interrupt_normal_navigation(motion):
+    manager,node,clock,pose,stopped,permission=motion
+    tick(manager,clock);pose[0]=(.95,0.,.125);stopped[0]=False
+    tick(manager,clock);assert not node.cancels
+    stopped[0]=True;manager.grid.turn_clear=lambda *_:False
+    tick(manager,clock);assert not node.cancels and not manager.final_heading_pending

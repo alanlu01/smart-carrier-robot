@@ -111,6 +111,7 @@ class OptionalIdleRuntime:
         self.log_key = None
         self.last_progress_log = 0.0
         self.localization_status = None
+        self.localization_evidence = {}
         self.localization_pauses = 0
         self.data_pauses = 0
         self.localization_restarts = 0
@@ -201,6 +202,7 @@ class OptionalIdleRuntime:
             if self.localization_status and stamp <= self.localization_status[1]:
                 return
             self.localization_status = (time.monotonic(), stamp, payload['state'])
+            self.localization_evidence = payload
         except (ValueError, KeyError, TypeError, OverflowError):
             return
 
@@ -519,7 +521,8 @@ class OptionalIdleRuntime:
         """Log transitions and bounded progress, never every detector frame."""
         if not self.config['people']['enabled']:
             return
-        key = (self.state, self.reason, self.parking_attempts, self.parking_outcome)
+        idle_reason=self.idle_clock.reason if self.state=='idle' else None
+        key = (self.state, self.reason, self.parking_attempts, self.parking_outcome,idle_reason)
         now = time.monotonic()
         transition = key != self.log_key
         progress = self.state in ('observing', 'waiting_observation_stop', 'waiting_observation_retry',
@@ -541,6 +544,20 @@ class OptionalIdleRuntime:
             remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
             text='💤 已停妥：'+str(self.idle_clock.point['name'])+'｜'+(
                 f'人流冷卻 {cooldown:.0f} 秒' if cooldown>0 else f'人流待機剩餘 {remaining:.0f} 秒')
+        elif self.state=='idle' and self.idle_clock.point is not None:
+            labels={
+                'map_pose_outside_auxiliary_hysteresis':'⏸️ 人流計時暫停：定位座標調整中',
+                'confirming_stationary_map_correction':'⏳ 人流計時暫停：確認原地定位修正',
+                'stationary_map_correction_verified':'✅ 原地定位修正已確認，恢復人流計時',
+                'map_pose_deviation_persistent':'🔁 人流計時重設：定位偏移持續',
+                'physical_odom_displacement':'🔁 人流計時重設：車輛已移動',
+                'short_tf_gap_paused':'⏸️ 人流計時暫停：等待座標更新',
+                'tf_gap_expired':'🔁 人流計時重設：座標資料中斷',
+            }
+            text=labels.get(idle_reason,text)
+            if idle_reason=='counting_verified_stationary_parking' and transition:
+                remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
+                text=f'💤 人流計時中：剩餘 {remaining:.0f} 秒'
         self.navigator.get_logger().info(text)
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
@@ -591,10 +608,11 @@ class OptionalIdleRuntime:
             self.home.expire(time.monotonic())
             battery_ok = self.home.healthy and not self.home.cutoff
         ready = bool(self.ready())
+        action_ready=getattr(self.navigator,'navigation_actions_ready',lambda:True)()
         odom_ok = (self.last_odom is not None
                    and self._stamp_fresh(self.last_odom[0], self.last_odom[1].header.stamp))
         pose_ok = self._pose() is not None
-        checks = {'map_matches':bool(self.map_matches),'delivery_ready':ready,
+        checks = {'map_matches':bool(self.map_matches),'delivery_ready':ready and action_ready,
                   'motion_allowed':not self.inhibited,'battery_healthy':bool(battery_ok),
                   'odom_fresh':bool(odom_ok),'map_pose_valid':pose_ok}
         failed = [key for key,value in checks.items() if not value]
@@ -1173,6 +1191,7 @@ class OptionalIdleRuntime:
                 self.spin_resume_pending = False
                 self._log_people_state()
             elif self.state == 'going_people_standby' and self.interrupt_reason == 'selected_standby_safety_pause':
+                self.parking_attempts=max(0,self.parking_attempts-1)
                 self._begin_parking_recovery(self.interrupt_reason)
             elif (self.state == 'going_people_standby' and self.interrupt_reason in (
                     None, 'observation_or_navigation_timeout')):
@@ -1369,7 +1388,8 @@ class OptionalIdleRuntime:
             and self._localization_phase() == 'LOCALIZED')
         if not self.idle_clock.update(now,parked=parked,safe=safe,
                                      stationary=stationary,pose=pose,odom=odom_pose,
-                                     transient_tf_gap=transient):
+                                     transient_tf_gap=transient,
+                                     trusted_map_correction=self._trusted_idle_correction()):
             if self.idle_clock.elapsed == 0.:
                 self.idle_since = None
             return False
@@ -1378,3 +1398,14 @@ class OptionalIdleRuntime:
             return False
         self._start(people['observation_pose'], 'going_observation', '', people['navigation_timeout_sec'])
         return True
+
+    def _trusted_idle_correction(self):
+        payload=getattr(self,'localization_evidence',{})
+        if self._localization_phase()!='LOCALIZED' or payload.get('dispatch_allowed') is not True:
+            return False
+        try:
+            values=[float(payload[k]) for k in ('xy_std','yaw_std','map_match_score')]
+            return (all(math.isfinite(v) for v in values) and values[0]<=.20
+                    and values[1]<=math.radians(8.) and values[2]>=.60
+                    and payload.get('mild_map_observation') is not True)
+        except (ValueError,TypeError,KeyError):return False

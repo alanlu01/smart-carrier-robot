@@ -20,6 +20,10 @@ def hull(points):
 
 def station_parameters(source):
     parameters = deepcopy(source)
+    bt = parameters['bt_navigator']['ros__parameters']
+    libraries = bt.setdefault('plugin_lib_names', [])
+    if 'smart_navigation_policy_bt_node' not in libraries:
+        libraries.append('smart_navigation_policy_bt_node')
     controller = parameters['controller_server']['ros__parameters']
     station = deepcopy(controller['FollowPath'])
     station.update(wz_max=.15,

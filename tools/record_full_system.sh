@@ -49,6 +49,7 @@ TOPICS=(
   /vehicle_battery/verified_status
   /smart_carrier/delivery_navigation_active /delivery/standby_state /delivery/station_state
   /delivery/station_controller_state
+  /delivery/navigation_policy
   /delivery/startup_state
   /chassis/odom_local /chassis/odometry_transport_health
   /chassis/serial_rx_health /chassis/serial_tx_health /chassis/serial_feedback /navigation/pipeline_health

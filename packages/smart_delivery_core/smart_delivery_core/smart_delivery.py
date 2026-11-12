@@ -1394,6 +1394,8 @@ def _run_delivery(runtime_holder):
 
     current_pos = {"x": 0.0, "y": 0.0}
     last_stale_warning_at = 0.0
+    action_wait_log_at = -float('inf')
+    was_waiting_localization = False
     print("\n🚀 智慧動態派車系統已啟動")
 
     while rclpy.ok():
@@ -1469,7 +1471,18 @@ def _run_delivery(runtime_holder):
             queue_result(expired,DeliveryStateMachine('waiting_localization'),'failed',
                          'Navigation/data recovery deadline exceeded (90 s)')
             continue
+        if not navigator.navigation_actions_ready():
+            set_navigation_active(False)
+            if time.monotonic()-action_wait_log_at>=5.:
+                status=navigator.action_health or {}
+                text=('⚠️ 導航恢復未完成，請檢查 start_nav；保留任務'
+                      if status.get('state')=='manual_required'
+                      else '⏸️ 等待導航回應恢復，保留任務')
+                navigator.get_logger().warning(text)
+                action_wait_log_at=time.monotonic()
+            continue
         if not localization_can_resume():
+            was_waiting_localization = True
             retry_tf_ready_since = None
             for order in pending_orders:
                 if order.get("_tf_retry_wait_started") is not None:
@@ -1493,6 +1506,16 @@ def _run_delivery(runtime_holder):
                 )
                 last_localization_warning_at = now
             continue
+
+        if was_waiting_localization:
+            was_waiting_localization=False
+            navigator.get_logger().info('✅ 定位穩定，恢復配送判斷')
+        health=navigator.action_health or {}
+        recovery_token=(localization_interrupt_generation,health.get('session'),
+                        health.get('recovered_generation',0))
+        if (localization_interrupt_generation>0 or health.get('recovered_generation',0)>0):
+            if standby_retry.rearm_after_recovery(recovery_token):
+                navigator.get_logger().info('🔁 定位／導航已恢復，重新嘗試停靠')
 
         if not pending_orders:
             now = time.monotonic()

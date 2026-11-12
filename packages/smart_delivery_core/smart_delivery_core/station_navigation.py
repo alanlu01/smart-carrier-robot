@@ -137,6 +137,7 @@ class StationNavigation:
         labels = {'waiting_data':'⏳ 進出站等待資料','departure':'↔️ 低速出站',
             'staging':'➡️ 前往進站準備點','entry':'↔️ 連續低速進站',
             'direct':'➡️ 直接導航','aligning':'🧭 小幅對正',
+            'waiting_action_health':'⏳ 確認導航回應',
             'waiting_clearance':'⏳ 等待進出站通道',
             'settling':'⏳ 確認停妥','arrived':'✅ 停靠完成','failed':'⚠️ 進出站中止',
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
@@ -161,6 +162,7 @@ class StationNavigation:
             clearance_kind=getattr(self,'clearance_kind',''),
             motion_stalled=getattr(self,'motion_stalled',False),
             clearance_timeout=getattr(self,'clearance_timeout',False),
+            native_error=getattr(self,'native_error',(0,'')),
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
             wait_blockers=getattr(self,'wait_blockers',[]),
             deadline_remaining_sec=round(max(0.,getattr(self,'deadline',0.)-time.monotonic()),2),
@@ -217,6 +219,8 @@ class StationNavigation:
         self.mode,self.mode_reason,self.mode_switches = None,'',0
         self.decision_time_ms = None
         self.replan_pending = False
+        self.final_heading_pending = False
+        self.final_heading_since = None
         self.checked_plan = None
         self.alignment_attempts,self.final_corrections = 0,0
         self.align_anchor = None
@@ -229,6 +233,7 @@ class StationNavigation:
         self.clearance_deadline,self.clearance_grid_stamp = None,None
         self.sequence_deadline = time.monotonic()+240.
         self.native_error = (0,'')
+        self.pending_unknown_failure = None
         self.after_stop,self.start_at,self.deadline = 'prepare',time.monotonic(),time.monotonic()+self.preflight_wait_sec
         self._report('waiting_data')
 
@@ -255,7 +260,10 @@ class StationNavigation:
         self.route_sent_at = time.monotonic()
         self.goals_submitted += 1
         self._report(phase)
-        accepted = self.nav.goToPose(self._pose_message(point),behavior_tree=tree)
+        goal=self._pose_message(point)
+        if hasattr(self.nav,'configure_navigation_goal'):
+            tree=self.nav.configure_navigation_goal(goal,tree)
+        accepted = self.nav.goToPose(goal,behavior_tree=tree)
         self.active_goal = accepted is not False
         if not self.active_goal: self._finish(TaskResult.FAILED,'failed','Nav2 拒絕目標')
 
@@ -405,6 +413,21 @@ class StationNavigation:
         self.replan_pending=True
         self.nav.cancelTask()
 
+    def _finish_heading_stalled(self, pose):
+        # Native ordinary MPPI can reach XY yet produce a yaw command below
+        # this chassis' breakaway torque. Use the existing bounded shim only
+        # after fresh odometry proves it is stopped, in verified turning space.
+        eligible=(self.park and self.phase=='direct' and self.mode=='normal'
+            and math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.10
+            and .10<abs(angle_error(pose[2],self.target[2]))<=.35
+            and self._stopped() and self.grid.turn_clear(pose,self.target[2]))
+        if not eligible:
+            self.final_heading_since=None
+            return False
+        now=time.monotonic()
+        self.final_heading_since=now if self.final_heading_since is None else self.final_heading_since
+        return now-self.final_heading_since>=.5
+
     @staticmethod
     def _blocked_failure(code, message):
         from nav2_msgs.action import FollowPath
@@ -455,6 +478,17 @@ class StationNavigation:
         completed = self.nav.isTaskComplete() if self.active_goal else None
         if not self.active_goal: self._pump_callbacks()
         if not self.running: return True
+        pending=getattr(self,'pending_unknown_failure',None)
+        if pending is not None:
+            if not self.nav.navigation_actions_ready():
+                self.failure,self.data_unavailable='導航回應異常，等待導航恢復',True
+            elif time.monotonic()<pending[1] and not self.cancelled:
+                return False
+            result=TaskResult.CANCELED if self.cancelled else pending[0]
+            self.pending_unknown_failure=None
+            self._finish(TaskResult.FAILED if self.failure else result,
+                         'cancelled' if self.cancelled and not self.failure else 'failed',self.failure)
+            return True
         pose,data_ok = self._pose(),self._data()
         # Pump native actions even when cancelling; do not release the mission
         # lease or submit a successor until the server reports a terminal state.
@@ -500,9 +534,19 @@ class StationNavigation:
             self.cancelTask()
         if not self.cancelled and not self.permitted():
             self.cancelTask()
+        if (not self.cancelled and hasattr(self.nav,'navigation_actions_ready')
+                and not self.nav.navigation_actions_ready()):
+            self.failure,self.data_unavailable='導航回應異常，等待導航恢復',True
+            self.cancelTask()
         if (self.active_goal and not completed and not self.cancelled and not self.replan_pending
-                and pose is not None and data_ok and self._normal_plan_unsafe(pose)):
-            self._request_station_fallback()
+                and pose is not None and data_ok):
+            if self._finish_heading_stalled(pose):
+                self.final_heading_pending=True
+                self.mode,self.mode_reason,self.mode_switches='station','final_heading_stopped',1
+                self.replan_pending=True
+                self.nav.cancelTask()
+            elif self._normal_plan_unsafe(pose):
+                self._request_station_fallback()
         if self.active_goal:
             if not completed:
                 return False
@@ -514,6 +558,17 @@ class StationNavigation:
                     self.native_error = int(message.error_code),str(message.error_msg)
                 except (AttributeError,TypeError,ValueError):
                     pass
+                if (hasattr(self.nav,'navigation_actions_ready')
+                        and not self.nav.navigation_actions_ready()):
+                    self.failure,self.data_unavailable='導航回應異常，等待導航恢復',True
+                elif (result==TaskResult.FAILED and not self.cancelled and not self.replan_pending
+                        and self.native_error==(0,'')
+                        and hasattr(self.nav,'navigation_actions_ready')):
+                    # Native ACK timeout can return FAILED with error_code=0.
+                    # Let the bounded stderr observer report the actual fault.
+                    self.pending_unknown_failure=(result,time.monotonic()+1.5)
+                    self._report('waiting_action_health')
+                    return False
             if (not self.cancelled and self.mode=='normal' and not self.mode_switches
                     and result==TaskResult.FAILED and self._blocked_failure(*self.native_error)):
                 self.mode,self.mode_reason,self.mode_switches='station','normal_route_blocked',1
@@ -521,7 +576,7 @@ class StationNavigation:
             if self.replan_pending and not self.cancelled:
                 self.replan_pending=False
                 self.stage=None
-                self.after_stop,self.stop_since='prepare',None
+                self.after_stop,self.stop_since=('final_align' if self.final_heading_pending else 'prepare'),None
                 self.deadline=min(self.sequence_deadline,time.monotonic()+6.)
                 self._report('settling','確認停妥後改用進出站模式')
             elif self.cancelled or result != TaskResult.SUCCEEDED:

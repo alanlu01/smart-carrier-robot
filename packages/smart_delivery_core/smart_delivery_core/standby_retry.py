@@ -14,6 +14,8 @@ class StandbyRetryPolicy:
     unexpected_cancellations: int = 0
     retry_at: float = 0.0
     motion_blocked: bool = False
+    recovery_rearms: int = 0
+    recovery_token: object = None
 
     def __post_init__(self):
         if self.max_attempts < 1 or self.retry_delay <= 0:
@@ -26,6 +28,20 @@ class StandbyRetryPolicy:
         self.unexpected_cancellations = 0
         self.retry_at = 0.0
         self.motion_blocked = False
+        self.recovery_rearms = 0
+        self.recovery_token = None
+
+    def rearm_after_recovery(self, token):
+        """At most one extra parking round per episode, never after motor stall."""
+        if token is None or token==self.recovery_token:
+            return False
+        self.recovery_token=token
+        if self.motion_blocked or self.attempts<self.max_attempts or self.recovery_rearms>=1:
+            return False
+        self.recovery_rearms+=1
+        self.failures=self.unexpected_cancellations=0
+        self.retry_at=0.
+        return True
 
     def select_goal(self, point):
         """Keep one retry budget for the same actual parking pose."""

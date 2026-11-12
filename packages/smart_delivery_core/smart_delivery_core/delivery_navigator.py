@@ -7,6 +7,10 @@ from nav2_simple_commander.robot_navigator import BasicNavigator
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
 from smart_delivery_core.delivery_console import startup_status
+from ament_index_python.packages import get_package_share_directory
+from smart_delivery_core.navigation_policy import navigation_policy
+from smart_delivery_core.delivery_inputs import shared_inputs, message_json
+from std_srvs.srv import Trigger
 
 
 class Nav2StartupUnavailable(RuntimeError):
@@ -21,9 +25,64 @@ class DeliveryNavigator(BasicNavigator):
 
     def __init__(self):
         super().__init__()
+        self.policy_share = get_package_share_directory('smart_delivery_core')
+        self.policy_pub = self.create_publisher(String, '/delivery/navigation_policy',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
         self.startup_pub = self.create_publisher(String, '/delivery/startup_state',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                        reliability=ReliabilityPolicy.RELIABLE))
+        self.action_health=None
+        self.action_health_at=-float('inf')
+        self.action_request=None
+        self.action_request_at=0.
+        self.action_request_warned=False
+        self.action_requested_key=None
+        self.action_recovery_client=self.create_client(Trigger,'/navigation/recover_actions')
+        shared_inputs(self).subscribe(String,'/navigation/pipeline_health',self._action_health,1)
+        self.create_timer(.5,self._poll_action_recovery)
+
+    def _action_health(self, message):
+        try:
+            payload=message_json(message)
+            age=(self.get_clock().now().nanoseconds-payload['sample_ros_stamp_ns'])/1e9
+            if -.1<=age<=3. and isinstance(payload.get('action'),dict):
+                self.action_health,self.action_health_at=payload['action'],time.monotonic()
+        except (KeyError,ValueError,TypeError,AttributeError):pass
+
+    def navigation_actions_ready(self):
+        # Initial discovery still uses the existing Nav2/localization startup
+        # gates. Once observed, missing heartbeats never clear an action fault.
+        return (self.action_health is None or (time.monotonic()-self.action_health_at<=3.
+                and self.action_health.get('state')=='healthy'))
+
+    def _poll_action_recovery(self):
+        if self.action_request is not None:
+            if not self.action_request.done():
+                if time.monotonic()-self.action_request_at>3. and not self.action_request_warned:
+                    self.action_request_warned=True
+                    self.get_logger().warning('⚠️ 導航恢復請求未回應，暫留原地；不重複重置')
+                return
+            try:self.action_request.result()
+            except Exception:pass
+            self.action_request=None
+        status=self.action_health or {}
+        key=(status.get('session'),status.get('fault_sequence'))
+        if (status.get('state')=='fault' and key!=self.action_requested_key
+                and time.monotonic()-self.action_health_at<=3.
+                and self.action_recovery_client.service_is_ready()):
+            self.action_requested_key=key
+            self.action_request=self.action_recovery_client.call_async(Trigger.Request())
+            self.action_request_at=time.monotonic()
+            self.action_request_warned=False
+            self.get_logger().warning('⏸️ 導航回應異常，停妥後嘗試恢復；保留任務')
+
+    def configure_navigation_goal(self, pose, behavior_tree=''):
+        selected = navigation_policy(pose, behavior_tree, self.policy_share)
+        if selected is not None:
+            behavior_tree, policy = selected
+            self.policy_pub.publish(String(data=policy))
+        return behavior_tree
 
     def _waitForNodeToActivate(self, node_name):
         started = time.monotonic()
