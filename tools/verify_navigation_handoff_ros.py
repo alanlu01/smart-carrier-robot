@@ -157,6 +157,17 @@ def main():
                 policy_pub.publish(String(data=policy))
             answer=resolve(client.send_goal_async(request)); assert answer.accepted
             return answer
+
+        def managed(x,y,yaw,tree):
+            from types import SimpleNamespace
+            phase['tree']=tree
+            p=PoseStamped();p.header.frame_id='map';p.header.stamp=node.get_clock().now().to_msg()
+            p.pose.position.x=x;p.pose.position.y=y
+            p.pose.orientation.z=math.sin(yaw/2);p.pose.orientation.w=math.cos(yaw/2)
+            station.start(p,label='software standby')
+            assert pump(station.isTaskComplete,40.),(station.phase,state)
+            return SimpleNamespace(status=4 if station.getResult()==TaskResult.SUCCEEDED else 6,
+                result=SimpleNamespace(error_msg=station.error_details()[1],error_code=station.error_details()[0]))
         for index,(x,y,yaw,tree) in enumerate([
             (.8,0.,0.,'smart_delivery_navigate.xml'),
             (.8,.45,0.,'station_y.xml'),
@@ -169,15 +180,8 @@ def main():
         ]):
             if tree=='station_align.xml':x,y=state['x'],state['y']
             start=time.monotonic()
-            if index==4 and '--owned' in sys.argv:
-                phase['tree']=tree
-                p=PoseStamped();p.header.frame_id='map';p.header.stamp=node.get_clock().now().to_msg()
-                p.pose.position.x=x;p.pose.position.y=y;p.pose.orientation.w=1.
-                station.start(p,label='software standby')
-                assert pump(station.isTaskComplete,40.),(station.phase,state)
-                from types import SimpleNamespace
-                answer=SimpleNamespace(status=4 if station.getResult()==TaskResult.SUCCEEDED else 6,
-                    result=SimpleNamespace(error_msg=station.error_details()[1],error_code=station.error_details()[0]))
+            if tree=='smart_delivery_navigate.xml' and '--owned' in sys.argv:
+                answer=managed(x,y,yaw,tree)
             else:
                 handle=send(x,y,yaw,tree)
                 answer=resolve(handle.get_result_async(),35.)
@@ -227,8 +231,11 @@ def main():
             assert resolve(node.create_client(GetState,'/amcl/get_state').call_async(GetState.Request())).current_state.id==3
             handle=send(state['x'],state['y']+.3,state['yaw'],'station_y.xml')
             assert resolve(handle.get_result_async(),20.).status==4
-            handle=send(state['x']+.4,state['y'],0.,'smart_delivery_navigate.xml')
-            assert resolve(handle.get_result_async(),20.).status==4
+            if '--owned' in sys.argv:
+                assert managed(state['x']+.4,state['y'],0.,'smart_delivery_navigate.xml').status==4
+            else:
+                handle=send(state['x']+.4,state['y'],0.,'smart_delivery_navigate.xml')
+                assert resolve(handle.get_result_async(),20.).status==4
             recovery_report=dict(native_navigation_reset_startup=True,stale_stop_proof_blocked=True,
                 localization_lifecycle_preserved=True,new_station_and_normal_goals_succeeded=True,
                 injected_diagnostic_only=True,action=health[-1]['action'])

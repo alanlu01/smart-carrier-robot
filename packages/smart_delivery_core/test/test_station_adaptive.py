@@ -135,3 +135,15 @@ def test_moving_or_unsafe_heading_tail_does_not_interrupt_normal_navigation(moti
     tick(manager,clock);assert not node.cancels
     stopped[0]=True;manager.grid.turn_clear=lambda *_:False
     tick(manager,clock);assert not node.cancels and not manager.final_heading_pending
+
+
+def test_recorded_failed_zero_code_waits_for_action_fault_and_preserves_data_retry(motion):
+    manager,node,clock,pose,stopped,permission=motion
+    fault=[False];node.navigation_actions_ready=lambda:not fault[0]
+    tick(manager,clock);node.complete=True;node.result=TaskResult.FAILED
+    node.result_future=NS(result=lambda:NS(result=NS(error_code=0,error_msg='')))
+    assert not manager.isTaskComplete() and manager.phase=='waiting_action_health'
+    fault[0]=True
+    assert manager.isTaskComplete() and manager.getResult()==TaskResult.FAILED
+    assert manager.data_unavailable and len(node.sent)==1
+    assert '導航回應異常' in manager.error_details()[1]

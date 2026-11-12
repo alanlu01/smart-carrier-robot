@@ -22,7 +22,7 @@
 
 ## 驗證
 
-- 配送核心742項功能測試、電源／API橋接／語意108項，共850項通過；另C++速度包絡測試通過。未包含原有ament版權／flake8／PEP257格式檢查。
+- 配送核心743項功能測試、電源／API橋接／語意108項，共851項通過；另C++速度包絡測試通過。未包含原有ament版權／flake8／PEP257格式檢查。
 - 真正composed PlannerServer、ControllerServer、BTNavigator等，搭配軟體底盤，通過8段普通／進出站／對正交接、取消後進站、錯誤策略不產生路徑或位移、普通速度不被station限速污染，以及資料過期時拒絕恢復、新鮮停車後導航層RESET／STARTUP、AMCL保持active、恢復後再進站和普通導航。
 - 軟體底盤含0.11rad/s角速度死區；使用真正StationNavigation的普通停靠通過小角度尾段交接。這是邊界模型，不是重新校準實車起轉門檻。
 - `verify_station_actions_ros.py --loaded --remote-obstacle`驗證生產類似callback負載、遠端障礙、安全取消、資料缺失及真實待機呼叫流程。
