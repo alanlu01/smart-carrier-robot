@@ -1,5 +1,6 @@
 """Exercise native composed planner/controller/BT handoffs on a software plant."""
 import json
+from copy import deepcopy
 import math
 import os
 from pathlib import Path
@@ -51,17 +52,19 @@ def main():
     from smart_delivery_core.station_navigation import StationNavigation
     from tf2_ros import Buffer, TransformListener
     node = BasicNavigator(node_name='codex_navigation_handoff_plant')
-    state = dict(x=0., y=0., yaw=0., command=Twist(), received=-math.inf, last=time.monotonic())
+    state = dict(x=0., y=0., yaw=0., command=Twist(), received=-math.inf, last=time.monotonic(), map_shift=0.)
     frames = TransformBroadcaster(node)
     static = StaticTransformBroadcaster(node)
     tr = TransformStamped(); tr.header.frame_id='map'; tr.child_frame_id='odom'
     tr.transform.rotation.w=1.; tr.header.stamp=node.get_clock().now().to_msg()
-    static.sendTransform(tr)
     odom = node.create_publisher(Odometry, '/odom', 10)
     scan = node.create_publisher(LaserScan, '/scan_filtered', qos_profile_sensor_data)
     paths = []
     command_peaks={}
-    phase={'tree':'none'}
+    command_trace={}
+    for topic in ('/cmd_vel_nav','/cmd_vel_smoothed'):
+        node.create_subscription(Twist,topic,lambda m,t=topic:command_trace.update({t:[m.linear.x,m.linear.y,m.angular.z]}),10)
+    phase={'tree':'none','stress':False,'feedback':0.,'feedback_at':0.,'rate':0.}
     health=[]
     node.create_subscription(String,'/navigation/pipeline_health',lambda m:health.append(json.loads(m.data)),1)
     lease_pub=node.create_publisher(Bool,'/smart_carrier/delivery_navigation_active',
@@ -89,6 +92,7 @@ def main():
     node.create_subscription(NavPath, '/plan', lambda m:paths.append((time.monotonic(),len(m.poses))), 1)
     def command(message):
         state['command'], state['received'] = message, time.monotonic()
+        command_trace['/cmd_vel']=[message.linear.x,message.linear.y,message.angular.z]
         tree=phase['tree']
         command_peaks[tree]=max(command_peaks.get(tree,0.),math.hypot(message.linear.x,message.linear.y))
     node.create_subscription(Twist, '/cmd_vel', command, 10)
@@ -97,16 +101,23 @@ def main():
         v=state['command'] if now-state['received']<.3 else Twist(); a=state['yaw']
         state['x']+=(math.cos(a)*v.linear.x-math.sin(a)*v.linear.y)*dt
         state['y']+=(math.sin(a)*v.linear.x+math.cos(a)*v.linear.y)*dt
-        rate=v.angular.z if abs(v.angular.z)>.11 else 0.
+        target=(1.5 if phase['stress'] else 1.)*v.angular.z if abs(v.angular.z)>.11 else 0.
+        phase['rate']+=max(-.8*dt,min(.8*dt,target-phase['rate']))
+        rate=phase['rate']
         state['yaw']+=rate*dt
+        if not phase['stress'] or now-phase['feedback_at']>=.5:
+            phase['feedback'],phase['feedback_at']=rate,now
         stamp=node.get_clock().now().to_msg()
         tr=TransformStamped(); tr.header.frame_id='odom'; tr.child_frame_id='base_footprint'
         tr.header.stamp=stamp; tr.transform.translation.x=state['x']; tr.transform.translation.y=state['y']
         tr.transform.rotation.z=math.sin(state['yaw']/2); tr.transform.rotation.w=math.cos(state['yaw']/2)
-        frames.sendTransform(tr)
+        correction=TransformStamped();correction.header.frame_id='map';correction.child_frame_id='odom'
+        correction.header.stamp=stamp;correction.transform.rotation.w=1.
+        correction.transform.translation.x=state['map_shift']
+        frames.sendTransform([correction,tr])
         m=Odometry(); m.header.frame_id='odom'; m.child_frame_id='base_footprint'; m.header.stamp=stamp
         m.pose.pose.position.x=state['x']; m.pose.pose.position.y=state['y']
-        m.pose.pose.orientation=tr.transform.rotation; m.twist.twist=v; m.twist.twist.angular.z=rate
+        m.pose.pose.orientation=tr.transform.rotation; m.twist.twist=deepcopy(v); m.twist.twist.angular.z=phase['feedback']
         odom.publish(m)
         laser=LaserScan(); laser.header.frame_id='base_footprint'; laser.header.stamp=stamp
         laser.angle_min=-math.pi; laser.angle_max=math.pi; laser.angle_increment=2*math.pi/720
@@ -138,7 +149,11 @@ def main():
         assert service.wait_for_service(timeout_sec=15.)
         end=time.monotonic()+30.
         while time.monotonic()<end:
-            if resolve(service.call_async(GetState.Request())).current_state.id==3:break
+            response=service.call_async(GetState.Request())
+            if pump(response.done,1.5):
+                if response.result().current_state.id==3:break
+            else:
+                response.cancel();service.remove_pending_request(response)
         else:raise AssertionError('Nav2 did not activate')
         client=ActionClient(node,NavigateToPose,'/navigate_to_pose')
         assert client.wait_for_server(timeout_sec=5.)
@@ -168,7 +183,7 @@ def main():
             assert pump(station.isTaskComplete,40.),(station.phase,state)
             return SimpleNamespace(status=4 if station.getResult()==TaskResult.SUCCEEDED else 6,
                 result=SimpleNamespace(error_msg=station.error_details()[1],error_code=station.error_details()[0]))
-        for index,(x,y,yaw,tree) in enumerate([
+        routes = [
             (.8,0.,0.,'smart_delivery_navigate.xml'),
             (.8,.45,0.,'station_y.xml'),
             (.8,.45,.125,'station_align.xml'),
@@ -177,7 +192,9 @@ def main():
             (.5,0.,0.,'smart_delivery_navigate.xml'),
             (.5,.4,0.,'station_y.xml'),
             (0.,0.,0.,'smart_delivery_navigate.xml'),
-        ]):
+        ]
+        if '--alignment-only' in sys.argv:routes=[]
+        for index,(x,y,yaw,tree) in enumerate(routes):
             if tree=='station_align.xml':x,y=state['x'],state['y']
             start=time.monotonic()
             if tree=='smart_delivery_navigate.xml' and '--owned' in sys.argv:
@@ -191,6 +208,34 @@ def main():
             assert answer.status==4,result
             assert pump(lambda:math.hypot(state['command'].linear.x,state['command'].linear.y)<.01
                         and abs(state['command'].angular.z)<.01,3.)
+        if '--alignment-stress' in sys.argv:
+            phase['stress']=True
+            for delta in (1.92,-1.92,.20,-.20):
+                assert pump(lambda:abs(phase['rate'])<.03,3.)
+                anchor=(state['x'],state['y']);target=state['yaw']+delta
+                handle=send(anchor[0]+state['map_shift'],anchor[1],target,'station_align.xml')
+                result=handle.get_result_async()
+                assert pump(lambda:abs(phase['rate'])>.1,4.),dict(state=state,phase=phase,commands=command_trace,root=str(root))
+                # Recorded map XY correction exceeded 5 cm, with no physical
+                # translation. Latched XY + strict physical outer guard owns it.
+                state['map_shift']+=.14
+                answer=resolve(result,22.)
+                assert answer.status==4,(delta,answer,state)
+                native_finish_rate=phase['rate']
+                # Native consumes held 2Hz feedback. Match the production
+                # outer stop/settle gate before checking the final pose.
+                assert pump(lambda:abs(phase['rate'])<=.03 and abs(state['command'].angular.z)<.01,3.)
+                pump(lambda:False,.75)
+                assert abs(math.atan2(math.sin(target-state['yaw']),math.cos(target-state['yaw'])))<=.06
+                assert abs(phase['rate'])<=.03
+                assert math.hypot(state['x']-anchor[0],state['y']-anchor[1])<.001
+                print(json.dumps(dict(alignment_stress=delta,passed=True,native_finish_rate=native_finish_rate,settled_rate=phase['rate'])),flush=True)
+            state['map_shift']=0.
+            pump(lambda:False,.3)
+            phase['stress']=False
+            if '--alignment-only' in sys.argv:
+                print(json.dumps(dict(passed=True,alignment_stress=True,domain=231,root=str(root))),flush=True)
+                return
         handle=send(1.,0.,0.,'smart_delivery_navigate.xml')
         assert pump(lambda:math.hypot(state['command'].linear.x,state['command'].linear.y)>.05,5.)
         resolve(handle.cancel_goal_async()); assert resolve(handle.get_result_async()).status==5

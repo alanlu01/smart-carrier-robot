@@ -145,13 +145,16 @@ class StationNavigation:
         self.last_report = phase,reason
         labels = {'waiting_data':'⏳ 進出站等待資料','departure':'↔️ 低速出站',
             'staging':'➡️ 前往進站準備點','entry':'↔️ 連續低速進站',
-            'direct':'➡️ 直接導航','aligning':'🧭 小幅對正',
+            'direct':'➡️ 直接導航','aligning':'🧭 車頭對正',
             'waiting_action_health':'⏳ 確認導航回應',
             'waiting_clearance':'⏳ 等待進出站通道',
             'settling':'⏳ 確認停妥','arrived':'✅ 停靠完成','failed':'⚠️ 進出站中止',
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
         if transition or time.monotonic()-self.last_console_at>=5.:
             label=getattr(self,'target_label','')
+            if phase=='aligning':
+                degrees = math.degrees(angle_error(self.stage[2], self.align_anchor[2]))
+                label = f'{degrees:+.0f}°'+(f' → {label}' if label else '')
             if phase=='departure':
                 source=getattr(self,'source_station',None)
                 label=(f'離開 ({source[0]:.2f}, {source[1]:.2f}) → {label}'
@@ -274,7 +277,8 @@ class StationNavigation:
         self.stage,self.next_phase = point,next_phase
         self.native_error = (0,'')
         self.stop_since = None
-        allowance = 12. if phase=='aligning' else 25. if phase in ('departure','entry') else 180.
+        allowance = (min(22., max(12., abs(angle_error(point[2], self.align_anchor[2]))/.20+6.))
+                     if phase=='aligning' else 25. if phase in ('departure','entry') else 180.)
         self.deadline = min(self.sequence_deadline,time.monotonic()+allowance)
         self.clearance_deadline = None
         self.clearance_scope,self.clearance_detail,self.clearance_kind='','',''
@@ -317,7 +321,7 @@ class StationNavigation:
 
     def _align(self, pose, resume):
         if self.alignment_attempts>=2:
-            self._finish(TaskResult.FAILED,'failed','小幅對正仍未達要求');return
+            self._finish(TaskResult.FAILED,'failed','車頭對正仍未達要求');return
         if not self.grid.turn_clear(pose,self.target[2]):
             self._wait_clearance('等待車頭對正空間',
                 'final_align' if resume=='final_translation' else resume);return

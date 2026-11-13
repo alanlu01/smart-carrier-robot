@@ -31,3 +31,16 @@ def test_bond_diagnostics_distinguish_source_cadence_from_receipt_stall(monkeypa
     monitor.observe_tf(NS(transforms=[NS(header=NS(frame_id='map',stamp=NS(sec=105,nanosec=500000000)),
                                          child_frame_id='odom')]))
     assert monitor.receipts.snapshot(106.)['map->odom']['source_age_at_receive_sec']==.5
+
+
+def test_map_server_late_reply_has_bounded_independently_verified_grace():
+    records={n:dict(id=3,at=103.) for n in TARGETS}
+    records['map_server']['at']=100.
+    assert navigation_snapshot(records,103.1)['state']=='unavailable'
+    assert navigation_snapshot(records,103.1,fresh_safety=True)['state']=='ready'
+    assert navigation_snapshot(records,104.6,fresh_safety=True)['state']=='unavailable'
+    records['map_server']['id']=2
+    assert navigation_snapshot(records,103.1,fresh_safety=True)['state']=='unavailable'
+    records['map_server']['id']=3
+    records['amcl']['at']=100.
+    assert navigation_snapshot(records,103.1,fresh_safety=True)['state']=='unavailable'

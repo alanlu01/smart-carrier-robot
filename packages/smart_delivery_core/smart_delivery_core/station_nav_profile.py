@@ -55,7 +55,7 @@ def station_parameters(source):
     align = deepcopy(station)
     align.update(vx_max=.02,vx_min=-.02,vy_max=.02,vy_min=-.02,wz_max=.20,
                  vx_std=.02,vy_std=.02,wz_std=.08,az_max=.4,
-                 plugin='nav2_rotation_shim_controller::RotationShimController',
+                 plugin='smart_station_controller::StationAlignment',
                  primary_controller='nav2_mppi_controller::MPPIController',
                  rotate_to_goal_heading=True,rotate_to_heading_once=True,
                  rotate_to_heading_angular_vel=.20,max_angular_accel=.8,
@@ -64,8 +64,9 @@ def station_parameters(source):
     controller['StationAlign'] = align
     if 'StationAlign' not in controller['controller_plugins']:
         controller['controller_plugins'].append('StationAlign')
-    controller['station_alignment_checker'] = dict(plugin='nav2_controller::SimpleGoalChecker',
-        xy_goal_tolerance=.05,yaw_goal_tolerance=.06,stateful=False)
+    controller['station_alignment_checker'] = dict(plugin='nav2_controller::StoppedGoalChecker',
+        xy_goal_tolerance=.05,yaw_goal_tolerance=.06,stateful=True,
+        trans_stopped_velocity=.02,rot_stopped_velocity=.03)
     if 'station_alignment_checker' not in controller['goal_checker_plugins']:
         controller['goal_checker_plugins'].append('station_alignment_checker')
 

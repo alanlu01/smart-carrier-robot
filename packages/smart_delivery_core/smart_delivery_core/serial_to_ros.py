@@ -11,6 +11,7 @@ from std_msgs.msg import String
 from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
 from smart_delivery_core.pipeline_health import DurationMetrics
 from smart_delivery_core.serial_mailbox import LatestMailbox
+from smart_delivery_core.wheel_resend import WheelResend
 from smart_delivery_core.serial_workers import receive_worker, diagnostic_worker, stop_workers
 
 
@@ -33,6 +34,7 @@ class SerialToROS(Node):
         self.last_control = 0
         self.last_relay_at = 0.
         self.dropped_stale = 0
+        self.wheel_resend = WheelResend()
         self.workers = [
             ctx.Process(target=receive_worker, args=(str(self.get_parameter('serial_port').value),
                 int(self.get_parameter('baud_rate').value), self.stop, self.wheel, self.health, self.raw,
@@ -60,12 +62,19 @@ class SerialToROS(Node):
             if not -.1 <= age <= limit:
                 self.dropped_stale += 1
                 continue
+            if attribute == 'last_wheel':
+                self.wheel_resend.offer(version, payload, started)
             with self.metrics.measure(operation):
                 publisher.publish(String(data=json.dumps(payload)))
+        repeat = self.wheel_resend.due(started, self.get_clock().now().nanoseconds)
+        if repeat is not None:
+            with self.metrics.measure('wheel_repeat_publish'):
+                self.sample_pub.publish(String(data=json.dumps(repeat)))
         if started-self.last_relay_at >= .2:
             self.relay.put(dict(sample_ros_stamp_ns=self.get_clock().now().nanoseconds,
                                 wall_durations=self.metrics.snapshot(time.monotonic()),
                                 stale_snapshots_dropped=self.dropped_stale,
+                                wheel_delivery=self.wheel_resend.snapshot(),
                                 io_alive=self.workers[0].is_alive()))
             self.last_relay_at = started
 

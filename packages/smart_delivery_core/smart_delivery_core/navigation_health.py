@@ -9,6 +9,8 @@ from std_msgs.msg import String
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 from nav2_msgs.srv import ManageLifecycleNodes
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry
 from action_msgs.msg import GoalStatusArray
 from bond.msg import Status
 from tf2_msgs.msg import TFMessage
@@ -20,7 +22,7 @@ from smart_delivery_core.serial_recovery import fresh_feedback
 TARGETS = ('map_server','amcl','planner_server','controller_server','bt_navigator','behavior_server','collision_monitor')
 
 
-def navigation_snapshot(records, now):
+def navigation_snapshot(records, now, *, fresh_safety=False):
     states = {name: dict(record, age_sec=max(0.,now-record.get('at',now)))
               for name,record in records.items()}
     ready = len(states)==len(TARGETS) and all(
@@ -28,10 +30,14 @@ def navigation_snapshot(records, now):
     inactive = [name for name,p in states.items() if p.get('id') != 3]
     missing = [name for name in TARGETS if name not in states]
     stale = [name for name,p in states.items() if not 0 <= now-p.get('at',-1e6) <= 3.]
-    reason = ('lifecycle_inactive' if inactive else 'awaiting_responses' if missing
+    grace = (fresh_safety and not inactive and not missing and stale == ['map_server']
+             and 3. < states['map_server']['age_sec'] <= 4.5)
+    ready = ready or grace
+    reason = ('late_map_server_response' if grace else 'lifecycle_inactive' if inactive else 'awaiting_responses' if missing
               else 'response_stale' if stale else 'ready')
     return dict(state='ready' if ready else 'unavailable', nodes=states, reason=reason,
-                inactive_nodes=inactive, missing_nodes=missing, stale_nodes=stale)
+                inactive_nodes=inactive, missing_nodes=missing, stale_nodes=stale,
+                response_grace=bool(grace))
 
 
 class NavigationHealth(Node):
@@ -46,6 +52,11 @@ class NavigationHealth(Node):
         self.owned_fault=False
         self.feedback,self.feedback_at={},-float('inf')
         self.active_actions={}
+        self.safety_receipts = {}
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose',
+            lambda m:self._safety_sample('amcl', m), qos_profile_sensor_data)
+        self.create_subscription(Odometry, '/odom',
+            lambda m:self._safety_sample('odom', m), qos_profile_sensor_data)
         state_qos=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool,'/smart_carrier/delivery_navigation_active',
             self._lease,state_qos)
@@ -77,6 +88,21 @@ class NavigationHealth(Node):
             payload=json.loads(message.data)
             self.feedback,self.feedback_at=(payload if isinstance(payload,dict) else {}),time.monotonic()
         except (ValueError,TypeError):self.feedback={}
+
+    def _safety_sample(self, name, message):
+        stamp = message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+        previous = self.safety_receipts.get(name)
+        if previous is None or stamp > previous[1]:
+            self.safety_receipts[name] = (time.monotonic(), stamp)
+
+    def _fresh_safety(self, now):
+        ros_now = self.get_clock().now().nanoseconds
+        for name, limit in (('amcl', .5), ('odom', .25)):
+            receipt = self.safety_receipts.get(name)
+            if receipt is None or not (0 <= now-receipt[0] <= limit
+                    and -.1 <= (ros_now-receipt[1])/1e9 <= limit):
+                return False
+        return fresh_feedback(self.feedback, ros_now, now-self.feedback_at)
 
     def _lease(self, message):
         now=time.time()
@@ -150,7 +176,7 @@ class NavigationHealth(Node):
                 except Exception:
                     self.errors[name] += 1
                 self.pending.pop(name)
-            elif now-start>.75:
+            elif now-start>1.25:
                 self.timeouts[name] += 1
                 future.cancel()
                 self.health_clients[name].remove_pending_request(future)
@@ -174,7 +200,7 @@ class NavigationHealth(Node):
                 service_ready=self.manage.service_is_ready(),call=self._manage)
         if now-self.last_publish>=1.:
             self.last_publish=now
-            payload=navigation_snapshot(self.records,now)
+            payload=navigation_snapshot(self.records,now,fresh_safety=self._fresh_safety(now))
             payload['sample_ros_stamp_ns']=self.get_clock().now().nanoseconds
             payload['diagnostic_only']=True
             payload['action']=self.action.snapshot()

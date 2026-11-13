@@ -222,9 +222,18 @@ class OptionalIdleRuntime:
         except TransformException:
             return None
 
+    def _pipeline_pause(self):
+        evidence = getattr(self, 'localization_evidence', {}) or {}
+        return (self._localization_phase() == 'RECOVERING_LOCAL'
+                and evidence.get('pipeline_recheck') is not None
+                and evidence.get('manual_intervention_kind') == 'pipeline')
+
+    def _waiting_phase_allowed(self, phase):
+        return phase in (None, 'SUSPECT', 'LOCALIZED') or self._pipeline_pause()
+
     def _can_wait_localization(self):
         """Only brief SUSPECT can wait; stale sensors, manual/global recovery cannot."""
-        return (not self.ready() and self._localization_phase() in ('SUSPECT', 'LOCALIZED')
+        return (not self.ready() and (self._localization_phase() in ('SUSPECT', 'LOCALIZED') or self._pipeline_pause())
                 and self.map_matches and not self.inhibited
                 and (self.home is None or (self.home.healthy and not self.home.cutoff))
                 and self.last_odom is not None
@@ -235,7 +244,7 @@ class OptionalIdleRuntime:
 
     def _can_pause_for_data(self):
         """Stop on jitter first; fresh evidence is required only to RESUME."""
-        return (self._localization_phase() in ('SUSPECT','LOCALIZED')
+        return ((self._localization_phase() in ('SUSPECT','LOCALIZED') or self._pipeline_pause())
                 and self.map_matches and not self.inhibited and not self.stop_accepting
                 and (self.home is None or (self.home.healthy and not self.home.cutoff)))
 
@@ -259,7 +268,7 @@ class OptionalIdleRuntime:
             self._people_finished('people_localization_wait_timeout')
             return True
         phase = self._localization_phase()
-        if phase not in (None, 'SUSPECT', 'LOCALIZED'):
+        if not self._waiting_phase_allowed(phase):
             self._people_finished('people_localization_escalated:'+phase)
             return True
         if (phase != 'LOCALIZED' or not self._safe() or not self._stationary()
@@ -1037,7 +1046,7 @@ class OptionalIdleRuntime:
         if not self.motion and self.state == 'waiting_people_localization':
             phase = self._localization_phase()
             if (time.monotonic() >= self.localization_wait_deadline
-                    or phase not in (None, 'SUSPECT', 'LOCALIZED')):
+                    or not self._waiting_phase_allowed(phase)):
                 # Expiration/escalation is not paused by an external recovery
                 # spin. Still keep the independent stop proof before service.
                 reason = ('people_localization_wait_timeout' if time.monotonic() >= self.localization_wait_deadline
@@ -1057,7 +1066,7 @@ class OptionalIdleRuntime:
         if (not self.motion and self.state in ('waiting_observation_stop', 'waiting_observation_retry')
                 and not self._safe()):
             phase = self._localization_phase()
-            hard_failure = (phase not in (None,'SUSPECT','LOCALIZED')
+            hard_failure = (not self._waiting_phase_allowed(phase)
                 or not self.map_matches or self.inhibited or self.stop_accepting
                 or (self.home is not None and (not self.home.healthy or self.home.cutoff)))
             if hard_failure:

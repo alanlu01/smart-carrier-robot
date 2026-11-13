@@ -58,7 +58,10 @@ def test_intermittent_data_cannot_restart_fixed_deadline_forever():
 def test_without_prior_trusted_reference_never_accept_a_high_score_alone():
     g=PipelineRecheck(100.,100000000000,None)
     for at in range(101,109):assert observe(g,float(at))=='wait'
-    assert observe(g,109.)=='pose_recovery'
+    assert observe(g,109.)=='wait'
+    assert g.reason=='reference_missing'
+    assert g.verification_elapsed==0.
+    assert observe(g,130.)=='pose_recovery'
 
 
 def test_wrapped_map_odom_heading_is_not_mistaken_for_a_full_turn():
@@ -76,3 +79,12 @@ def test_waiting_for_data_pauses_verification_budget_but_not_total_deadline():
     assert observe(g,115.)=='wait'
     assert g.verification_elapsed==pytest.approx(1.)
     assert observe(g,131.,available=False)=='manual_pipeline'
+
+
+def test_missing_transform_is_not_a_position_change_or_an_unbounded_wait():
+    g=PipelineRecheck(100.,100000000000,(0.,0.,0.))
+    for at in (101.,110.,120.):
+        assert observe(g,at,transform=None)=='wait'
+        assert g.reason=='transform_missing'
+    assert g.verification_elapsed==0.
+    assert observe(g,130.,transform=None)=='pose_recovery'

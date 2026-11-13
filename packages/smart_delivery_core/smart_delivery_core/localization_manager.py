@@ -781,6 +781,8 @@ class LocalizationManager(Node):
             "scan_pair_timing": self.scan_pair_metrics.snapshot(now),
             "wall_durations": self.duration_metrics.snapshot(now),
             "pose_cache_io": self.pose_cache_writer.snapshot(),
+            "wheel_delivery": self.atomic_wheels.snapshot(),
+            "lateral_continuations": getattr(self, "lateral_continuations", 0),
             "lateral_motion_timing": getattr(self, 'lateral_motion_timing', {}),
             "post_lateral_observation": self.post_lateral_observation,
             "global_pose_gate": dict(required=self.global_verification_required,
@@ -1959,6 +1961,12 @@ class LocalizationManager(Node):
                 self.map_match_window_min_samples,
             )
             self.latest_map_score_at = now
+            if (self.state == 'LOCALIZED' and self.latest_quality is not None
+                    and self.latest_quality.healthy and self.latest_map_score is not None
+                    and self.latest_map_score >= self.map_match_recovery_score):
+                trusted = self._pipeline_transform()
+                if trusted is not None:
+                    self.pipeline_trusted_reference = (now, trusted)
             self.last_map_match_error = ""
             if getattr(self, 'global_verification_required', False):
                 self.global_geometry_report = ray_consistency(
@@ -2094,6 +2102,9 @@ class LocalizationManager(Node):
             if (self.latest_quality is None or not self.latest_quality.healthy
                     or self.latest_map_score is None or self.latest_map_score < self.map_match_recovery_score):
                 reference = None
+            cached = getattr(self, 'pipeline_trusted_reference', None)
+            if reference is None and cached is not None and 0 <= now-cached[0] <= 2.:
+                reference = cached[1]
             self.pipeline_recheck = PipelineRecheck(
                 now, self.get_clock().now().nanoseconds, reference,
                 required=self.stable_samples_required, timeout=self.pipeline_wait_timeout,
@@ -2575,7 +2586,8 @@ class LocalizationManager(Node):
                 and now-self.second_guard_started_at<self.second_guard_wait):
             return
         if self._recovery_spin_clear(now):
-            self.get_logger().warning('🔄 橫移不可用，改用第二輪原地定位')
+            self.get_logger().warning('🔄 橫移完成，開始第二輪定位' if self.post_lateral_observation
+                                      else '🔄 橫移不可用，改用第二輪原地定位')
             self._start_global_recovery()
             return
         if now - self.second_guard_started_at >= self.second_guard_wait:
@@ -2864,6 +2876,7 @@ class LocalizationManager(Node):
             return False
         self._cancel_navigation()
         self.lateral_attempted = True
+        self.lateral_continuations = 0
         self.lateral_direction = directions[0]
         self.lateral_anchor = self.last_odom_pose
         self.lateral_started_at = now
@@ -2968,6 +2981,22 @@ class LocalizationManager(Node):
                 elif abs(angle) > math.radians(5):
                     self.lateral_settled_yaw_recheck = True
             if self._lateral_stop_ready(now):
+                if (not self.lateral_abort_reason and self.last_odom_pose is not None
+                        and self.lateral_anchor is not None
+                        and travelled < self.lateral_distance-.030):
+                    if (getattr(self, 'lateral_continuations', 0) < 1
+                            and now-self.lateral_started_at < 5.
+                            and abs(angle) <= math.radians(5)
+                            and self._lateral_sensors_ready(now)
+                            and self._lateral_path_clear(self.lateral_direction,
+                                                        self.lateral_distance-travelled+.07)):
+                        self.lateral_continuations = 1
+                        self.lateral_phase = 'authorize'
+                        self.recovery_step = 'lateral_move'
+                        self.lateral_progress_value, self.lateral_progress_at = travelled, now
+                        self.get_logger().info('↔️ 橫移距離不足，安全續行一次')
+                        return
+                    self.lateral_abort_reason = '橫移未達有效距離'
                 if getattr(self, 'lateral_settled_yaw_recheck', False):
                     self.get_logger().info('⏳ 橫移已停穩，煞停角差 5～8°；重新確認定位與旋轉空間')
                 self._record_lateral_event('wheels_stopped', now)

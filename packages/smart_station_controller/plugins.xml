@@ -2,4 +2,7 @@
   <class type="smart_station_controller::StationMPPI" base_class_type="nav2_core::Controller">
     <description>Station-only MPPI with a continuous goal-distance speed envelope.</description>
   </class>
+  <class type="smart_station_controller::StationAlignment" base_class_type="nav2_core::Controller">
+    <description>Rotation-only station alignment with braking and native footprint collision checks.</description>
+  </class>
 </library>

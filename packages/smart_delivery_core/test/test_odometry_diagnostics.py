@@ -45,6 +45,7 @@ def test_health_recomputes_age_instead_of_repeating_last_healthy_callback(monkey
     node=object.__new__(module.MecanumOdomReal)
     node.feedback_assembler=SimpleNamespace(sample_age=lambda _:5.,complete_sample_count=10)
     node.feedback_state='healthy';node.wheel_state_timeout_sec=.8
+    node.atomic_wheels=module.AtomicWheelReceiver(None)
     node.local_write_errors=0
     node.receipt_metrics=ReceiptMetrics();node.duration_metrics=DurationMetrics()
     node.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100000000000))

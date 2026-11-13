@@ -51,3 +51,14 @@ def test_old_or_duplicate_sequence_cannot_rearm_with_new_stamp():
     assert r.observe(sample(),100000000000,100.) is not None
     assert r.observe(sample(100.5,1),100500000000,100.5) is None
 
+
+
+def test_receiver_identity_diagnostics_do_not_turn_duplicates_into_samples():
+    receiver=AtomicWheelReceiver(WheelSampleAssembler(.25,0.))
+    receiver.observe(sample(),100000000000,100.)
+    receiver.observe(sample(),100100000000,100.1)
+    receiver.observe(sample(101.,3),101000000000,101.)
+    data=receiver.snapshot()
+    assert data['accepted_sequence']==3 and data['accepted_groups']==2
+    assert data['duplicate_groups']==1 and data['sequence_gaps']==1
+    assert data['source_stamp_ns']==101000000000

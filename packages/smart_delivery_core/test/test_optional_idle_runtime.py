@@ -409,3 +409,22 @@ def test_persisted_admission_stop_also_survives_restart(runtime):
     restarted=OptionalIdleRuntime(navigator,manager.buffer,manager.config,ROOT,
                                  lambda:True,lambda _:None,lambda:None)
     assert not restarted.home_requested and restarted.stop_accepting
+
+
+def test_pipeline_recheck_is_a_bounded_pause_not_global_recovery(runtime):
+    manager,nav,moment=runtime
+    manager._localization_phase=lambda:'RECOVERING_LOCAL'
+    manager.localization_evidence={'pipeline_recheck':{'reason':'waiting_data'},
+                                   'manual_intervention_kind':'pipeline'}
+    assert manager._pipeline_pause()
+    assert manager._waiting_phase_allowed('RECOVERING_LOCAL')
+    assert manager._can_pause_for_data()
+    manager.state='waiting_people_localization'
+    manager.localization_wait_deadline=moment[0]+5.
+    manager._safe=lambda:False
+    assert manager._poll_localization_wait()
+    assert manager.state=='waiting_people_localization'
+    manager.localization_evidence['pipeline_recheck']=None
+    assert not manager._waiting_phase_allowed('RECOVERING_LOCAL')
+    manager._poll_localization_wait()
+    assert manager.state!='waiting_people_localization'

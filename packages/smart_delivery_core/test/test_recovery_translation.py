@@ -61,7 +61,7 @@ def test_braking_reserves_feedback_delay_and_real_stopping_tail():
             target = delayed.pop(0)
             speed += max(-.25*.01, min(.25*.01, target-speed))
             position += speed*.01
-        assert .25 < position < .33
+        assert .270 <= position < .33
 
 
 def mask():
@@ -156,3 +156,20 @@ def test_rotation_safety_never_ignores_near_obstacle_or_large_unknown_wedge():
         data.ranges[i]=float('inf')
     assert not spin_scan_clear(data,(.15,-.025,math.pi))
     assert spin_scan_clear(body_echo_scan(),(.15,-.025,math.pi),mask(),.425)
+
+
+@pytest.mark.parametrize('lag', [.1,.25,.5,.65])
+@pytest.mark.parametrize('gain', [1.,1.5])
+def test_measured_momentum_does_not_stop_at_recorded_eight_centimeters(lag,gain):
+    assert lateral_speed(.0813,feedback_age=lag,measured_speed=.25)>0.
+    position,speed=0.,0.
+    delayed=[0.]*round(lag/.01)
+    feedback=0.
+    for i in range(800):
+        if i%50==0:feedback=speed
+        command=lateral_speed(position,feedback_age=lag,measured_speed=feedback)
+        delayed.append(command)
+        target=gain*delayed.pop(0)
+        speed+=max(-.25*.01,min(.25*.01,target-speed))
+        position+=speed*.01
+    assert .270 <= position <= .330

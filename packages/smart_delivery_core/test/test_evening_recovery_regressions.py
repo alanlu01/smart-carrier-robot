@@ -77,7 +77,7 @@ def test_stopped_large_sweep_can_finish_without_perfect_heading():
 
 
 def test_recorded_lateral_momentum_brakes_before_272mm():
-    assert lateral_speed(.24,.30,.15,feedback_age=.15,measured_speed=.10)==0.
+    assert 0 < lateral_speed(.24,.30,.15,feedback_age=.15,measured_speed=.10) < .10
     assert lateral_speed(.10,.30,.15,feedback_age=.15,measured_speed=.10)>0.
 
 

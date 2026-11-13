@@ -29,6 +29,12 @@ class PipelineRecheck:
             self.last_map_at = max(self.last_map_at, map_at)
             self.reason = 'waiting_data' if not available else 'waiting_stop'
             return 'wait'
+        if self.reference is None or transform is None:
+            self.samples = 0
+            self.last_available_at = None
+            self.last_map_at = max(self.last_map_at, map_at)
+            self.reason = 'reference_missing' if self.reference is None else 'transform_missing'
+            return 'wait'
         if self.verifying_since is None:
             self.verifying_since = now
         if self.last_available_at is not None:

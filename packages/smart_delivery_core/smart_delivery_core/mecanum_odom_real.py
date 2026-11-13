@@ -242,6 +242,7 @@ class MecanumOdomReal(Node):
             'last_callback_state': self.feedback_state,
             'local_write_errors': self.local_write_errors,
             'complete_sample_count': self.feedback_assembler.complete_sample_count,
+            'wheel_delivery': self.atomic_wheels.snapshot(),
             'complete_sample_age_sec': round(age, 3),
             'receipts': self.receipt_metrics.snapshot(now),
             'wall_durations': self.duration_metrics.snapshot(now),

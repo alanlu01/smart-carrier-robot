@@ -128,14 +128,15 @@ def lateral_speed(progress, distance=0.30, cap=0.20, feedback_age=0., measured_s
         return 0.0
     # v*t + v²/(2*a) <= available distance. Actual stop still needs wheel proof.
     deceleration = .25
-    reaction = .35 + max(0., min(.65, feedback_age))
-    # Recorded stop travelled 66.8 mm after zero. Reserve measured momentum
-    # as well as held-wheel sample age, not the fresh 20 Hz odom timer age.
+    reaction = .45 + max(0., min(.65, feedback_age))
+    # Measured momentum lengthens the slowing horizon continuously. A binary
+    # momentum threshold previously stopped at 8 cm and never resumed.
     rate=abs(measured_speed)
     if not math.isfinite(rate):return 0.
-    if rate>0 and remaining <= .025+rate*reaction+rate*rate/(2*deceleration):return 0.
     at = deceleration * reaction
-    return min(cap, math.sqrt(at*at + 2*deceleration*(remaining-.025)) - at)
+    envelope = math.sqrt(at*at + 2*deceleration*(remaining-.025)) - at
+    momentum = (remaining-.025)/(reaction+rate/deceleration)
+    return min(cap, envelope, momentum)
 
 
 def spin_scan_clear(scan, sensor_pose, self_mask=None, sensor_z=0.0,

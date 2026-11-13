@@ -14,6 +14,7 @@ class AtomicWheelReceiver:
         self.stamp_ns = 0
         self.last_ros_now_ns = None
         self.retired_sessions = []
+        self.accepted_groups = self.duplicate_groups = self.sequence_gaps = 0
 
     def observe(self, payload, ros_now_ns, now, max_age=.65):
         # Wall-clock corrections invalidate the old stop/source epoch. Keep
@@ -38,6 +39,9 @@ class AtomicWheelReceiver:
                     or any(isinstance(v, bool) or not isinstance(v, (int, float))
                            or not math.isfinite(v) for v in wheels.values())):
                 return None
+            if session == self.session and seq == self.sequence and stamp == self.stamp_ns:
+                self.duplicate_groups += 1
+                return None
             age = (ros_now_ns-stamp)/1e9
             if (not -.1 <= age <= max_age or stamp <= self.stamp_ns
                     or (session == self.session and seq <= self.sequence)):
@@ -47,6 +51,9 @@ class AtomicWheelReceiver:
                 if self.session is not None:
                     self.retired_sessions=(self.retired_sessions+[self.session])[-8:]
                 if self.stop is not None:self.stop.reset()
+            if session == self.session:
+                self.sequence_gaps += max(0, seq-self.sequence-1)
+            self.accepted_groups += 1
             self.session, self.sequence, self.stamp_ns = session, seq, stamp
             if self.assembler is not None:
                 self.assembler.add_snapshot(wheels, observed_at)
@@ -57,3 +64,8 @@ class AtomicWheelReceiver:
             return dict(wheels)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
+
+    def snapshot(self):
+        return dict(session=self.session, accepted_sequence=self.sequence,
+                    source_stamp_ns=self.stamp_ns, accepted_groups=self.accepted_groups,
+                    duplicate_groups=self.duplicate_groups, sequence_gaps=self.sequence_gaps)

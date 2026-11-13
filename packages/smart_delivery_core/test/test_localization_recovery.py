@@ -58,7 +58,7 @@ def manager(monkeypatch):
         amcl_nomotion_refresh=3.0, verification_nomotion_refresh=1.0,
         amcl_stationary_grace=2.0, map_match_stale_grace=5.0,
         last_nomotion_request_at=0.0, sensor_waiting_for_pipeline=False,
-        local_wait=12.0, global_wait=12.0, global_max_wait=30.0,
+        local_wait=12.0, global_wait=12.0, global_max_wait=30.0, post_lateral_observation=False,
         global_convergence_max_wait=40.0,
         global_attempts=1, recovery_stall_window=8.0, restore_heading=True,
         mild_map_enabled=False, mild_map_active=False, mild_map_guard=MildMapGuard(),
@@ -621,6 +621,7 @@ def test_two_hz_independent_wheel_groups_can_confirm_real_stop(manager):
         nanoseconds=int(clock.now*1e9)))
     node._lateral_stop_ready = lambda at: module.LocalizationManager._lateral_stop_ready(node, at)
     node._try_lateral_recovery(clock.now)
+    node.last_odom_pose=(0.,.28,0.)
     node._stop_lateral()
     for index in range(24):
         clock.now = 100.0 + index*.05
@@ -1020,3 +1021,32 @@ def test_amcl_callback_remains_responsive_while_pose_file_is_blocked(manager, tm
     finally:
         release.set()
         assert writer.close()
+
+
+def test_short_lateral_stop_cannot_be_called_complete_and_continuation_is_once(manager):
+    n,c,lease=lateral_harness(manager)
+    assert n._try_lateral_recovery(c.now)
+    n.last_odom_pose=(0.,.187,0.)
+    n._stop_lateral()
+    n._lateral_stop_ready=lambda _:True
+    c.now+=2.
+    n._tick_lateral_motion()
+    assert n.lateral_phase=='authorize' and n.lateral_continuations==1
+    assert lease.blocked(c.now)  # Rearm must still pass the independent fusion handshake.
+    n._stop_lateral()
+    c.now+=.1
+    n._tick_lateral_motion()
+    assert n.lateral_phase=='disarming' and n.lateral_abort_reason=='橫移未達有效距離'
+
+
+@pytest.mark.parametrize('age,expected', [(1.5,(1.,2.,.1)),(2.1,None)])
+def test_only_recent_trusted_pre_outage_reference_survives_transient_quality_loss(manager,age,expected):
+    n,c=manager;n.state='LOCALIZED'
+    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int(c.now*1e9)))
+    n._pipeline_transform=lambda:None
+    n.pipeline_trusted_reference=(c.now-age,(1.,2.,.1))
+    n._cancel_navigation=lambda:None
+    n._set_state=lambda state,reason:setattr(n,'state',state)
+    module.LocalizationManager._begin_recovery(n,'test',sensor_pipeline_timeout=True)
+    assert n.pipeline_recheck.reference==expected and n.state=='RECOVERING_LOCAL'
+    assert n.pipeline_recheck.started==c.now
