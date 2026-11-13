@@ -78,6 +78,9 @@ class INA3221Node(Node):
         self.declare_parameter("empty_current_max_a", 0.008)
         self.declare_parameter("empty_voltage_max_v", 1.0)
         self.declare_parameter("present_current_min_a", 0.020)
+        self.declare_parameter("weak_presence_min_a", 0.010)
+        self.declare_parameter("weak_presence_duration_sec", 6.0)
+        self.declare_parameter("weak_presence_max_gap_sec", 0.8)
         self.declare_parameter("full_power_max_w", 5.0)
         self.declare_parameter("ready_power_max_w", 10.0)
         self.declare_parameter("power_hysteresis_w", 0.5)
@@ -211,6 +214,9 @@ class INA3221Node(Node):
                 ready_power_max_w=self.ready_power_max_w,
                 power_hysteresis_w=self.power_hysteresis_w,
                 confirm_samples=state_confirm_samples,
+                weak_presence_min_a=float(self.get_parameter("weak_presence_min_a").value),
+                weak_presence_duration_sec=float(self.get_parameter("weak_presence_duration_sec").value),
+                weak_presence_max_gap_sec=float(self.get_parameter("weak_presence_max_gap_sec").value),
             )
             for _ in range(3)
         ]
@@ -395,6 +401,7 @@ class INA3221Node(Node):
                     current_average if sensor_ok else None,
                     voltage_average if sensor_ok else None,
                     sensor_ok=sensor_ok and supply['healthy'],
+                    now=time.monotonic(),
                 )
                 if enabled
                 else "disabled"
@@ -438,6 +445,9 @@ class INA3221Node(Node):
                 f"CH{number}: {channel['voltage']} V, "
                 f"{channel['current']} A, {power_text}, {channel['status']}"
             )
+        for index,tracker in enumerate(self.state_trackers,1):
+            channels[f"ch{index}"]["presence_evidence"]=tracker.evidence()
+
         vehicle_battery = build_vehicle_battery(
             [channel["voltage"] for channel in channels.values()],
             full_voltage_v=self.vehicle_full_voltage,

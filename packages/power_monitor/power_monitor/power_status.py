@@ -216,6 +216,13 @@ class SlotStateTracker:
     state: str = "unknown"
     _candidate: str | None = None
     _candidate_samples: int = 0
+    weak_presence_min_a: float = 0.0
+    weak_presence_duration_sec: float = 6.0
+    weak_presence_max_gap_sec: float = 0.8
+    _weak_started_at: float | None = None
+    _weak_last_at: float | None = None
+    _weak_samples: int = 0
+    presence_evidence: str = "unknown"
 
     def __post_init__(self):
         if self.empty_current_max_a < 0:
@@ -236,6 +243,11 @@ class SlotStateTracker:
             raise ValueError("power hysteresis is too large for configured thresholds")
         if self.confirm_samples < 1:
             raise ValueError("confirm_samples must be at least one")
+        if self.weak_presence_min_a and not self.empty_current_max_a < self.weak_presence_min_a < self.present_current_min_a:
+            raise ValueError("weak presence threshold must lie inside the current gap")
+        if (not all(math.isfinite(v) for v in (self.weak_presence_min_a,self.weak_presence_duration_sec,self.weak_presence_max_gap_sec))
+                or self.weak_presence_duration_sec < 3.0 or not 0 < self.weak_presence_max_gap_sec <= 1.0):
+            raise ValueError("weak evidence needs a bounded sample gap and at least three seconds")
 
     def update(
         self,
@@ -243,9 +255,13 @@ class SlotStateTracker:
         voltage_v: float | None = None,
         *,
         sensor_ok: bool = True,
+        now: float | None = None,
     ) -> str:
-        if not sensor_ok or current_a is None or voltage_v is None:
+        if (not sensor_ok or current_a is None or voltage_v is None
+                or not math.isfinite(float(current_a)) or not math.isfinite(float(voltage_v))):
             self.state = "unknown"
+            self._reset_weak()
+            self.presence_evidence = "unknown"
             self._candidate = None
             self._candidate_samples = 0
             return self.state
@@ -258,6 +274,28 @@ class SlotStateTracker:
             full_power_max_w=self.full_power_max_w,
             ready_power_max_w=self.ready_power_max_w,
         )
+        weak=False
+        eligible=(measured=="unknown" and self.weak_presence_min_a>0
+            and abs(float(current_a))>=self.weak_presence_min_a and float(voltage_v)>1.
+            and now is not None and math.isfinite(now))
+        if eligible:
+            if self._weak_last_at is not None and now==self._weak_last_at:
+                return self.state
+            if self._weak_last_at is None or now-self._weak_last_at>self.weak_presence_max_gap_sec or now<self._weak_last_at:
+                self._weak_started_at=now
+                self._weak_samples=1
+            elif now>self._weak_last_at:
+                self._weak_samples+=1
+            self._weak_last_at=now
+            weak=(now-self._weak_started_at>=self.weak_presence_duration_sec
+                  and self._weak_samples>=self.confirm_samples)
+            if weak:
+                measured=classify_power_status(current_a,voltage_v,
+                    empty_current_max_a=self.empty_current_max_a,
+                    present_current_min_a=self.weak_presence_min_a,
+                    full_power_max_w=self.full_power_max_w,ready_power_max_w=self.ready_power_max_w)
+        else:
+            self._reset_weak()
         if measured == "unknown":
             self._candidate = None
             self._candidate_samples = 0
@@ -292,9 +330,23 @@ class SlotStateTracker:
             self._candidate_samples += 1
         if self._candidate_samples >= self.confirm_samples:
             self.state = measured
+            self.presence_evidence=("sustained_low_current" if weak else "empty_current" if measured=="empty" else "present_current")
             self._candidate = None
             self._candidate_samples = 0
         return self.state
+
+
+    def _reset_weak(self):
+        self._weak_started_at=self._weak_last_at=None
+        self._weak_samples=0
+
+    def evidence(self):
+        return dict(method=self.presence_evidence,
+            weak_samples=self._weak_samples,
+            weak_elapsed_sec=round(max(0.,self._weak_last_at-self._weak_started_at),3)
+                if self._weak_last_at is not None and self._weak_started_at is not None else 0.,
+            weak_min_current_a=self.weak_presence_min_a,
+            weak_required_sec=self.weak_presence_duration_sec)
 
 
 def normalize_power_bank_status(status: Any, status_aliases: dict[Any, str] | None = None) -> str:

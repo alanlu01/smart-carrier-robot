@@ -27,6 +27,11 @@ ina3221_node:
     empty_current_max_a: 0.008
     # 0.008–0.020 A 是遲滯區，維持上一個可信狀態。
     present_current_min_a: 0.020
+    # 11/10–11/12 bag: full bank can draw 10–17mA; empty spikes last <=2.5s
+    # in the inspected reference intervals. Require continuous healthy evidence.
+    weak_presence_min_a: 0.010
+    weak_presence_duration_sec: 6.0
+    weak_presence_max_gap_sec: 0.8
     # Type-C 快充輸入功率模型：<=5 W 為 full、5–10 W 為 ready、>10 W 為 low/charging。
     full_power_max_w: 5.0
     ready_power_max_w: 10.0
