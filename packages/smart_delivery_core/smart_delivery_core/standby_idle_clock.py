@@ -21,6 +21,9 @@ class StandbyIdleClock:
         self.reason = 'not_verified_parked'
         self.correction_candidate = None
         self.correction_since = None
+        self.correction_last_at = None
+        self.deviation_expired = False
+        self.deviation_resets = 0
 
     def mark_parked(self, point):
         self.point = dict(point)
@@ -40,6 +43,7 @@ class StandbyIdleClock:
                                   math.cos(odom[2]-self.odom_anchor[2])))>.035))
             self.data_pause_since = now if self.data_pause_since is None else self.data_pause_since
             if moved or now-self.data_pause_since>1.:
+                self.correction_disqualified=True
                 self.reset()
                 self.reason='physical_odom_displacement' if moved else 'tf_gap_expired'
             else:
@@ -47,13 +51,16 @@ class StandbyIdleClock:
                 self.reason='short_tf_gap_paused'
             return False
         if self.data_pause_since is not None and now-self.data_pause_since>1.:
+            self.correction_disqualified=True
             self.reset()
         self.data_pause_since = None
         if not parked or not safe or not stationary or self.point is None or pose is None or odom is None:
+            self.correction_disqualified=True
             self.reset()
             self.reason = 'not_parked_or_unsafe_or_moving'
             return False
         if not all(math.isfinite(v) for v in (*odom, pose['x'], pose['y'], pose['yaw'])):
+            self.correction_disqualified=True
             self.reset()
             self.reason = 'nonfinite_pose'
             return False
@@ -82,18 +89,30 @@ class StandbyIdleClock:
         original_angle=abs(math.atan2(math.sin(pose['yaw']-self.point['yaw']),
                                      math.cos(pose['yaw']-self.point['yaw'])))
         # Auxiliary hysteresis only; caller must already have verified arrival.
-        if xy > .20 or angle > .20 or original_xy>.35 or original_angle>.20:
+        if xy > .20 or angle > .20 or original_xy>.35 or original_angle>math.radians(20.):
             self.pause_since = now if self.pause_since is None else self.pause_since
             self.last_tick = None
             self.reason = 'map_pose_outside_auxiliary_hysteresis'
-            correction=(trusted_map_correction and not self.correction_disqualified
-                        and not self.correction_used and original_xy<=.35 and original_angle<=.20)
-            if correction and now-self.pause_since<=10.:
+            eligible=(not self.correction_disqualified and not self.correction_used
+                      and original_xy<=.35 and original_angle<=math.radians(20.))
+            # Preserve accumulated AUXILIARY time for at most 30 seconds. Once
+            # expired, keep the original wheel anchor and latch one reset until
+            # the pose returns or fresh trusted evidence permits a new reference.
+            if not self.deviation_expired and now-self.pause_since >= (30. if eligible else 2.):
+                self.elapsed = 0.
+                self.deviation_expired = True
+                self.deviation_resets += 1
+            if self.deviation_expired:
+                self.reason = 'map_pose_deviation_persistent'
+            if eligible and trusted_map_correction:
                 candidate=self.correction_candidate
                 if (candidate is None or math.hypot(observed[0]-candidate[0],observed[1]-candidate[1])>.04
                         or abs(math.atan2(math.sin(observed[2]-candidate[2]),
-                                          math.cos(observed[2]-candidate[2])))>.035):
+                                          math.cos(observed[2]-candidate[2])))>.035
+                        or self.correction_last_at is None
+                        or not 0 <= now-self.correction_last_at <= 1.):
                     self.correction_candidate,self.correction_since=observed,now
+                self.correction_last_at=now
                 self.reason='confirming_stationary_map_correction'
                 if now-self.correction_since>=3.:
                     # Rebase this auxiliary clock only. The actual station goal,
@@ -101,21 +120,33 @@ class StandbyIdleClock:
                     self.map_reference=dict(x=observed[0],y=observed[1],yaw=observed[2])
                     self.correction_used=True
                     self.pause_since=self.correction_since=None
+                    self.correction_last_at=None
+                    self.deviation_expired=False
                     self.reason='stationary_map_correction_verified'
                     return True
                 return False
-            self.correction_candidate=self.correction_since=None
-            if now-self.pause_since >= 2.0:
-                self.reset()
-                self.reason = 'map_pose_deviation_persistent'
+            self.correction_candidate=self.correction_since=self.correction_last_at=None
             return False
         self.pause_since = None
+        self.deviation_expired = False
+        self.correction_candidate=self.correction_since=self.correction_last_at=None
         if self.last_tick is not None:
             gap = now-self.last_tick
             if not 0 <= gap <= 1.0:
+                self.correction_disqualified=True
                 self.reset()
             else:
                 self.elapsed += gap
         self.last_tick = now
         self.reason = 'counting_verified_stationary_parking'
         return True
+
+    def snapshot(self, now):
+        return dict(reason=self.reason, elapsed_sec=round(self.elapsed,3),
+                    pause_sec=None if self.pause_since is None else round(max(0.,now-self.pause_since),3),
+                    deviation_expired=self.deviation_expired, deviation_resets=self.deviation_resets,
+                    correction_used=self.correction_used,
+                    correction_disqualified=self.correction_disqualified,
+                    confirmation_sec=None if self.correction_since is None else round(max(0.,now-self.correction_since),3),
+                    map_reference=self.map_reference, observed_pose=self.last_map_pose,
+                    odom_anchor=self.odom_anchor)

@@ -149,7 +149,7 @@ def test_gradual_stationary_map_drift_preserves_elapsed_after_bounded_confirmati
 @pytest.mark.parametrize('changes',[dict(trusted_map_correction=False),dict(pose=dict(x=3.,y=5.18,yaw=0.))])
 def test_uncertain_or_large_map_change_does_not_rebase_auxiliary_clock(changes):
     c=StandbyIdleClock();c.mark_parked(POINT)
-    for i in range(121):idle(c,i*.5,min(.25,i*.5*.004),**changes)
+    for i in range(181):idle(c,i*.5,min(.25,i*.5*.004),**changes)
     assert not c.correction_used and c.elapsed==0.
 
 

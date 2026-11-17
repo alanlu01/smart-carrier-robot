@@ -96,7 +96,7 @@ def people_status(state, reason, point, degrees, attempts=0, blocker=''):
     if reason == 'parked_at_selected_standby':
         return f'💤 已停妥：{name}'
     if reason == 'insufficient_directional_demand':
-        return '🔎 人流證據不足，維持一般待機'
+        return '🔎 分析完成：可用人形不足，維持一般待機'
     if reason.startswith('observation_preempted'):
         return '📥 新任務／電池接管，人流流程已結束'
     return '💤 人流待機／冷卻' if not reason else '⚠️ 人流流程結束：'+reason_label(reason)

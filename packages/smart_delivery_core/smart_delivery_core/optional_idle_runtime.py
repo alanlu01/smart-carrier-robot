@@ -64,6 +64,7 @@ class OptionalIdleRuntime:
         self.deadline = 0.0
         self.cancel_requested = False
         self.cancel_started = None
+        self.cancel_stop_since = None
         self.goal_request = None
         self.cancel_future = None
         self.last_cancel_at = 0.0
@@ -118,6 +119,11 @@ class OptionalIdleRuntime:
         self.localization_resume_state = None
         self.localization_resume_deadline = None
         self.localization_wait_deadline = None
+        self.localization_wait_data_only = False
+        self.localization_pause_source_ns = 0
+        self.localization_fresh_since = None
+        self.localization_fresh_last_at = None
+        self.localization_resume_blocker = 'not_waiting'
         self.observation_alignment = None
         self.safety_report = {}
         self.duration_metrics = DurationMetrics()
@@ -253,6 +259,11 @@ class OptionalIdleRuntime:
             self.data_pauses += 1
         else:
             self.localization_pauses += 1
+        self.localization_wait_data_only = data_only
+        self.localization_pause_source_ns = self.navigator.get_clock().now().nanoseconds
+        self.localization_fresh_since = None
+        self.localization_fresh_last_at = None
+        self.localization_resume_blocker = 'waiting_terminal_and_stop'
         self.localization_resume_state = resume_state
         self.localization_resume_deadline = deadline
         limit = time.monotonic()+self.config['people'].get('localization_wait_sec', 20.)
@@ -260,6 +271,28 @@ class OptionalIdleRuntime:
         if self.observation_session_deadline is not None:
             self.localization_wait_deadline = min(self.localization_wait_deadline,
                                                   self.observation_session_deadline)
+
+    def _fresh_data_resume(self, now):
+        """A recovered frame must be new, and fresh inputs stable for 0.2 sec."""
+        def source(message):
+            return message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+        stamps=(self.pose_report.get('source_stamp_ns',0),
+                source(self.last_odom[1]) if self.last_odom is not None else 0,
+                source(self.last_scan[1]) if self.last_scan is not None else 0)
+        if any(stamp<=self.localization_pause_source_ns for stamp in stamps):
+            self.localization_fresh_since=None
+            self.localization_resume_blocker='waiting_post_pause_sources'
+            return False
+        if (self.localization_fresh_last_at is None
+                or not 0 <= now-self.localization_fresh_last_at <= .30):
+            self.localization_fresh_since=None
+        self.localization_fresh_last_at=now
+        self.localization_fresh_since=(now if self.localization_fresh_since is None
+                                       else self.localization_fresh_since)
+        self.localization_resume_blocker='confirming_fresh_sources'
+        if now-self.localization_fresh_since<.20:return False
+        self.localization_resume_blocker='ready'
+        return True
 
     def _poll_localization_wait(self):
         """Own a bounded safe stop even while Delivery waits for readiness."""
@@ -274,6 +307,10 @@ class OptionalIdleRuntime:
         if (phase != 'LOCALIZED' or not self._safe() or not self._stationary()
                 or self.last_scan is None
                 or not self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp)):
+            self.localization_fresh_since=self.localization_fresh_last_at=None
+            self.localization_resume_blocker='waiting_fresh_safety_and_stop'
+            return True
+        if self.localization_wait_data_only and not self._fresh_data_resume(now):
             return True
         target = self.localization_resume_state
         changed = False
@@ -507,6 +544,11 @@ class OptionalIdleRuntime:
                                    'idle_clock_reason': self.idle_clock.reason,
                                    'idle_elapsed_sec': round(self.idle_clock.elapsed,1),
                                    'spin_guard': self.guard_report}
+        payload['idle_clock'] = self.idle_clock.snapshot(time.monotonic())
+        payload['data_resume'] = dict(data_only=self.localization_wait_data_only,
+            pause_source_ns=self.localization_pause_source_ns,blocker=self.localization_resume_blocker,
+            fresh_confirmation_sec=None if self.localization_fresh_since is None else
+                round(max(0.,time.monotonic()-self.localization_fresh_since),3))
         payload['observed_heading_coverage'] = None if self.people is None else round(
             len(self.people.headings)/self.people.count, 3)
         payload['people_demand'] = (self.people.summary(self.config['people']['observation_pose'])
@@ -558,7 +600,7 @@ class OptionalIdleRuntime:
                 'map_pose_outside_auxiliary_hysteresis':'⏸️ 人流計時暫停：定位座標調整中',
                 'confirming_stationary_map_correction':'⏳ 人流計時暫停：確認原地定位修正',
                 'stationary_map_correction_verified':'✅ 原地定位修正已確認，恢復人流計時',
-                'map_pose_deviation_persistent':'🔁 人流計時重設：定位偏移持續',
+                'map_pose_deviation_persistent':'⏸️ 人流計時已重設，等待定位修正穩定',
                 'physical_odom_displacement':'🔁 人流計時重設：車輛已移動',
                 'short_tf_gap_paused':'⏸️ 人流計時暫停：等待座標更新',
                 'tf_gap_expired':'🔁 人流計時重設：座標資料中斷',
@@ -567,6 +609,30 @@ class OptionalIdleRuntime:
             if idle_reason=='counting_verified_stationary_parking' and transition:
                 remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
                 text=f'💤 人流計時中：剩餘 {remaining:.0f} 秒'
+        if self.reason=='people_data_pause':
+            enroute=(self.state=='going_observation' or self.localization_resume_state=='going_observation')
+            text=('🛑 前往分析停止中：等待新鮮資料' if self.cancel_requested and self.motion and enroute
+                  else '⏸️ 前往分析暫停：等待新鮮資料' if enroute
+                  else '🛑 分析自旋停止中：等待新鮮資料' if self.cancel_requested and self.motion
+                  else '⏸️ 分析自旋暫停：等待新鮮資料')
+        cooldown=max(0.,self.next_people_at-now)
+        if self.state=='idle':
+            event=(self.next_people_at,self.reason)
+            first_insufficient=(self.reason=='insufficient_directional_demand'
+                and getattr(self,'_logged_insufficient',None)!=event)
+            if first_insufficient:
+                self._logged_insufficient=event
+                text='🔎 分析完成：可用人形不足，維持一般待機'
+            elif self.reason=='insufficient_directional_demand' and self.idle_clock.point is None:
+                text=f'💤 人流冷卻：剩餘 {cooldown:.0f} 秒' if cooldown>0 else '💤 等待停靠後啟動人流計時'
+            if cooldown>0:
+                if idle_reason=='counting_verified_stationary_parking' and not first_insufficient:
+                    text=f'💤 人流冷卻：剩餘 {cooldown:.0f} 秒'
+                elif not first_insufficient:
+                    text+=f'｜冷卻 {cooldown:.0f} 秒'
+        if self.state=='idle' and text==getattr(self,'_last_people_text',None) and now-getattr(self,'_last_people_text_at',0.)<30.:
+            return
+        self._last_people_text,self._last_people_text_at=text,now
         self.navigator.get_logger().info(text)
 
     def _stamp_fresh(self, receipt, stamp, limit=0.30):
@@ -582,7 +648,8 @@ class OptionalIdleRuntime:
         if stamp is None and cached is not None and 0 <= now_mono-cached[0] <= .01:
             age = (self.navigator.get_clock().now().nanoseconds-cached[1])/1e9
             if -.1 <= age <= .30:
-                self.pose_report = dict(valid=True, reason='healthy', source_age_sec=round(age,4))
+                self.pose_report = dict(valid=True, reason='healthy', source_age_sec=round(age,4),
+                                        source_stamp_ns=cached[1])
                 return dict(cached[2])
         try:
             transform = self.buffer.lookup_transform('map', 'base_footprint', stamp or Time())
@@ -592,7 +659,8 @@ class OptionalIdleRuntime:
         now = self.navigator.get_clock().now().nanoseconds
         source = transform.header.stamp.sec * 1_000_000_000 + transform.header.stamp.nanosec
         age = (now-source)/1e9
-        self.pose_report = {'valid':False,'reason':'tf_stale','source_age_sec':round(age,4)}
+        self.pose_report = {'valid':False,'reason':'tf_stale','source_age_sec':round(age,4),
+                            'source_stamp_ns':source}
         if not -0.1 <= age <= 0.30:
             return None
         pose = {'x': transform.transform.translation.x, 'y': transform.transform.translation.y,
@@ -841,6 +909,7 @@ class OptionalIdleRuntime:
         self.goal, self.state, self.motion = dict(point), state, True
         self.deadline = time.monotonic() + timeout
         self.cancel_requested, self.cancel_started = False, None
+        self.cancel_stop_since = None
         self.cancel_future, self.last_cancel_at = None, 0.0
         self.reason = ''
         self.interrupt_reason = None
@@ -1084,7 +1153,7 @@ class OptionalIdleRuntime:
         if not self.motion:
             if self.settling_after_cancel:
                 if self._stationary():
-                    self.stop_since = self.stop_since or time.monotonic()
+                    self.stop_since = self.stop_since if self.stop_since is not None else time.monotonic()
                     if time.monotonic() - self.stop_since >= 1.0:
                         self.settling_after_cancel = False
                         self.stop_since = None
@@ -1121,6 +1190,7 @@ class OptionalIdleRuntime:
                     data_only=reason == 'people_data_pause')
             self.cancel_requested = True
             self.cancel_started = time.monotonic()
+            self.cancel_stop_since = None
             self.interrupt_reason = reason
             self.reason = reason
             self._log_people_state()
@@ -1149,6 +1219,10 @@ class OptionalIdleRuntime:
                 return False
             self.navigator.goal_handle = handle
             self.navigator.result_future = handle.get_result_async()
+        if self.cancel_requested:
+            if self._stationary():
+                if self.cancel_stop_since is None:self.cancel_stop_since=time.monotonic()
+            else:self.cancel_stop_since=None
         if (self.station_managed and self.cancel_requested
                 and not self.navigator.station_navigation.cancelled):
             self.navigator.station_navigation.cancelTask()
@@ -1179,7 +1253,7 @@ class OptionalIdleRuntime:
         self.station_managed = False
         if not succeeded:
             self.settling_after_cancel = True
-            self.stop_since = None
+            self.stop_since = self.cancel_stop_since if self.cancel_requested else None
             if self.state == 'going_home':
                 self.state, self.reason = 'home_failed', 'navigation_interrupted_or_failed'
             elif self.state=='going_people_standby' and station_motion_stalled:

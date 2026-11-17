@@ -32,7 +32,14 @@ def data_pause(runtime):
 def test_short_data_gap_can_resume_remaining_angle_not_a_new_full_turn(runtime):
     m,n,t=data_pause(runtime)
     end=m.observation_session_deadline
-    t[0]+=2.;recover(m);m.poll(False)
+    t[0]+=2.;recover(m)
+    def fresh_sources():
+        m.pose_report={'source_stamp_ns':round(t[0]*1e9)}
+        for message in (m.last_odom[1],m.last_scan[1]):
+            message.header.stamp.sec=int(t[0]);message.header.stamp.nanosec=round(t[0]%1*1e9)
+    fresh_sources();m.poll(False)
+    assert m.state=='waiting_people_localization'
+    t[0]+=.21;fresh_sources();m.poll(False)
     assert m.state=='waiting_observation_retry' and m.spin_travel==.6
     m.idle()
     assert len(n.sent)==2 and m.state=='observing'

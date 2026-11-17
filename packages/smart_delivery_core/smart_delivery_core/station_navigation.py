@@ -185,6 +185,10 @@ class StationNavigation:
             motion_stalled=getattr(self,'motion_stalled',False),
             clearance_timeout=getattr(self,'clearance_timeout',False),
             native_error=getattr(self,'native_error',(0,'')),
+            cancel_request_pending=(getattr(self,'cancel_request',None) is not None
+                and hasattr(self.cancel_request,'done') and not self.cancel_request.done()),
+            cancel_request_age_sec=(None if getattr(self,'cancel_requested_at',None) is None else
+                round(max(0.,time.monotonic()-self.cancel_requested_at),3)),
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
             motion_check=getattr(self,'motion_check',{}),
             clearance_retries=getattr(self,'clearance_retries',0),
@@ -283,6 +287,7 @@ class StationNavigation:
             self._finish(TaskResult.CANCELED,'cancelled'); return
         self.stage,self.next_phase = point,next_phase
         self.native_error = (0,'')
+        self.cancel_request,self.cancel_requested_at = None,None
         self.stop_since = None
         allowance = (min(22., max(12., abs(angle_error(point[2], self.align_anchor[2]))/.20+6.))
                      if phase=='aligning' else 25. if phase in ('departure','entry') else 180.)
@@ -350,7 +355,7 @@ class StationNavigation:
         # One six-second grace only; never reset the sequence or action budget.
         self.deadline=min(self.sequence_deadline,self.deadline+6.)
         self.stop_since=None
-        self.nav.cancelTask()
+        self._cancel_native()
         self._report('alignment_pausing',reason)
 
     def _tick_alignment_pause(self, pose, data_ok):
@@ -520,7 +525,7 @@ class StationNavigation:
     def _request_station_fallback(self):
         self.mode,self.mode_reason,self.mode_switches = 'station','actual_route_requires_station',1
         self.replan_pending=True
-        self.nav.cancelTask()
+        self._cancel_native()
 
     def _finish_heading_stalled(self, pose):
         # Native ordinary MPPI can reach XY yet produce a yaw command below
@@ -584,7 +589,7 @@ class StationNavigation:
         self.clearance_retries+=1
         self.clearance_pending=(self.phase,self.stage,self.next_phase)
         self.replan_pending=True
-        self.nav.cancelTask()
+        self._cancel_native()
 
     def _odom_heading(self):
         if self.odom is None:return None
@@ -610,9 +615,26 @@ class StationNavigation:
             self.align_progress,self.align_progress_at=progress,time.monotonic()
         return time.monotonic()-self.align_progress_at>=2.5
 
+    def _cancel_native(self):
+        """Request cancellation without spinning inside an auxiliary safety poll."""
+        if getattr(self,'cancel_requested_at',None) is not None:return
+        self.cancel_requested_at=time.monotonic()
+        handle=getattr(self.nav,'goal_handle',None)
+        if handle is not None and callable(getattr(handle,'cancel_goal_async',None)):
+            try:
+                self.cancel_request=handle.cancel_goal_async()
+            except Exception:
+                # Retain ownership until the original action is terminal. The
+                # existing outer lease timeout also remains armed on a fault.
+                self.failure,self.failure_kind='導航取消請求異常，保持安全停止','cancel_request_error'
+                self.data_unavailable=True
+                self.cancelled=True
+        else:
+            self.nav.cancelTask()  # Compatibility with non-ROS test/legacy adapters.
+
     def cancelTask(self):
         self.cancelled = True
-        if self.active_goal: self.nav.cancelTask()
+        if self.active_goal: self._cancel_native()
         else: self._finish(TaskResult.FAILED if self.failure else TaskResult.CANCELED,
                            'failed' if self.failure else 'cancelled',self.failure)
 
@@ -705,7 +727,7 @@ class StationNavigation:
                 self.final_heading_pending=True
                 self.mode,self.mode_reason,self.mode_switches='station','final_heading_stopped',1
                 self.replan_pending=True
-                self.nav.cancelTask()
+                self._cancel_native()
             elif self._normal_plan_unsafe(pose):
                 self._request_station_fallback()
         if self.active_goal:

@@ -124,8 +124,11 @@ def fixture():
             handle.publish_feedback(NavigateToPose.Feedback());time.sleep(.03)
         state['pose']=coordinates(handle.request.pose)
         handle.succeed();return NavigateToPose.Result()
+    def cancel_callback(_):
+        if '--slow-cancel' in sys.argv:time.sleep(3.)
+        return CancelResponse.ACCEPT
     server=ActionServer(node,NavigateToPose,'/navigate_to_pose',execute,
-        cancel_callback=lambda _:CancelResponse.ACCEPT,callback_group=ReentrantCallbackGroup())
+        cancel_callback=cancel_callback,callback_group=ReentrantCallbackGroup())
     executor=MultiThreadedExecutor(num_threads=4);executor.add_node(node);executor.add_node(guard)
     publish_grid()
     try:executor.spin()
@@ -154,7 +157,8 @@ def main():
     root=Path(os.environ['ROS_LOG_DIR']);root.mkdir(parents=True,exist_ok=True)
     with (root/'action_fixture.log').open('w') as log:
         child=subprocess.Popen([sys.executable,__file__,'--fixture']+(['--loaded'] if loaded else [])+
-            (['--remote-obstacle'] if '--remote-obstacle' in sys.argv else []),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            (['--remote-obstacle'] if '--remote-obstacle' in sys.argv else [])+
+            (['--slow-cancel'] if '--async-cancel' in sys.argv else []),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         rclpy.init();node=DeliveryNavigator();buffer=Buffer();listener=TransformListener(buffer,node)
         share=get_package_share_directory('smart_delivery_core')
         manager=manager_type(node,buffer,share);node.station_navigation=manager
@@ -202,6 +206,31 @@ def main():
         try:
             assert node.nav_to_pose_client.wait_for_server(timeout_sec=10.)
             pump(1.)
+            if '--async-cancel' in sys.argv:
+                assert not loaded
+                hold.publish(Bool(data=True));pump(.3)
+                manager.start(goal(1.,0.))
+                end=time.monotonic()+3.
+                while not manager.active_goal and time.monotonic()<end:
+                    manager.isTaskComplete();rclpy.spin_once(node,timeout_sec=.02)
+                assert manager.active_goal
+                started=time.monotonic();manager.cancelTask();request_sec=time.monotonic()-started
+                assert request_sec<.10,request_sec
+                assert manager.running and manager.active_goal
+                started=time.monotonic();assert not manager.isTaskComplete()
+                poll_sec=time.monotonic()-started
+                assert poll_sec<.5,poll_sec
+                assert finish(8.)==TaskResult.CANCELED
+                drain_sec=time.monotonic()-started
+                assert drain_sec>=2.5 and manager.goals_submitted==1
+                hold.publish(Bool(data=False));pump(.2)
+                manager.start(goal(1.,0.));assert finish()==TaskResult.SUCCEEDED
+                assert not commands
+                print(json.dumps(dict(passed=True,async_cancel=True,domain=231,
+                    cancellation_request_sec=request_sec,poll_during_delayed_ack_sec=poll_sec,
+                    terminal_drain_sec=drain_sec,old_goal_terminal_before_successor=True,
+                    nonzero_velocity_commands=0)))
+                return
             if '--alignment-tf-outage' in sys.argv:
                 assert not loaded
                 hold.publish(Bool(data=True));pump(.3)
