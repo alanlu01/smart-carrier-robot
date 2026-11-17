@@ -104,7 +104,7 @@ class StationNavigation:
             ns = tr.header.stamp.sec*10**9+tr.header.stamp.nanosec
             age = self._ages(time.monotonic(),ns,1.)
             age.pop('receipt_age_sec')  # Buffer lookup does not expose receipt time.
-            self.pose_gate = dict(available=True,receipt_age_observed=False,**age)
+            self.pose_gate = dict(available=True,receipt_age_observed=False,stamp_ns=ns,**age)
             if not self._fresh(time.monotonic(),ns,1.): return None
             p,q = tr.transform.translation,tr.transform.rotation
             pose = (p.x,p.y,math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z)))
@@ -147,6 +147,7 @@ class StationNavigation:
             'staging':'➡️ 前往進站準備點','entry':'↔️ 連續低速進站',
             'direct':'➡️ 直接導航','aligning':'🧭 車頭對正',
             'waiting_action_health':'⏳ 確認導航回應',
+            'alignment_pausing':'⏸️ 對正暫停煞停','alignment_wait':'⏳ 對正等待資料',
             'waiting_clearance':'⏳ 等待進出站通道',
             'settling':'⏳ 確認停妥','arrived':'✅ 停靠完成','failed':'⚠️ 進出站中止',
             'cancelled':'⏸️ 進出站已取消','transit':'➡️ 繼續導航','reached':'✅ 已抵達目標'}
@@ -173,6 +174,10 @@ class StationNavigation:
             mode_switch_scope=getattr(self,'mode_switch_scope',None),
             decision_time_ms=getattr(self,'decision_time_ms',None),
             alignment_attempts=getattr(self,'alignment_attempts',0),
+            alignment_data_pauses=getattr(self,'alignment_data_pauses',0),
+            alignment_pause=getattr(self,'alignment_pause',None),
+            failure_kind=getattr(self,'failure_kind',''),
+            clearance_blocker=getattr(self,'clearance_blocker',{}),
             final_corrections=getattr(self,'final_corrections',0),
             remote_preparation=getattr(self,'remote_preparation',False),
             clearance_scope=getattr(self,'clearance_scope',''),
@@ -248,6 +253,8 @@ class StationNavigation:
         self.checked_plan = None
         self.mode_switch_scope = None
         self.alignment_attempts,self.final_corrections = 0,0
+        self.alignment_pause,self.alignment_data_pauses = None,0
+        self.failure_kind,self.clearance_blocker = '',{}
         self.align_anchor = None
         self.align_odom_anchor = None
         self.align_progress,self.align_progress_at = 0.,0.
@@ -314,10 +321,72 @@ class StationNavigation:
         self.clearance_resume = resume
         self.clearance_scope,self.clearance_detail=scope,reason
         point=self.target if scope.startswith('destination') else self._pose()
-        self.clearance_kind=('static_map_unavailable' if self.static_grid is None else
-            'static_or_unknown' if point and not self.static_grid.clear(point) else 'dynamic_costmap')
+        self.clearance_blocker=(self.grid.blocker(point,rotation=True)
+            if point and hasattr(self.grid,'blocker') else {}) or {}
+        self.clearance_kind=self._classify_blocker(self.clearance_blocker)
+        kind_label={'static':'靜態障礙','unknown':'未知區域','off_map':'地圖邊界',
+                    'dynamic_costmap':'即時障礙','static_map_unavailable':'缺少靜態地圖'}.get(self.clearance_kind,'通道受阻')
+        self.clearance_detail=f'{reason}（{kind_label}）'
         self.after_stop = 'clearance'
-        self._report('waiting_clearance',reason)
+        self._report('waiting_clearance',self.clearance_detail)
+
+    def _classify_blocker(self, blocker):
+        if not blocker:return 'sweep_or_corridor_blocked'
+        if blocker.get('kind') in ('unknown','off_map'):return blocker['kind']
+        point=blocker.get('position')
+        if self.static_grid is None:return 'static_map_unavailable'
+        if point is None:return 'unclassified'
+        value=self.static_grid.cell_value(*point)
+        return ('unknown' if value is None or value<0 else
+                'static' if value>=100 else 'dynamic_costmap')
+
+    def _pause_alignment(self, reason):
+        if self.alignment_data_pauses>=1:
+            self.failure,self.failure_kind='對正資料反覆中斷','alignment_data_repeated'
+            self.data_unavailable=True;self.cancelTask();return
+        self.alignment_data_pauses+=1
+        self.alignment_pause=dict(reason=reason,source_ns=self.nav.get_clock().now().nanoseconds,
+                                  next_phase=self.next_phase)
+        # One six-second grace only; never reset the sequence or action budget.
+        self.deadline=min(self.sequence_deadline,self.deadline+6.)
+        self.stop_since=None
+        self.nav.cancelTask()
+        self._report('alignment_pausing',reason)
+
+    def _tick_alignment_pause(self, pose, data_ok):
+        physical=self._physical_pose(self.align_anchor)
+        if physical is not None:
+            distance=math.hypot(physical[0]-self.align_anchor[0],physical[1]-self.align_anchor[1])
+            self.motion_check=dict(alignment_displacement_m=round(distance,4),source='odom')
+            if distance>.05:
+                self.failure,self.failure_kind='對正實際位移超過 5 cm','alignment_displacement'
+                self.cancelTask();return
+        stopped=self._stopped()
+        pause=self.alignment_pause
+        odom_stamp=(self.odom.header.stamp.sec*10**9+self.odom.header.stamp.nanosec
+                    if self.odom is not None else 0)
+        new_sources=(self.pose_gate.get('stamp_ns',0)>pause['source_ns']
+                     and odom_stamp>pause['source_ns'] and self.grid_stamp>pause['source_ns'])
+        if pose is None or not data_ok or physical is None or not stopped or not new_sources:
+            self.stop_since=None
+            self._waiting(pose,data_ok,stopped)
+            return
+        if not self.grid.turn_clear(pose,self.target[2]):
+            self.failure,self.failure_kind='對正旋轉空間受阻','alignment_turn_blocked'
+            self.cancelTask();return
+        self.stop_since=time.monotonic() if self.stop_since is None else self.stop_since
+        if time.monotonic()-self.stop_since<.5:return
+        resume=pause['next_phase']
+        self.alignment_pause=None
+        if abs(angle_error(self.target[2],pose[2]))<=.10:
+            self.after_stop=resume
+            self._report('settling','資料恢復，對正位置已確認')
+            self._advance(pose)
+        else:
+            # Retain original physical guard across all resumed native goals.
+            anchor,origin=self.align_anchor,self.motion_odom_anchor
+            self._align(pose,resume)
+            self.align_anchor,self.motion_odom_anchor=anchor,origin
 
     def _align(self, pose, resume):
         if self.alignment_attempts>=2:
@@ -572,7 +641,8 @@ class StationNavigation:
         if not self.cancelled and time.monotonic()>self.deadline:
             self.preflight_timeout = self.goals_submitted==0 and self.phase=='waiting_data'
             self.clearance_timeout = self.phase=='waiting_clearance'
-            self.failure = ('導航前置確認逾時，尚未送出目標' if self.preflight_timeout
+            self.failure_kind = ('alignment_data_deadline' if self.alignment_pause else 'stage_deadline')
+            self.failure = ('對正資料恢復逾時' if self.alignment_pause else '導航前置確認逾時，尚未送出目標' if self.preflight_timeout
                             else '進出站通道持續受阻' if self.clearance_timeout
                             else '階段逾時，未確認停妥')
             self.data_unavailable = not data_ok or pose is None
@@ -604,22 +674,23 @@ class StationNavigation:
                 elif not self.grid.segment(pose,self.stage):
                     self.motion_check.update(blocker=self._translation_blocker(pose,self.stage))
                     self._pause_translation()
-        align_physical=(self._physical_pose(self.align_anchor)
-                        if self.phase=='aligning' and self.align_anchor else None)
-        if (self.active_goal and not completed and self.phase=='aligning' and not self.cancelled
-                and (pose is None or not data_ok or
-                     align_physical is None or
-                     math.hypot(align_physical[0]-self.align_anchor[0],
-                                align_physical[1]-self.align_anchor[1])>.05
-                     or not self.grid.turn_clear(pose,self.stage[2]))):
-            self.failure = '對正位置或資料未通過檢查'
-            self.data_unavailable = pose is None or not data_ok or align_physical is None
-            self.cancelTask()
-        align_physical=(self._physical_pose(self.align_anchor)
-                        if self.phase=='aligning' and self.align_anchor else None)
+        if self.active_goal and not completed and self.phase=='aligning' and not self.cancelled:
+            physical=self._physical_pose(self.align_anchor)
+            if physical is not None and math.hypot(physical[0]-self.align_anchor[0],
+                                                   physical[1]-self.align_anchor[1])>.05:
+                self.failure,self.failure_kind='對正實際位移超過 5 cm','alignment_displacement'
+                self.cancelTask()
+            elif pose is None or not data_ok or physical is None:
+                reason=('等待車輛座標更新' if pose is None else
+                        '等待代價地圖更新' if not data_ok else '等待里程計更新')
+                self._pause_alignment(reason)
+            elif not self.grid.turn_clear(pose,self.stage[2]):
+                self.failure,self.failure_kind='對正旋轉空間受阻','alignment_turn_blocked'
+                self.cancelTask()
         if (self.active_goal and not completed and self.phase=='aligning' and not self.cancelled
                 and self._alignment_stalled()):
             self.motion_stalled=True
+            self.failure_kind='alignment_no_progress'
             self.failure='對正命令無有效輪速進展，停止補停'
             self.cancelTask()
         if not self.cancelled and not self.permitted():
@@ -642,6 +713,10 @@ class StationNavigation:
                 return False
             self.active_goal = False
             result = self.nav.getResult()
+            if self.alignment_pause is not None and not self.cancelled:
+                self._report('alignment_wait','舊目標已停止，等待新資料')
+                self._tick_alignment_pause(pose,data_ok)
+                return not self.running
             if result != TaskResult.SUCCEEDED:
                 try:
                     message = self.nav.result_future.result().result
@@ -683,6 +758,9 @@ class StationNavigation:
         if self.cancelled or not self.permitted():
             self._finish(TaskResult.FAILED if self.failure else TaskResult.CANCELED,
                          'failed' if self.failure else 'cancelled',self.failure); return True
+        if self.alignment_pause is not None:
+            self._tick_alignment_pause(pose,data_ok)
+            return not self.running
         stopped = self._stopped()
         if self.phase=='waiting_clearance':
             self._waiting(pose,data_ok,stopped)

@@ -23,3 +23,35 @@ def near_convergence(samples, xy_limit, yaw_limit, distance=.20, angle=.174533):
                 or abs(math.atan2(math.sin(delta), math.cos(delta))) > angle):
             return False
     return all(b[2] <= a[2]+.01 for a,b in zip(samples,samples[1:]))
+
+
+class StationaryPoseGuard:
+    """Arm only from a source-stamped pose produced after physical settling."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.after_ns = None
+        self.last_stamp_ns = 0
+        self.anchor = None
+
+    def observe(self, pose, stamp_ns, now_ns, *, settled, distance, angle):
+        if not settled:
+            self.reset()
+            return False
+        if self.after_ns is None or now_ns < self.after_ns:
+            self.reset()
+            self.after_ns = now_ns
+            return False
+        if (not all(math.isfinite(v) for v in pose)
+                or not self.after_ns < stamp_ns <= now_ns+100_000_000
+                or stamp_ns <= self.last_stamp_ns):
+            return False
+        self.last_stamp_ns = stamp_ns
+        if self.anchor is None:
+            self.anchor = pose
+            return False
+        delta = pose[2]-self.anchor[2]
+        return (math.hypot(pose[0]-self.anchor[0], pose[1]-self.anchor[1]) >= distance
+                or abs(math.atan2(math.sin(delta), math.cos(delta))) >= angle)

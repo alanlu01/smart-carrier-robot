@@ -1,5 +1,6 @@
 """Bounded stopped verification after a data outage, separate from pose search."""
 import math
+from dataclasses import dataclass
 
 
 class PipelineRecheck:
@@ -29,6 +30,9 @@ class PipelineRecheck:
             self.last_map_at = max(self.last_map_at, map_at)
             self.reason = 'waiting_data' if not available else 'waiting_stop'
             return 'wait'
+        if self.reference is None and transform is not None:
+            self.reason = 'reference_missing'
+            return 'pose_recovery'  # Existing bounded no-motion observation, never resume here.
         if self.reference is None or transform is None:
             self.samples = 0
             self.last_available_at = None
@@ -66,4 +70,32 @@ class PipelineRecheck:
         return dict(elapsed_sec=round(max(0., now-self.started), 3), samples=self.samples,
                     verification_elapsed_sec=round(self.verification_elapsed, 3),
                     required_samples=self.required, reason=self.reason,
+                    reference_evidence=getattr(self, 'reference_evidence', None),
                     position_delta_m=self.position_delta, angle_delta_rad=self.angle_delta)
+
+
+@dataclass(frozen=True)
+class TrustedPipelineReference:
+    """Pre-outage provenance; never derive a reference from recovered TF."""
+
+    observed_at: float
+    source_ns: int
+    transform: tuple
+    odom: tuple
+    xy_std: float
+    yaw_std: float
+    map_score: float
+    amcl_source_ns: int = 0
+    odom_source_ns: int = 0
+
+    def select(self, now, now_ns, odom, distance, angle):
+        if (odom is None or not 0 <= now-self.observed_at <= 10.
+                or not -1.1 <= (now_ns-self.source_ns)/1e9 <= 12.
+                or not all(math.isfinite(v) for v in (
+                    *self.transform, *self.odom, *odom, self.xy_std, self.yaw_std, self.map_score))):
+            return None
+        delta = odom[2]-self.odom[2]
+        if (math.hypot(odom[0]-self.odom[0], odom[1]-self.odom[1]) > distance
+                or abs(math.atan2(math.sin(delta), math.cos(delta))) > angle):
+            return None
+        return self.transform

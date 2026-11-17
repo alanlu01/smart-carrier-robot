@@ -34,7 +34,8 @@ def fixture():
     rclpy.init();node=rclpy.create_node('codex_station_action_fixture');guard=DeliveryGoalGuard()
     loaded='--loaded' in sys.argv
     remote='--remote-obstacle' in sys.argv
-    state=dict(pose=(0.,0.,0.),hold=False,grid_enabled=True,goals=[],cancels=0)
+    state=dict(pose=(0.,0.,0.),hold=False,grid_enabled=True,tf_enabled=True,goals=[],cancels=0)
+    node.create_subscription(Bool,'/codex/station_tf_enabled',lambda m:state.update(tf_enabled=m.data),10)
     node.create_subscription(Bool,'/codex/station_hold',lambda m:state.update(hold=m.data),10)
     node.create_subscription(Bool,'/codex/station_grid_enabled',lambda m:state.update(grid_enabled=m.data),10)
     state_qos=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -63,7 +64,8 @@ def fixture():
         stamp=node.get_clock().now().to_msg();x,y,yaw=state['pose']
         tr=TransformStamped();tr.header.frame_id='odom' if loaded else 'map';tr.child_frame_id='base_footprint';tr.header.stamp=stamp
         tr.transform.translation.x=x;tr.transform.translation.y=y
-        tr.transform.rotation.z=math.sin(yaw/2);tr.transform.rotation.w=math.cos(yaw/2);tf.sendTransform(tr)
+        tr.transform.rotation.z=math.sin(yaw/2);tr.transform.rotation.w=math.cos(yaw/2)
+        if state['tf_enabled']:tf.sendTransform(tr)
         message=Odometry();message.header.stamp=stamp;message.pose.pose.orientation.w=1.;odom.publish(message)
     def publish_grid():
         if not state['grid_enabled']:return
@@ -178,6 +180,7 @@ def main():
         lease=node.create_publisher(Bool,'/smart_carrier/delivery_navigation_active',LEASE_QOS)
         node.create_timer(.2,lambda:lease.publish(Bool(data=True)))
         hold=node.create_publisher(Bool,'/codex/station_hold',10)
+        tf_enabled=node.create_publisher(Bool,'/codex/station_tf_enabled',10)
         grid_enabled=node.create_publisher(Bool,'/codex/station_grid_enabled',10)
         commands=[];node.create_subscription(Twist,'/cmd_vel',commands.append,10)
         def pump(seconds):
@@ -199,6 +202,26 @@ def main():
         try:
             assert node.nav_to_pose_client.wait_for_server(timeout_sec=10.)
             pump(1.)
+            if '--alignment-tf-outage' in sys.argv:
+                assert not loaded
+                hold.publish(Bool(data=True));pump(.3)
+                manager.start(goal(0.,0.,.3))
+                manager.mode='station';manager._align(manager._pose(),'finish')
+                assert manager.active_goal
+                tf_enabled.publish(Bool(data=False))
+                end=time.monotonic()+4.
+                while time.monotonic()<end and manager.phase!='alignment_wait':
+                    manager.isTaskComplete();rclpy.spin_once(node,timeout_sec=.02)
+                assert manager.phase=='alignment_wait' and not manager.active_goal,manager.last_report
+                assert manager.goals_submitted==1 and not manager.cancelled
+                tf_enabled.publish(Bool(data=True));hold.publish(Bool(data=False))
+                assert finish()==TaskResult.SUCCEEDED,manager.last_report
+                assert manager.goals_submitted==2 and manager.alignment_data_pauses==1
+                assert not commands
+                print(json.dumps(dict(passed=True,domain=231,alignment_tf_outage=True,
+                    terminal_drained_before_resume=True,new_sources_and_stopped_dwell=True,
+                    native_goals=manager.goals_submitted,nonzero_velocity_commands=0)))
+                return
             first=(-3.,5.,0.) if loaded else (1.,0.,0.)
             second=(6.6,-.3,math.pi) if loaded else (1.,1.,0.)
             manager.start(goal(*first));first_result=finish()

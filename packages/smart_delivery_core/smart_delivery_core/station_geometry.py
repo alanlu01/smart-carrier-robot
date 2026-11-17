@@ -39,7 +39,16 @@ class StationGrid:
                 or not all(math.isfinite(v) for v in (self.x, self.y, self.yaw))):
             raise ValueError('invalid station costmap')
 
+    def cell_value(self, x, y):
+        c,s=math.cos(self.yaw),math.sin(self.yaw)
+        col=math.floor((c*(x-self.x)+s*(y-self.y))/self.resolution)
+        row=math.floor((-s*(x-self.x)+c*(y-self.y))/self.resolution)
+        return self.data[row*self.width+col] if 0<=col<self.width and 0<=row<self.height else None
+
     def clear(self, pose, rotation=False):
+        return self.blocker(pose,rotation) is None
+
+    def blocker(self, pose, rotation=False):
         # Add 3 cm to the real 44 x 32 cm body. Test cell squares, not just
         # centers, to avoid losing a thin chair leg along the sampled boundary.
         x, y, yaw = pose
@@ -54,7 +63,7 @@ class StationGrid:
         lo_x, hi_x = math.floor((gx-extent_x)/self.resolution-1e-9), math.floor((gx+extent_x)/self.resolution+1e-9)
         lo_y, hi_y = math.floor((gy-extent_y)/self.resolution-1e-9), math.floor((gy+extent_y)/self.resolution+1e-9)
         if lo_x < 0 or lo_y < 0 or hi_x >= self.width or hi_y >= self.height:
-            return False
+            return dict(kind='off_map',position=[x,y])
         for row in range(lo_y, hi_y+1):
             for col in range(lo_x, hi_x+1):
                 value = self.data[row*self.width+col]
@@ -79,8 +88,11 @@ class StationGrid:
                               and abs(c*dx+s*dy) <= .25+half_cell*(ac+ass)+1e-12
                               and abs(-s*dx+c*dy) <= .19+half_cell*(ac+ass)+1e-12)
                 if inside:
-                    return False
-        return True
+                    c0,s0=math.cos(self.yaw),math.sin(self.yaw)
+                    cx,cy=(col+.5)*self.resolution,(row+.5)*self.resolution
+                    return dict(kind='unknown' if value<0 else 'occupied',value=int(value),
+                        cell=[col,row],position=[self.x+c0*cx-s0*cy,self.y+s0*cx+c0*cy])
+        return None
 
     def segment(self, start, end):
         if abs(angle_error(start[2],end[2])) > .12:

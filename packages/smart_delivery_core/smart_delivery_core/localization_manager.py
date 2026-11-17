@@ -74,8 +74,8 @@ from smart_delivery_core.delivery_console import localization_label, brief, reas
 from smart_delivery_core.global_pose_gate import ray_consistency
 from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
 from smart_delivery_core.covariance_probe import CovarianceProbe
-from smart_delivery_core.pipeline_recheck import PipelineRecheck
-from smart_delivery_core.settled_motion import can_arm_stationary_anchor, near_convergence
+from smart_delivery_core.pipeline_recheck import PipelineRecheck, TrustedPipelineReference
+from smart_delivery_core.settled_motion import can_arm_stationary_anchor, near_convergence, StationaryPoseGuard
 from smart_delivery_core.recovery_spin import RecoverySpin
 from nav2_msgs.msg import CollisionMonitorState
 
@@ -1039,6 +1039,7 @@ class LocalizationManager(Node):
             self.last_motion_command_at = now
             self.stationary_odom_anchor = None
             self.stationary_amcl_anchor = None
+            if hasattr(self, 'stationary_pose_guard'):self.stationary_pose_guard.reset()
 
     def _motion_inhibited_callback(self, message):
         self.motion_inhibited = bool(message.data)
@@ -1067,6 +1068,7 @@ class LocalizationManager(Node):
         )
         if self.odom_motion:
             self.last_odom_motion_at = now
+            if hasattr(self, 'stationary_pose_guard'):self.stationary_pose_guard.reset()
         self.last_odom_pose = current
         managed = getattr(self, 'managed_spin', None)
         if managed is not None:
@@ -1128,17 +1130,24 @@ class LocalizationManager(Node):
         ):
             self._persist_trusted_pose()
 
-        if self.state == "LOCALIZED" and not self.commanded_motion:
-            if self.stationary_amcl_anchor is None:
-                self.stationary_amcl_anchor = current
-            distance, angle = pose_jump(self.stationary_amcl_anchor, current)
-            if distance >= self.pose_jump_distance or angle >= self.pose_jump_angle:
-                self.stationary_amcl_anchor = current
-                self._begin_recovery(
-                    f"無速度命令但 AMCL 累積位移 {distance:.2f} m / "
-                    f"{math.degrees(angle):.1f} deg"
-                )
-                return
+        guard = getattr(self, 'stationary_pose_guard', None)
+        if guard is None:
+            guard = self.stationary_pose_guard = StationaryPoseGuard()
+        stop = getattr(self, 'recovery_stop', None)
+        settled = (self.state == 'LOCALIZED' and self.latest_odom_valid
+            and 0 <= now-self.latest_odom_at <= .4
+            and can_arm_stationary_anchor(now, getattr(self, 'last_motion_command_at', 0.),
+                self.commanded_motion, self.odom_motion, stop is not None and stop.ready(now)))
+        changed = guard.observe(current, stamp_ns, self.get_clock().now().nanoseconds,
+            settled=settled, distance=getattr(self, 'pose_jump_distance', .5),
+            angle=getattr(self, 'pose_jump_angle', math.radians(20.)))
+        self.stationary_amcl_anchor = guard.anchor
+        if changed:
+            distance, angle = pose_jump(guard.anchor, current)
+            guard.reset()
+            self._begin_recovery(
+                f"實際停穩後 AMCL 累積位移 {distance:.2f} m / {math.degrees(angle):.1f} deg")
+            return
 
         if getattr(self, 'pipeline_recheck', None) is not None or getattr(self, 'managed_spin', None) is not None:
             # Only the stopped pipeline verifier may release this hold. Old
@@ -1271,6 +1280,7 @@ class LocalizationManager(Node):
             return
         self._cancel_navigation()
         self.pipeline_recheck=None
+        self.pipeline_trusted_reference=None
         self.recovery_step=None
         self.spin_sequence=[]
         self.stable_samples=0
@@ -1964,9 +1974,7 @@ class LocalizationManager(Node):
             if (self.state == 'LOCALIZED' and self.latest_quality is not None
                     and self.latest_quality.healthy and self.latest_map_score is not None
                     and self.latest_map_score >= self.map_match_recovery_score):
-                trusted = self._pipeline_transform()
-                if trusted is not None:
-                    self.pipeline_trusted_reference = (now, trusted)
+                self._capture_pipeline_reference(now)
             self.last_map_match_error = ""
             if getattr(self, 'global_verification_required', False):
                 self.global_geometry_report = ray_consistency(
@@ -2069,7 +2077,8 @@ class LocalizationManager(Node):
         self.transient_recovery_started_at = 0.0
         self.sensor_waiting_for_pipeline = False
         self.stationary_odom_anchor = self.last_odom_pose
-        self.stationary_amcl_anchor = self.latest_pose
+        self.stationary_amcl_anchor = None
+        self.stationary_pose_guard = StationaryPoseGuard()
         quality = self.latest_quality
         reason = reason_override or "AMCL 已穩定"
         if quality is not None:
@@ -2098,18 +2107,21 @@ class LocalizationManager(Node):
             return
         now = time.monotonic()
         if sensor_pipeline_timeout and self.state == 'LOCALIZED':
-            reference = self._pipeline_transform()
-            if (self.latest_quality is None or not self.latest_quality.healthy
-                    or self.latest_map_score is None or self.latest_map_score < self.map_match_recovery_score):
-                reference = None
             cached = getattr(self, 'pipeline_trusted_reference', None)
-            if reference is None and cached is not None and 0 <= now-cached[0] <= 2.:
-                reference = cached[1]
+            reference = (cached.select(now, self.get_clock().now().nanoseconds,
+                         self.last_odom_pose, self.verification_pose_distance,
+                         self.verification_pose_angle)
+                         if isinstance(cached, TrustedPipelineReference) else None)
             self.pipeline_recheck = PipelineRecheck(
                 now, self.get_clock().now().nanoseconds, reference,
                 required=self.stable_samples_required, timeout=self.pipeline_wait_timeout,
                 verification_timeout=max(8., self.transient_recovery_max),
                 distance=self.verification_pose_distance, angle=self.verification_pose_angle)
+            self.pipeline_recheck.reference_evidence = (dict(
+                observed_at=cached.observed_at, tf_source_ns=cached.source_ns,
+                amcl_source_ns=cached.amcl_source_ns, odom_source_ns=cached.odom_source_ns,
+                odom=cached.odom, xy_std_m=cached.xy_std, yaw_std_rad=cached.yaw_std,
+                map_score=cached.map_score) if reference is not None else None)
             self.stable_samples = 0
             self.manual_intervention_kind = 'pipeline'
             self._cancel_navigation()
@@ -2120,6 +2132,7 @@ class LocalizationManager(Node):
             self.get_logger().warning('📡 回授／導航資料中斷，安全停車並保留任務')
             return
         self.pipeline_recheck = None
+        self.pipeline_trusted_reference = None
         self.manual_intervention_kind = 'pose'
         self.transient_recovery_eligible = bool(
             transient_sensor_timeout
@@ -2192,6 +2205,34 @@ class LocalizationManager(Node):
             "請確認 fusion_node/start_ai 已啟動）"
         )
         return False
+
+    def _capture_pipeline_reference(self, now):
+        """Cache provenance only while independent map/AMCL evidence is healthy."""
+        try:
+            tf = self.tf_buffer.lookup_transform('map', 'odom', Time(),
+                timeout=RclpyDuration(seconds=0.))
+            stamp = tf.header.stamp.sec*1_000_000_000+tf.header.stamp.nanosec
+            now_ns = self.get_clock().now().nanoseconds
+            source_age = (now_ns-stamp)/1e9
+            amcl_ns = round(getattr(self, 'latest_pose_observed_at', 0.)*1e9)
+            odom_ns = getattr(self, 'latest_odom_stamp_ns', 0)
+            if (amcl_ns<=0 or odom_ns<=0
+                    or not -.1 <= (now_ns-amcl_ns)/1e9 <= 2.
+                    or not -.1 <= (now_ns-odom_ns)/1e9 <= .4
+                    or not -1.1 <= source_age <= 2. or now-self.last_amcl_at > 2.
+                    or not self.latest_odom_valid or now-self.latest_odom_at > .4
+                    or self.last_odom_pose is None):
+                return
+            t, q = tf.transform.translation, tf.transform.rotation
+            # Store the SAME lookup and its source timestamp atomically.
+            value = (float(t.x), float(t.y), quaternion_to_yaw(q))
+            if not all(math.isfinite(v) for v in (*value, *self.last_odom_pose)):return
+            self.pipeline_trusted_reference = TrustedPipelineReference(
+                now, stamp, value, self.last_odom_pose,
+                self.latest_quality.xy_std, self.latest_quality.yaw_std, self.latest_map_score,
+                amcl_ns, odom_ns)
+        except (AttributeError, TransformException):
+            return
 
     def _pipeline_transform(self):
         """Use AMCL's map->odom transform, not unsynchronised moving poses."""
@@ -2336,7 +2377,8 @@ class LocalizationManager(Node):
         elif action == 'manual_pipeline':
             self._require_manual('底盤／導航資料管線持續未恢復，維持安全停車')
         elif action == 'pose_recovery':
-            self.get_logger().warning('📍 資料已恢復但位置未通過驗證，進入定位恢復')
+            self.get_logger().warning('🔎 '+('缺少可信參考，改用停車定位驗證'
+                if guard.reference is None else '位置未通過驗證，進入定位恢復'))
             self._begin_recovery('資料恢復後位置仍不確定')
         elif guard.reason != before:
             if guard.reason == 'verifying':

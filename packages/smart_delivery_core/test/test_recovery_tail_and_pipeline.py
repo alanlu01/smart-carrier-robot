@@ -4,7 +4,7 @@ from smart_delivery_core.recovery_translation import lateral_speed
 from smart_delivery_core.localization_manager import LocalizationManager
 from smart_delivery_core.delivery_console import localization_label
 from test_localization_recovery import manager,lateral_harness
-from smart_delivery_core.pipeline_recheck import PipelineRecheck
+from smart_delivery_core.pipeline_recheck import PipelineRecheck, TrustedPipelineReference
 
 
 def test_recorded_273556_mm_tail_finishes_without_requiring_unachievable_small_command():
@@ -51,7 +51,9 @@ def test_inactive_or_missing_navigation_health_keeps_dispatch_stopped(manager):
 def test_real_pipeline_entry_keeps_history_even_if_fault_happened_while_driving(manager):
     n,c=manager
     n.state='LOCALIZED';n.commanded_motion=n.odom_motion=True
-    n._pipeline_transform=lambda:(1.,4.,0.)
+    n.last_odom_pose=(0.,0.,0.)
+    n.pipeline_trusted_reference=TrustedPipelineReference(99.,99000000000,(1.,4.,0.),
+        n.last_odom_pose,.2,.1,.8)
     n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100000000000))
     n.cancelled=[];n._cancel_navigation=lambda:n.cancelled.append(True)
     n._set_state=lambda state,reason:setattr(n,'state',state)

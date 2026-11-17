@@ -82,6 +82,7 @@ def manager(monkeypatch):
     cov[0] = cov[7] = 0.20 ** 2
     cov[35] = 0.10 ** 2
     node.latest_quality = pose_quality(cov, 0.25, 0.17, 0.50, 0.45)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(clock.now*1e9)))
     node.get_logger = lambda: SimpleNamespace(
         info=lambda *_: None, warning=lambda *_: None, error=lambda *_: None
     )
@@ -1039,12 +1040,12 @@ def test_short_lateral_stop_cannot_be_called_complete_and_continuation_is_once(m
     assert n.lateral_phase=='disarming' and n.lateral_abort_reason=='橫移未達有效距離'
 
 
-@pytest.mark.parametrize('age,expected', [(1.5,(1.,2.,.1)),(2.1,None)])
+@pytest.mark.parametrize('age,expected', [(1.5,(1.,2.,.1)),(5.,(1.,2.,.1)),(10.1,None)])
 def test_only_recent_trusted_pre_outage_reference_survives_transient_quality_loss(manager,age,expected):
-    n,c=manager;n.state='LOCALIZED'
-    n.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int(c.now*1e9)))
-    n._pipeline_transform=lambda:None
-    n.pipeline_trusted_reference=(c.now-age,(1.,2.,.1))
+    from smart_delivery_core.pipeline_recheck import TrustedPipelineReference
+    n,c=manager;n.state='LOCALIZED';n.last_odom_pose=(0.,0.,0.)
+    n.pipeline_trusted_reference=TrustedPipelineReference(c.now-age,int((c.now-age)*1e9),
+        (1.,2.,.1),n.last_odom_pose,.2,.1,.9)
     n._cancel_navigation=lambda:None
     n._set_state=lambda state,reason:setattr(n,'state',state)
     module.LocalizationManager._begin_recovery(n,'test',sensor_pipeline_timeout=True)
