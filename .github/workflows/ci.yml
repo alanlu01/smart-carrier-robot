@@ -54,4 +54,5 @@ jobs:
           colcon build --packages-select smart_station_controller smart_delivery_core smart_carrier_api power_monitor hailo_vision --symlink-install --cmake-args -DBUILD_TESTING=ON
           source install/setup.bash
           colcon test --packages-select smart_station_controller --return-code-on-test-failure
-          python3 -m pytest -q packages/smart_delivery_core/test packages/smart_carrier_api/tests packages/power_monitor/test/test_power_status.py packages/hailo_vision/test --ignore-glob='*/test_copyright.py' --ignore-glob='*/test_flake8.py' --ignore-glob='*/test_pep257.py'
+          ctest --test-dir build/smart_station_controller --output-on-failure
+          python3 -m pytest -q packages/smart_delivery_core/test packages/smart_carrier_api/tests packages/power_monitor/test/test_power_status.py packages/hailo_vision/test --ignore=packages/smart_delivery_core/test/test_copyright.py --ignore=packages/smart_delivery_core/test/test_flake8.py --ignore=packages/smart_delivery_core/test/test_pep257.py --ignore=packages/hailo_vision/test/test_copyright.py --ignore=packages/hailo_vision/test/test_flake8.py --ignore=packages/hailo_vision/test/test_pep257.py
