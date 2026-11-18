@@ -344,6 +344,8 @@ class StationNavigation:
         self.clearance_kind=self._classify_blocker(self.clearance_blocker)
         kind_label={'static':'靜態障礙','unknown':'未知區域','off_map':'地圖邊界',
                     'dynamic_costmap':'即時障礙','static_map_unavailable':'缺少靜態地圖'}.get(self.clearance_kind,'通道受阻')
+        if self.clearance_blocker.get('layer')=='margin':
+            kind_label+='／餘裕邊界'
         self.clearance_detail=f'{reason}（{kind_label}）'
         self.after_stop = 'clearance'
         self._report('waiting_clearance',self.clearance_detail)
