@@ -55,4 +55,4 @@ jobs:
           source install/setup.bash
           colcon test --packages-select smart_station_controller --return-code-on-test-failure
           ctest --test-dir build/smart_station_controller --output-on-failure
-          python3 -m pytest -q packages/smart_delivery_core/test packages/smart_carrier_api/tests packages/power_monitor/test/test_power_status.py packages/hailo_vision/test --ignore=packages/smart_delivery_core/test/test_copyright.py --ignore=packages/smart_delivery_core/test/test_flake8.py --ignore=packages/smart_delivery_core/test/test_pep257.py --ignore=packages/hailo_vision/test/test_copyright.py --ignore=packages/hailo_vision/test/test_flake8.py --ignore=packages/hailo_vision/test/test_pep257.py
+          python3 tools/run_functional_tests.py
