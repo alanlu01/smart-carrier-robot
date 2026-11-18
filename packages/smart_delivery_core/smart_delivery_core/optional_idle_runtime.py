@@ -35,6 +35,7 @@ STATE_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
 # Pair only the latest scan, without blocking the executor that receives TF.
 # The original 0.30 s source/receipt freshness budget still applies.
 SPIN_TF_PAIR_WAIT_SEC = 0.20
+SPIN_TF_MOVING_HOLD_SEC = 0.10
 RETRYABLE_SPIN_STOPS = frozenset({
     'unknown_scan_coverage', 'near_obstacle', 'recent_near_obstacle',
     'laser_tf_pending', 'laser_tf_wait_timeout',
@@ -78,10 +79,13 @@ class OptionalIdleRuntime:
         self.scan_evidence_error = ''
         self.scan_evidence_reason = ''
         self.pending_scan = None
+        self.tf_pending_since = None
         self.next_people_at = 0.0
         self.people = None
         self.spin_yaw = None
         self.spin_travel = 0.0
+        self.spin_physical_travel = 0.0
+        self.evidence_reframes = 0
         self.stop_since = None
         self.settling_after_cancel = False
         self.parked_point = None
@@ -314,6 +318,7 @@ class OptionalIdleRuntime:
             return True
         target = self.localization_resume_state
         changed = False
+        reframed = False
         if target == 'going_observation':
             self._start(self.config['people']['observation_pose'], target, '',
                         self.localization_resume_deadline-now, resume=True)
@@ -335,16 +340,27 @@ class OptionalIdleRuntime:
                 if self.localization_restarts >= 1:
                     self._people_finished('people_localization_repeated_alignment_change')
                     return True
-                self.people = DirectionalPeople(self.config['people'])
-                self.spin_travel = 0.
+                # A map correction changes directional labels, not how far the
+                # wheels already turned. Never replenish the motion budget.
+                yaw_delta = math.atan2(math.sin(alignment[2]-old[2]),
+                                       math.cos(alignment[2]-old[2]))
+                if (distance <= .10 and angle <= math.radians(10.)
+                        and self.people.reframe(yaw_delta)):
+                    self.evidence_reframes += 1
+                    reframed = True
+                else:
+                    self.people = DirectionalPeople(self.config['people'])
                 self.localization_restarts += 1
                 self.observation_alignment = alignment
             self.state = 'waiting_observation_retry'
         else:
             self.state = 'waiting_observation_stop'
-        self.reason = 'localization_recovered_recollecting' if target == 'observing' and changed else 'localization_recovered'
+        self.reason = ('localization_recovered_reframed' if reframed else
+                       'localization_recovered_recollecting' if target == 'observing' and changed else
+                       'localization_recovered')
         self.scan_history.clear()
         self.pending_scan = None
+        self.tf_pending_since = None
         self.scan_evidence_error = self.scan_evidence_reason = ''
         self.spin_cache = None
         self._reset_spin_ready()
@@ -402,11 +418,14 @@ class OptionalIdleRuntime:
             self.scan_evidence_error = ''
             self.scan_evidence_reason = ''
             self.pending_scan = None
+            self.tf_pending_since = None
             self.spin_cache = None
         except ExtrapolationException as exc:
             self.scan_evidence_error = str(exc)
             if 'extrapolation into the future' in str(exc).lower():
                 if time.monotonic()-received_at < SPIN_TF_PAIR_WAIT_SEC:
+                    if self.tf_pending_since is None:
+                        self.tf_pending_since = received_at
                     self.pending_scan = (received_at, message)
                     self.scan_evidence_reason = 'laser_tf_pending'
                 else:
@@ -453,7 +472,9 @@ class OptionalIdleRuntime:
         if self.observation_collecting and previous is not None:
             old = yaw_of(previous[1].pose.pose.orientation)
             new = yaw_of(message.pose.pose.orientation)
-            self.spin_travel += math.atan2(math.sin(new - old), math.cos(new - old))
+            delta = math.atan2(math.sin(new - old), math.cos(new - old))
+            self.spin_travel += delta
+            self.spin_physical_travel += abs(delta)
             if (self.spin_resume_pending and self.state=='observing' and not self.cancel_requested
                     and self.spin_travel-self.spin_resume_anchor >= .05):
                 self.spin_resumes += 1
@@ -528,6 +549,11 @@ class OptionalIdleRuntime:
                                    'parking_retry_in_sec': (max(0.,self.parking_retry.retry_at-time.monotonic())
                                        if self.state=='people_parking_retry_wait' else None),
                                    'spin_progress_deg': round(math.degrees(self.spin_travel), 1),
+                                   'spin_physical_travel_deg': round(math.degrees(self.spin_physical_travel), 1),
+                                   'spin_budget_remaining_deg': round(math.degrees(self._spin_remaining()), 1),
+                                   'evidence_reframes': self.evidence_reframes,
+                                   'tf_pending_elapsed_sec': (None if self.tf_pending_since is None else
+                                       round(max(0.,time.monotonic()-self.tf_pending_since),3)),
                                    'spin_resume_count': self.spin_resumes,
                                    'spin_resume_requests': self.spin_resume_requests,
                                    'spin_resume_pending': self.spin_resume_pending,
@@ -735,16 +761,31 @@ class OptionalIdleRuntime:
             return {'clear':False,'reason':'unsafe_localization_or_odom'}
         if self.last_scan is None or not self._stamp_fresh(self.last_scan[0], self.last_scan[1].header.stamp):
             return {'clear':False,'reason':'scan_stale_or_absent'}
-        if self.scan_evidence_error:
+        pending_hold = bool(not require_stationary and self.state == 'observing' and self.motion
+            and self.pending_scan is not None and self.tf_pending_since is not None
+            and self.scan_evidence_reason == 'laser_tf_pending'
+            and 0 <= time.monotonic()-self.tf_pending_since <= SPIN_TF_MOVING_HOLD_SEC)
+        if self.scan_evidence_error and not pending_hold:
             return {'clear':False,'reason':self.scan_evidence_reason or 'laser_tf_unavailable',
                     'detail':self.scan_evidence_error}
+        if pending_hold:
+            # No invented time/pose: the fresh CURRENT raw scan must itself
+            # be clear, and the timestamp-paired history must still pass every
+            # age, displacement, coverage and obstacle guard below.
+            current = self._single_spin_guard_report(False)
+            if not current['clear']:
+                return current
         if not self.scan_history:
+            if pending_hold:
+                return {'clear':False,'reason':'laser_tf_pending'}
             # No historical permission: retain original conservative single scan.
             return self._single_spin_guard_report(require_stationary)
         scan = self.last_scan[1]
         source = scan.header.stamp.sec+scan.header.stamp.nanosec/1e9
-        if self.scan_history[-1].source_sec != source or self.scan_evidence_error:
+        if not pending_hold and (self.scan_history[-1].source_sec != source or self.scan_evidence_error):
             return {'clear':False,'reason':'laser_tf_unavailable','detail':self.scan_evidence_error}
+        if pending_hold:
+            source = self.scan_history[-1].source_sec
         try:
             base = self.buffer.lookup_transform('odom','base_footprint',Time())
             if not self._stamp_fresh(time.monotonic(),base.header.stamp):
@@ -757,7 +798,7 @@ class OptionalIdleRuntime:
                 return {'clear':False,'reason':'invalid_base_orientation'}
             pose = (t.translation.x,t.translation.y,yaw_of(t.rotation))
             now = time.monotonic()
-            if self.spin_cache is not None:
+            if self.spin_cache is not None and not pending_hold:
                 key,at,old_pose,report = self.spin_cache
                 angle = abs(math.atan2(math.sin(pose[2]-old_pose[2]),math.cos(pose[2]-old_pose[2])))
                 if (source==key and 0<=now-at<=.04
@@ -768,7 +809,11 @@ class OptionalIdleRuntime:
                 self.navigator.get_clock().now().nanoseconds/1e9,
                 math.hypot(.22,.16)+self.config['people']['scan_clearance_m'],
                 self.config['people']['max_unknown_arc_deg'])
-            self.spin_cache=(source,now,pose,report)
+            if pending_hold:
+                report = dict(report, tf_pair_wait=True,
+                    tf_pair_wait_elapsed_sec=round(now-self.tf_pending_since,4))
+            else:
+                self.spin_cache=(source,now,pose,report)
             return report
         except (TransformException, ValueError, TypeError, AttributeError) as exc:
             return {'clear':False,'reason':'laser_tf_unavailable','detail':str(exc)}
@@ -928,6 +973,8 @@ class OptionalIdleRuntime:
             self.parking_recovery_pauses = 0
             self.parking_recovery_deadline = None
             self.spin_travel = 0.0
+            self.spin_physical_travel = 0.0
+            self.evidence_reframes = 0
             self.spin_resumes = 0
             self.spin_resume_requests = 0
             self.people = None
@@ -973,6 +1020,7 @@ class OptionalIdleRuntime:
         self.idle_clock.reset()
         self.scan_history.clear()
         self.pending_scan = None
+        self.tf_pending_since = None
         self.scan_evidence_error = self.scan_evidence_reason = ''
         self.spin_cache = None
         self._reset_spin_ready()
@@ -992,7 +1040,7 @@ class OptionalIdleRuntime:
 
     def _resume_spin_tree(self):
         """A remaining-angle BT, never a fresh extra full revolution."""
-        remaining = max(0., 2*math.pi-self.spin_travel)
+        remaining = self._spin_remaining()
         self._remove_spin_tree()
         with tempfile.NamedTemporaryFile(prefix='robot_people_remaining_', suffix='.xml',
                                          mode='w', encoding='utf-8', delete=False) as stream:
@@ -1001,6 +1049,10 @@ class OptionalIdleRuntime:
                          'error_code_id="{spin_error}"/></BehaviorTree></root>' % remaining)
             self.observation_tree_path = stream.name
         return stream.name
+
+    def _spin_remaining(self):
+        """All pauses and evidence resets share ONE odometry rotation budget."""
+        return max(0., 2*math.pi-max(self.spin_travel, self.spin_physical_travel))
 
     def _finish_people_scan(self):
         self.observation_collecting = False
@@ -1178,6 +1230,8 @@ class OptionalIdleRuntime:
                 reason = 'unsafe_localization_or_odom_or_battery'
         elif time.monotonic() >= self.deadline:
             reason = 'observation_or_navigation_timeout'
+        elif self.state == 'observing' and self._spin_remaining() <= 0.:
+            reason = 'spin_angle_budget_reached'
         elif self.state == 'observing' and not self._clear_to_spin(False):
             reason = self.guard_report.get('reason', 'spin_safety_rejected')
             if (reason in DATA_SPIN_STOPS and self.data_pauses < 8
@@ -1268,6 +1322,11 @@ class OptionalIdleRuntime:
                 self.parking_outcome = 'waiting_data'
                 self.parking_stop_since = None
                 self._log_people_state()
+            elif self.state == 'observing' and self.interrupt_reason == 'spin_angle_budget_reached':
+                if self.spin_travel >= 5.8:
+                    self._finish_people_scan()
+                else:
+                    self._people_finished('insufficient_rotation_coverage')
             elif self.interrupt_reason in ('localization_suspect','people_data_pause'):
                 self.state, self.reason = 'waiting_people_localization', self.interrupt_reason
                 self._reset_spin_ready()
@@ -1395,8 +1454,11 @@ class OptionalIdleRuntime:
                 if now >= self.deadline:
                     self._people_finished('observation_position_not_verified')
                 return True
-            if retry and self.spin_travel >= 5.8 and self._stationary():
-                self._finish_people_scan()
+            if retry and (self.spin_travel >= 5.8 or self._spin_remaining() <= 0.) and self._stationary():
+                if self.spin_travel >= 5.8:
+                    self._finish_people_scan()
+                else:
+                    self._people_finished('insufficient_rotation_coverage')
                 return True
             if retry and (self.spin_resumes >= people['max_spin_resumes'] or self.spin_resume_requests >= 4):
                 self._people_finished('spin_resume_budget_exhausted')
@@ -1410,6 +1472,8 @@ class OptionalIdleRuntime:
                 self.people = DirectionalPeople(people)
                 self.observation_alignment = self._map_alignment()
                 self.spin_travel = 0.0
+                self.spin_physical_travel = 0.0
+                self.evidence_reframes = 0
                 self.spin_resumes = 0
                 self.observation_session_deadline = now+people['observation_session_timeout_sec']
                 self.observation_collecting = True

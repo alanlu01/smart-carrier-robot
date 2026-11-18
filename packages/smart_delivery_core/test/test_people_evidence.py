@@ -35,6 +35,28 @@ def test_three_intermittent_positives_choose_supported_direction_even_with_zero_
     assert report['reason'] == 'direction_selected'
 
 
+def test_small_rigid_map_rotation_matches_reobserving_the_same_frames_in_new_frame():
+    people, config = observed((1, 4, 7))
+    expected = DirectionalPeople(config)
+    delta = math.radians(7.)
+    for detections, heading, stamp in people.observations:
+        expected.observe(detections, heading+delta, stamp)
+    before = people.received_frames, people.person_frames, people.qualified_detections
+    assert people.reframe(delta)
+    assert people.summary(config['observation_pose']) == expected.summary(config['observation_pose'])
+    assert (people.received_frames, people.person_frames, people.qualified_detections) == before
+    # The same source frame cannot become a new independent observation.
+    people.observe([], 0., people.last_stamp)
+    assert people.received_frames == before[0]
+
+
+def test_bounded_or_nonfinite_history_cannot_be_reframed_as_complete_evidence():
+    people, _ = observed((1, 4, 7))
+    assert not people.reframe(float('nan'))
+    people.history_complete = False
+    assert not people.reframe(.1)
+
+
 @pytest.mark.parametrize('positive_count', [0, 1, 2])
 def test_empty_or_one_two_frame_false_positives_never_choose_a_point(positive_count):
     people, config = observed(())

@@ -76,7 +76,10 @@ def transmit_worker(path, baud, stop, commands, feedback, health):
             if item:
                 last_feedback, p = item
                 engine.feedback, engine.feedback_at = p['payload'], p['received_at']
-            engine.poll(started)
+            # The RX owner may publish between the loop timestamp and get().
+            # Freshness must be evaluated AFTER acquiring that snapshot; using
+            # started here can manufacture a negative receipt age and disarm.
+            engine.poll(time.monotonic())
             item = commands.get(last_command)
             if item:
                 last_command, payload = item

@@ -9,6 +9,7 @@ from test_station_navigation import motion,tick,finish_action,grid,obstacle
 from test_localization_recovery import manager
 from smart_delivery_core.recovery_spin import RecoverySpin
 from smart_delivery_core.standby_retry import StandbyRetryPolicy
+from test_station_navigation import single_cell_at
 
 
 def test_remote_dynamic_goal_cell_does_not_prevent_reaching_preparation(motion):
@@ -32,6 +33,44 @@ def test_static_wall_or_unknown_cannot_be_deferred_as_old_dynamic_obstacle(motio
     m.static_grid=grid();obstacle(m.static_grid,1.,0.,-1);obstacle(m.grid,1.,0.)
     tick(m,c)
     assert m.phase=='waiting_clearance' and not n.sent
+
+
+def test_margin_stop_resumes_only_remaining_leg_after_two_clear_snapshots(motion):
+    m,n,c,p,_,_=motion
+    m.mode='station'
+    m._translation(p[0],m.target,'entry','finish')
+    original_deadline=m.deadline
+    m.grid=single_cell_at(.5,.20);m.grid_stamp=1
+    assert not m.isTaskComplete() and n.cancels==1
+    assert m.motion_check['blocker']['layer']=='margin'
+    assert m.active_goal and len(n.sent)==1  # Cancellation still owns the action.
+    n.complete,n.result=True,TaskResult.CANCELED
+    tick(m,c)
+    assert m.phase=='waiting_clearance'
+    m.grid=grid();m.grid_stamp=2;c[0]+=.2
+    m.isTaskComplete()
+    assert m.clearance_clear_samples==1 and len(n.sent)==1
+    c[0]+=.5;m.isTaskComplete()
+    assert m.clearance_clear_samples==1 and len(n.sent)==1
+    m.grid_stamp=3;m.isTaskComplete()
+    assert m.phase=='entry' and len(n.sent)==2
+    assert n.sent[-1][0]==m.target and m.deadline==original_deadline
+
+
+def test_clearance_flap_or_stale_data_cannot_count_as_continuous_clear(motion):
+    m,n,c,p,_,_=motion
+    m.mode='station';m._translation(p[0],m.target,'entry','finish')
+    m.grid=single_cell_at(.5,.20);m.grid_stamp=1;m.isTaskComplete()
+    n.complete,n.result=True,TaskResult.CANCELED;tick(m,c)
+    m.grid=grid();m.grid_stamp=2;c[0]+=.2;m.isTaskComplete()
+    assert m.clearance_clear_samples==1
+    m._data=lambda:False;c[0]+=.3;m.isTaskComplete()
+    assert m.clearance_clear_samples==0 and len(n.sent)==1
+    m._data=lambda:True;m.grid_stamp=3;m.isTaskComplete()
+    assert m.clearance_clear_samples==1
+    m.grid=single_cell_at(.5,.15);m.grid_stamp=4;c[0]+=.2;m.isTaskComplete()
+    assert m.clearance_clear_samples==0 and len(n.sent)==1
+    assert m.clearance_blocker['layer']=='body'
 
 
 def test_distant_preparation_waits_for_reobservation_without_zero_goal_loop(motion):

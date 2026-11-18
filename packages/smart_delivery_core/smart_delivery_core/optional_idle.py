@@ -239,6 +239,10 @@ class DirectionalPeople:
         self.received_frames = 0
         self.person_frames = 0
         self.qualified_detections = 0
+        # Bounded eligible observations, not images. A small rigid map-yaw
+        # correction can re-bin evidence without requesting another full turn.
+        self.observations = []
+        self.history_complete = True
 
     def observe(self, detections, heading, stamp):
         """Use median per-frame counts to reduce repeated sightings/noise."""
@@ -246,6 +250,16 @@ class DirectionalPeople:
             return
         self.last_stamp = stamp
         self.received_frames += 1
+        detections = [{'class': 'Person', 'score': target['score'], 'angle': target['angle']}
+                      for target in detections
+                      if isinstance(target, dict) and target.get('class') == 'Person'
+                      and finite_number(target.get('score'))
+                      and target['score'] >= self.config['minimum_confidence']
+                      and finite_number(target.get('angle')) and abs(target['angle']) <= 34]
+        if len(self.observations) < 4096:
+            self.observations.append((detections, heading, stamp))
+        else:
+            self.history_complete = False
         heading += self.config['camera_yaw_offset_rad']
         self.headings.add(int((heading % (2 * math.pi)) / self.width) % self.count)
         counts = [0] * self.count
@@ -266,6 +280,16 @@ class DirectionalPeople:
             if abs(difference) <= math.radians(34):
                 self.frames[index].append(counts[index])
                 self.frames[index] = self.frames[index][-60:]
+
+    def reframe(self, yaw_delta):
+        """Re-bin a complete bounded history after a small rigid map correction."""
+        if not self.history_complete or not math.isfinite(yaw_delta):
+            return False
+        rebuilt = DirectionalPeople(self.config)
+        for detections, heading, stamp in self.observations:
+            rebuilt.observe(detections, heading+yaw_delta, stamp)
+        self.__dict__.update(rebuilt.__dict__)
+        return True
 
     def summary(self, observation_pose):
         """Keep intermittent positives without accepting one-frame false demand."""

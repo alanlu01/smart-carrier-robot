@@ -30,20 +30,25 @@ class PipelineRecheck:
             self.last_map_at = max(self.last_map_at, map_at)
             self.reason = 'waiting_data' if not available else 'waiting_stop'
             return 'wait'
-        if self.reference is None and transform is not None:
-            self.reason = 'reference_missing'
-            return 'pose_recovery'  # Existing bounded no-motion observation, never resume here.
-        if self.reference is None or transform is None:
+        if transform is None:
             self.samples = 0
             self.last_available_at = None
             self.last_map_at = max(self.last_map_at, map_at)
-            self.reason = 'reference_missing' if self.reference is None else 'transform_missing'
+            self.reason = 'transform_missing'
             return 'wait'
         if self.verifying_since is None:
             self.verifying_since = now
         if self.last_available_at is not None:
             self.verification_elapsed += max(0., now-self.last_available_at)
         self.last_available_at = now
+        if self.reference is None:
+            # Let delayed TF/service callbacks settle while STOPPED, without
+            # creating a reference from post-outage TF or releasing on score.
+            # Only available verification time consumes this bounded grace.
+            self.reason = 'reference_missing'
+            self.samples = 0
+            self.last_map_at = max(self.last_map_at, map_at)
+            return 'pose_recovery' if self.verification_elapsed >= self.verification_timeout else 'wait'
         consistent = False
         if self.reference is not None and transform is not None:
             self.position_delta = math.hypot(transform[0]-self.reference[0], transform[1]-self.reference[1])

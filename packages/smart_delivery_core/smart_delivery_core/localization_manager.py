@@ -108,6 +108,8 @@ class LocalizationManager(Node):
         self.navigation_health = None
         self.navigation_health_at = 0.
         self.pipeline_recheck = None
+        self.pipeline_trusted_reference = None
+        self.pipeline_continuity_reference = None
         self.managed_spin = None
         self.managed_spin_handle = None
         self.managed_spin_resume = False
@@ -1281,6 +1283,7 @@ class LocalizationManager(Node):
         self._cancel_navigation()
         self.pipeline_recheck=None
         self.pipeline_trusted_reference=None
+        self.pipeline_continuity_reference=None
         self.recovery_step=None
         self.spin_sequence=[]
         self.stable_samples=0
@@ -1972,8 +1975,9 @@ class LocalizationManager(Node):
             )
             self.latest_map_score_at = now
             if (self.state == 'LOCALIZED' and self.latest_quality is not None
-                    and self.latest_quality.healthy and self.latest_map_score is not None
-                    and self.latest_map_score >= self.map_match_recovery_score):
+                    and not self.latest_quality.critical and self.latest_map_score is not None
+                    and self.latest_map_score >= self.map_match_recovery_score
+                    and score >= self.map_match_recovery_score):
                 self._capture_pipeline_reference(now)
             self.last_map_match_error = ""
             if getattr(self, 'global_verification_required', False):
@@ -2112,13 +2116,24 @@ class LocalizationManager(Node):
                          self.last_odom_pose, self.verification_pose_distance,
                          self.verification_pose_angle)
                          if isinstance(cached, TrustedPipelineReference) else None)
+            reference_kind = 'trusted'
+            if reference is None:
+                # This is a PRE-outage continuity anchor, never a trusted pose
+                # or a seed. Fresh healthy covariance, geometry and six NEW
+                # confirmations are still mandatory before any release.
+                cached = getattr(self, 'pipeline_continuity_reference', None)
+                reference = (cached.select(now, self.get_clock().now().nanoseconds,
+                             self.last_odom_pose, self.verification_pose_distance,
+                             self.verification_pose_angle)
+                             if isinstance(cached, TrustedPipelineReference) else None)
+                reference_kind = 'continuity'
             self.pipeline_recheck = PipelineRecheck(
                 now, self.get_clock().now().nanoseconds, reference,
                 required=self.stable_samples_required, timeout=self.pipeline_wait_timeout,
                 verification_timeout=max(8., self.transient_recovery_max),
                 distance=self.verification_pose_distance, angle=self.verification_pose_angle)
             self.pipeline_recheck.reference_evidence = (dict(
-                observed_at=cached.observed_at, tf_source_ns=cached.source_ns,
+                kind=reference_kind, observed_at=cached.observed_at, tf_source_ns=cached.source_ns,
                 amcl_source_ns=cached.amcl_source_ns, odom_source_ns=cached.odom_source_ns,
                 odom=cached.odom, xy_std_m=cached.xy_std, yaw_std_rad=cached.yaw_std,
                 map_score=cached.map_score) if reference is not None else None)
@@ -2133,6 +2148,7 @@ class LocalizationManager(Node):
             return
         self.pipeline_recheck = None
         self.pipeline_trusted_reference = None
+        self.pipeline_continuity_reference = None
         self.manual_intervention_kind = 'pose'
         self.transient_recovery_eligible = bool(
             transient_sensor_timeout
@@ -2207,7 +2223,13 @@ class LocalizationManager(Node):
         return False
 
     def _capture_pipeline_reference(self, now):
-        """Cache provenance only while independent map/AMCL evidence is healthy."""
+        """Cache pre-outage continuity; only healthy evidence grants trusted grade."""
+        if (self.state != 'LOCALIZED' or self.latest_quality is None
+                or self.latest_quality.critical or self.latest_map_score is None
+                or self.latest_map_score < self.map_match_recovery_score
+                or getattr(self, 'latest_map_score_raw', None) is None
+                or self.latest_map_score_raw < self.map_match_recovery_score):
+            return
         try:
             tf = self.tf_buffer.lookup_transform('map', 'odom', Time(),
                 timeout=RclpyDuration(seconds=0.))
@@ -2227,10 +2249,13 @@ class LocalizationManager(Node):
             # Store the SAME lookup and its source timestamp atomically.
             value = (float(t.x), float(t.y), quaternion_to_yaw(q))
             if not all(math.isfinite(v) for v in (*value, *self.last_odom_pose)):return
-            self.pipeline_trusted_reference = TrustedPipelineReference(
+            reference = TrustedPipelineReference(
                 now, stamp, value, self.last_odom_pose,
                 self.latest_quality.xy_std, self.latest_quality.yaw_std, self.latest_map_score,
                 amcl_ns, odom_ns)
+            self.pipeline_continuity_reference = reference
+            if self.latest_quality.healthy:
+                self.pipeline_trusted_reference = reference
         except (AttributeError, TransformException):
             return
 

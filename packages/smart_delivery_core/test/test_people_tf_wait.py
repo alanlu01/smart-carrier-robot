@@ -67,6 +67,58 @@ def test_future_tf_never_grants_permission_until_exact_stamp_arrives(runtime):
     assert not manager._clear_to_spin()  # one frame is still insufficient
 
 
+def moving_with_short_tf_gap(runtime):
+    manager, navigator, moment, available, _ = pending_runtime(runtime)
+    available[0] = True
+    for at in (99.90, 99.94, 99.98):
+        moment[0] = at
+        manager._scan(scan_at(at))
+    manager.state, manager.motion = 'observing', True
+    latest = TransformStamped()
+    latest.header.stamp = Time(nanoseconds=100000000000).to_msg()
+    latest.transform.rotation.w = 1.
+    def lookup(parent, child, stamp):
+        if parent == 'odom' and stamp.nanoseconds:
+            raise ExtrapolationException('Lookup would require extrapolation into the future.')
+        return latest  # Static mount or fresh latest base; never exact pairing.
+    manager.buffer.lookup_transform = lookup
+    moment[0] = 100.
+    manager._scan(scan_at(100.))
+    return manager, navigator, moment, latest
+
+
+def test_short_future_pair_wait_can_continue_only_an_already_safe_active_spin(runtime):
+    manager, _, moment, _ = moving_with_short_tf_gap(runtime)
+    assert manager._clear_to_spin(False)
+    assert manager.guard_report['tf_pair_wait']
+    assert not manager._clear_to_spin(True)  # Cannot START or restart a spin.
+    moment[0] = 100.08
+    assert manager._clear_to_spin(False)
+    newer = scan_at(100.08)
+    manager._scan(newer)
+    assert manager.tf_pending_since == 100.
+    moment[0] = 100.101
+    assert not manager._clear_to_spin(False)  # New frames cannot renew the hold.
+    assert manager.guard_report['reason'] == 'laser_tf_pending'
+    assert newer.header.stamp.nanosec == 80_000_000
+
+
+@pytest.mark.parametrize('fault', ['obstacle', 'old_odom', 'unsafe', 'old_scan', 'no_history'])
+def test_short_tf_pair_hold_never_bypasses_real_safety_or_freshness(runtime, fault):
+    manager, _, moment, latest = moving_with_short_tf_gap(runtime)
+    if fault == 'obstacle':
+        manager.last_scan[1].ranges[0] = .2
+    elif fault == 'old_odom':
+        latest.header.stamp.sec = 99
+    elif fault == 'unsafe':
+        manager._safe = lambda: False
+    elif fault == 'old_scan':
+        moment[0] = 100.31
+    else:
+        manager.scan_history.clear()
+    assert not manager._clear_to_spin(False)
+
+
 def test_real_tf_buffer_reproduces_59ms_gap_and_interpolates_later(runtime):
     manager, _, moment, _, _ = pending_runtime(runtime)
     buffer = Buffer()

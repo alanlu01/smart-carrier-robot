@@ -60,9 +60,23 @@ def test_without_prior_trusted_reference_never_accept_a_high_score_alone():
     assert observe(g,101.,stopped=False)=='wait'
     assert observe(g,102.,available=False)=='wait'
     assert observe(g,103.,transform=None)=='wait'
-    assert observe(g,104.)=='pose_recovery'
+    assert observe(g,104.)=='wait'
     assert g.reference is None and g.samples==0 and g.reason=='reference_missing'
     assert g.verification_elapsed==0.
+    assert observe(g,108.)=='wait'
+    assert g.samples==0 and g.reference is None
+    assert observe(g,112.1)=='pose_recovery'
+
+
+def test_missing_reference_wait_does_not_count_inactive_nav2_as_pose_failure():
+    g=PipelineRecheck(100.,100000000000,None)
+    observe(g,101.)
+    observe(g,102.)
+    assert observe(g,110.,available=False)=='wait'
+    assert observe(g,120.)=='wait'
+    assert g.verification_elapsed==1.
+    assert observe(g,127.1)=='pose_recovery'
+    assert g.reference is None and g.samples==0
 
 
 def test_wrapped_map_odom_heading_is_not_mistaken_for_a_full_turn():

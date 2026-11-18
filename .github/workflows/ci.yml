@@ -33,6 +33,8 @@ jobs:
           packages/smart_carrier_api/tests --ignore=packages/smart_carrier_api/tests/ros
           packages/smart_delivery_core/test/test_wheel_handoff.py
           packages/smart_delivery_core/test/test_geometry_cache.py
+          packages/smart_delivery_core/test/test_serial_worker_clock.py
+          packages/smart_delivery_core/test/test_pipeline_recheck.py
 
   ros-jazzy-tests:
     runs-on: ubuntu-24.04

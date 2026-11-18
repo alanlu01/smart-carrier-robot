@@ -194,6 +194,9 @@ class StationNavigation:
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
             motion_check=getattr(self,'motion_check',{}),
             clearance_retries=getattr(self,'clearance_retries',0),
+            clearance_clear_samples=getattr(self,'clearance_clear_samples',0),
+            clearance_clear_elapsed_sec=(None if getattr(self,'clearance_clear_since',None) is None
+                else round(max(0.,time.monotonic()-self.clearance_clear_since),3)),
             wait_blockers=getattr(self,'wait_blockers',[]),
             deadline_remaining_sec=round(max(0.,getattr(self,'deadline',0.)-time.monotonic()),2),
             stamp_ns=self.nav.get_clock().now().nanoseconds),ensure_ascii=False)))
@@ -252,6 +255,10 @@ class StationNavigation:
         self.motion_check = {}
         self.clearance_retries = 0
         self.clearance_pending = None
+        self.translation_resume_deadline = None
+        self.clearance_clear_since = None
+        self.clearance_clear_stamp = None
+        self.clearance_clear_samples = 0
         self.mode,self.mode_reason,self.mode_switches = None,'',0
         self.decision_time_ms = None
         self.replan_pending = False
@@ -324,13 +331,16 @@ class StationNavigation:
     def _wait_clearance(self, reason, resume, scope='local_departure'):
         if self.clearance_deadline is None:
             self.clearance_deadline = min(self.sequence_deadline,time.monotonic()+30.)
+            if scope=='local_translation' and self.translation_resume_deadline is not None:
+                self.clearance_deadline=min(self.clearance_deadline,self.translation_resume_deadline)
         self.deadline = self.clearance_deadline
         self.clearance_grid_stamp = self.grid_stamp
         self.clearance_resume = resume
         self.clearance_scope,self.clearance_detail=scope,reason
         point=self.target if scope.startswith('destination') else self._pose()
-        self.clearance_blocker=(self.grid.blocker(point,rotation=True)
-            if point and hasattr(self.grid,'blocker') else {}) or {}
+        self.clearance_blocker=(self._translation_blocker(point,self.clearance_pending[1])
+            if scope=='local_translation' and point and self.clearance_pending else
+            self.grid.blocker(point,rotation=True) if point and hasattr(self.grid,'blocker') else {}) or {}
         self.clearance_kind=self._classify_blocker(self.clearance_blocker)
         kind_label={'static':'靜態障礙','unknown':'未知區域','off_map':'地圖邊界',
                     'dynamic_costmap':'即時障礙','static_map_unavailable':'缺少靜態地圖'}.get(self.clearance_kind,'通道受阻')
@@ -490,9 +500,24 @@ class StationNavigation:
         elif phase=='translation_resume':
             moving,end,resume=self.clearance_pending
             if not self.grid.segment(pose,end):
+                self.clearance_clear_since=self.clearance_clear_stamp=None
+                self.clearance_clear_samples=0
                 self._wait_clearance('等待平移通道恢復','translation_resume','local_translation');return
+            # Two independent clear snapshots, continuously stopped/fresh. A
+            # single boundary flicker cannot cancel and restart the same leg.
+            now=time.monotonic()
+            if self.clearance_clear_since is None:
+                self.clearance_clear_since=now
+            if self.grid_stamp!=self.clearance_clear_stamp:
+                self.clearance_clear_stamp=self.grid_stamp
+                self.clearance_clear_samples+=1
+            if self.clearance_clear_samples<2 or now-self.clearance_clear_since<.15:
+                self._wait_clearance('確認平移通道穩定','translation_resume','local_translation');return
+            original_deadline=self.translation_resume_deadline
             self.clearance_pending=None
             self._translation(pose,end,moving,resume)
+            self.deadline=min(self.deadline,original_deadline)
+            self.translation_resume_deadline=None
         elif phase=='finish':
             self._advance_finish()
 
@@ -576,6 +601,13 @@ class StationNavigation:
                 anchor[2]+angle_error(current[2],origin[2]))
 
     def _translation_blocker(self, start, end):
+        if hasattr(self.grid,'sweep_blocker'):
+            blocker=self.grid.sweep_blocker(start,end)
+            if blocker is not None:
+                point=blocker.get('pose')
+                return dict(blocker,static_clear=(self.static_grid.clear(point)
+                    if point and self.static_grid else None))
+            return dict(reason='changed_snapshot')
         if abs(angle_error(start[2],end[2]))>.12:
             return dict(reason='heading_mismatch',yaw_error_rad=angle_error(start[2],end[2]))
         steps=max(1,math.ceil(math.hypot(end[0]-start[0],end[1]-start[1])/.02))
@@ -590,6 +622,9 @@ class StationNavigation:
         if self.clearance_retries>=2:
             self.failure='平移通道持續受阻';self.cancelTask();return
         self.clearance_retries+=1
+        self.translation_resume_deadline=self.deadline
+        self.clearance_clear_since=self.clearance_clear_stamp=None
+        self.clearance_clear_samples=0
         self.clearance_pending=(self.phase,self.stage,self.next_phase)
         self.replan_pending=True
         self._cancel_native()
@@ -790,6 +825,9 @@ class StationNavigation:
         stopped = self._stopped()
         if self.phase=='waiting_clearance':
             self._waiting(pose,data_ok,stopped)
+            if pose is None or not data_ok or not stopped:
+                self.clearance_clear_since=self.clearance_clear_stamp=None
+                self.clearance_clear_samples=0
             if (pose is not None and data_ok and stopped
                     and self.grid_stamp!=self.clearance_grid_stamp):
                 self.clearance_grid_stamp=self.grid_stamp

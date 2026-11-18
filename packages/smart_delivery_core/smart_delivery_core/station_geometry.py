@@ -90,18 +90,19 @@ class StationGrid:
             cache[key] = deepcopy(result)
         return result
 
-    def _blocker(self, pose, rotation=False):
+    def _blocker(self, pose, rotation=False, padding=.03):
         # Add 3 cm to the real 44 x 32 cm body. Test cell squares, not just
         # centers, to avoid losing a thin chair leg along the sampled boundary.
         x, y, yaw = pose
         c, s = math.cos(self.yaw), math.sin(self.yaw)
         gx, gy = c*(x-self.x)+s*(y-self.y), -s*(x-self.x)+c*(y-self.y)
-        radius = math.hypot(.25, .19)
+        hx, hy = .22+padding, .16+padding
+        radius = math.hypot(hx, hy)
         half_cell = self.resolution/2
         c, s = math.cos(yaw-self.yaw), math.sin(yaw-self.yaw)
         ac, ass = abs(c), abs(s)
-        extent_x = radius if rotation else .25*ac+.19*ass
-        extent_y = radius if rotation else .25*ass+.19*ac
+        extent_x = radius if rotation else hx*ac+hy*ass
+        extent_y = radius if rotation else hx*ass+hy*ac
         lo_x, hi_x = math.floor((gx-extent_x)/self.resolution-1e-9), math.floor((gx+extent_x)/self.resolution+1e-9)
         lo_y, hi_y = math.floor((gy-extent_y)/self.resolution-1e-9), math.floor((gy+extent_y)/self.resolution+1e-9)
         if lo_x < 0 or lo_y < 0 or hi_x >= self.width or hi_y >= self.height:
@@ -127,14 +128,34 @@ class StationGrid:
                     # the recorded (-3,5) station despite >3 cm clearance.
                     inside = (abs(dx) <= extent_x+half_cell+1e-12
                               and abs(dy) <= extent_y+half_cell+1e-12
-                              and abs(c*dx+s*dy) <= .25+half_cell*(ac+ass)+1e-12
-                              and abs(-s*dx+c*dy) <= .19+half_cell*(ac+ass)+1e-12)
+                              and abs(c*dx+s*dy) <= hx+half_cell*(ac+ass)+1e-12
+                              and abs(-s*dx+c*dy) <= hy+half_cell*(ac+ass)+1e-12)
                 if inside:
                     c0,s0=math.cos(self.yaw),math.sin(self.yaw)
                     cx,cy=(col+.5)*self.resolution,(row+.5)*self.resolution
                     return dict(kind='unknown' if value<0 else 'occupied',value=int(value),
                         cell=[col,row],position=[self.x+c0*cx-s0*cy,self.y+s0*cx+c0*cy])
         return None
+
+    def sweep_blocker(self, start, end):
+        """Classify the actual blocked sweep; margin evidence is NOT permission."""
+        if abs(angle_error(start[2],end[2])) > .12:
+            return dict(reason='heading_mismatch',yaw_error_rad=angle_error(start[2],end[2]))
+        steps=max(1,math.ceil(math.hypot(end[0]-start[0],end[1]-start[1])/.02))
+        first = None
+        for i in range(steps+1):
+            pose=(start[0]+(end[0]-start[0])*i/steps,start[1]+(end[1]-start[1])*i/steps,end[2])
+            blocker=self.blocker(pose)
+            if blocker is None:
+                continue
+            detail=dict(blocker,reason='occupied_or_unknown_sweep',pose=pose,
+                        layer='margin' if blocker['kind']=='occupied' else 'unknown_or_boundary')
+            if first is None:
+                first=detail
+            hard=self._blocker(pose,padding=0.)
+            if hard is not None:
+                return dict(hard,reason='occupied_or_unknown_sweep',pose=pose,layer='body')
+        return first
 
     def segment(self, start, end):
         if abs(angle_error(start[2],end[2])) > .12:

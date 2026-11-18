@@ -78,6 +78,21 @@ def test_recorded_five_cm_cells_allow_three_cm_margin_without_shrinking_body():
     assert not g.clear((0.,0.,0.),rotation=True)
 
 
+@pytest.mark.parametrize('y,layer', [(.20,'margin'),(.175,'body')])
+def test_sweep_classifies_margin_and_body_without_granting_either_permission(y,layer):
+    g=single_cell_at(.10,y)
+    start,end=(0.,0.,0.),(.20,0.,0.)
+    report=g.sweep_blocker(start,end)
+    assert report['layer']==layer and report['kind']=='occupied'
+    assert not g.segment(start,end)
+
+
+def test_unknown_sweep_is_never_reclassified_as_a_disposable_margin():
+    g=single_cell_at(.10,.20,-1)
+    assert g.sweep_blocker((0.,0.,0.),(.20,0.,0.))['layer']=='unknown_or_boundary'
+    assert not g.segment((0.,0.,0.),(.20,0.,0.))
+
+
 def single_cell_at(x,y,value=100):
     g=grid(.05)
     g.x,g.y=x-100.5*g.resolution,y-100.5*g.resolution

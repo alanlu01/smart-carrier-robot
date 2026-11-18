@@ -98,3 +98,45 @@ def test_actual_manager_does_not_accept_kidnapped_transform_as_pipeline_resume(m
     for at in range(101,110):
         fresh_pipeline(n,c,float(at));n._tick_state_machine()
     assert not n.ready and n.started_spins==['資料恢復後位置仍不確定']
+
+
+def test_pre_outage_mild_quality_anchor_does_not_release_until_new_healthy_evidence(manager):
+    from geometry_msgs.msg import TransformStamped
+    from smart_delivery_core.localization_health import pose_quality
+    n,c=manager
+    n.state='LOCALIZED';n.last_odom_pose=(0.,0.,0.)
+    n.latest_pose_observed_at=c.now;n.latest_odom_stamp_ns=int(c.now*1e9)
+    n.latest_map_score_raw=.9
+    cov=[0.]*36;cov[0]=cov[7]=.304**2;cov[35]=.1**2
+    n.latest_quality=pose_quality(cov,.25,.17,.5,.45)
+    transform=TransformStamped();transform.header.stamp.sec=100
+    transform.transform.rotation.w=1.
+    n.tf_buffer=SimpleNamespace(lookup_transform=lambda *_a,**_k:transform)
+    n._capture_pipeline_reference(c.now)
+    assert getattr(n,'pipeline_trusted_reference',None) is None
+    assert n.pipeline_continuity_reference.xy_std==.304
+    n._cancel_navigation=lambda:None
+    n._set_state=lambda state,reason:setattr(n,'state',state)
+    LocalizationManager._begin_recovery(n,'test',sensor_pipeline_timeout=True)
+    assert n.pipeline_recheck.reference_evidence['kind']=='continuity'
+    n._pipeline_transform=lambda:(0.,0.,0.)
+    n._mild_map_sources_fresh=n._sensor_tf_is_ready=lambda:True
+    n.recovery_stop=SimpleNamespace(ready=lambda _:True)
+    fresh_pipeline(n,c,101.);n._tick_state_machine()
+    assert not n.ready and n.pipeline_recheck.samples==0  # Mild covariance cannot release.
+    cov[0]=cov[7]=.2**2;n.latest_quality=pose_quality(cov,.25,.17,.5,.45)
+    for at in range(102,107):
+        fresh_pipeline(n,c,float(at));n._tick_state_machine()
+        assert not n.ready and not n.started_spins
+    fresh_pipeline(n,c,107.);n._tick_state_machine()
+    assert n.ready and not n.started_spins
+
+
+def test_critical_or_post_outage_data_cannot_create_a_continuity_reference(manager):
+    n,c=manager;n.state='RECOVERING_LOCAL';n.latest_map_score_raw=.9
+    n._capture_pipeline_reference(c.now)
+    assert getattr(n,'pipeline_continuity_reference',None) is None
+    n.state='LOCALIZED'
+    n.latest_quality=SimpleNamespace(critical=True)
+    n._capture_pipeline_reference(c.now)
+    assert getattr(n,'pipeline_continuity_reference',None) is None

@@ -54,11 +54,32 @@ def test_global_frame_correction_discards_old_counts_and_restarts_within_origina
     recover(manager)
     manager._map_alignment = lambda: (.15, 0., .2)
     manager.poll(False)
-    assert manager.people is not old and manager.spin_travel == 0.
+    assert manager.people is not old and manager.spin_travel == .6
     assert manager.localization_restarts == 1 and manager.observation_session_deadline == 190.
     assert manager.people.received_frames == 0
     manager.idle()
     assert len(navigator.sent) == 2 and manager.deadline <= 190.
+    manager._people_finished('test_cleanup')
+
+
+def test_recorded_seven_degree_map_correction_rebins_without_buying_another_turn(runtime):
+    import math
+    from xml.etree import ElementTree
+    from smart_delivery_core.optional_idle import DirectionalPeople
+    manager, navigator, _ = paused_spin(runtime)
+    manager.people = DirectionalPeople(manager.config['people'])
+    manager.people.observe([dict(class_='ignored')], 0., 1.)
+    old = manager.people
+    manager.spin_travel = manager.spin_physical_travel = math.radians(148.3)
+    recover(manager)
+    manager._map_alignment = lambda: (.031, 0., math.radians(7.))
+    manager.poll(False)
+    assert manager.people is old and manager.people.received_frames == 1
+    assert manager.spin_travel == pytest.approx(math.radians(148.3))
+    assert manager.evidence_reframes == 1
+    manager.idle()
+    spin = ElementTree.parse(navigator.sent[-1].behavior_tree).find('.//Spin')
+    assert math.degrees(float(spin.get('spin_dist'))) == pytest.approx(211.7, abs=.001)
     manager._people_finished('test_cleanup')
 
 

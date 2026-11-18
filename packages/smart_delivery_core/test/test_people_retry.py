@@ -90,6 +90,24 @@ def begin_spin(runtime):
     return manager,navigator,moment
 
 
+def test_oscillation_and_pauses_cannot_replenish_the_single_rotation_budget(runtime):
+    from xml.etree import ElementTree
+    manager, navigator, _ = begin_spin(runtime)
+    manager.spin_travel, manager.spin_physical_travel = 2., 5.
+    tree=manager._resume_spin_tree()
+    remaining=float(ElementTree.parse(tree).find('.//Spin').get('spin_dist'))
+    assert remaining==pytest.approx(2*math.pi-5.)
+    manager.spin_physical_travel=2*math.pi
+    manager._clear_to_spin=lambda *_:True
+    assert manager.poll(False) and manager.interrupt_reason=='spin_angle_budget_reached'
+    assert navigator.cancel_calls==1 and manager.motion
+    navigator.complete,navigator.result=True,TaskResult.CANCELED
+    manager.poll(False)
+    assert manager.state=='idle' and manager.reason=='insufficient_rotation_coverage'
+    assert len(navigator.sent)==1 and manager.settling_after_cancel
+    manager._people_finished('test_cleanup')
+
+
 def test_unknown_scan_cancels_and_drains_before_any_resume(runtime):
     manager,navigator,moment=begin_spin(runtime)
     assert manager.poll(False) and navigator.cancel_calls==1

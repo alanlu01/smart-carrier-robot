@@ -53,6 +53,8 @@ def reason_label(reason):
         'observation_or_navigation_timeout':'導航／分析逾時','spin_resume_budget_exhausted':'續轉額度已用盡',
         'localization_recovered':'定位／感測已恢復',
         'localization_recovered_recollecting':'定位修正，重新收集人流',
+        'localization_recovered_reframed':'方向已校正，繼續剩餘分析',
+        'spin_angle_budget_reached':'分析旋轉額度已完成',
     }
     if reason in exact:
         return exact[reason]
