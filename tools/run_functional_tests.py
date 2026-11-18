@@ -1,6 +1,6 @@
 """Run the explicit functional suite independently of ROS collection plugins."""
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 
