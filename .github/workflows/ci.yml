@@ -46,11 +46,12 @@ jobs:
       - name: Install test dependencies in CI only
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends python3-pytest python3-serial python3-yaml python3-smbus2 python3-numpy python3-colcon-common-extensions ros-jazzy-nav2-simple-commander ros-jazzy-tf2-ros ros-jazzy-diagnostic-msgs
+          apt-get install -y --no-install-recommends python3-pytest python3-serial python3-yaml python3-smbus2 python3-numpy python3-colcon-common-extensions ros-jazzy-nav2-simple-commander ros-jazzy-nav2-mppi-controller ros-jazzy-nav2-rotation-shim-controller ros-jazzy-tf2-ros ros-jazzy-diagnostic-msgs nlohmann-json3-dev
       - name: ROS-dependent functional regression (no robot hardware)
         shell: bash
         run: |
           source /opt/ros/jazzy/setup.bash
-          colcon build --packages-select smart_delivery_core smart_carrier_api power_monitor hailo_vision --symlink-install
+          colcon build --packages-select smart_station_controller smart_delivery_core smart_carrier_api power_monitor hailo_vision --symlink-install --cmake-args -DBUILD_TESTING=ON
           source install/setup.bash
+          colcon test --packages-select smart_station_controller --return-code-on-test-failure
           python3 -m pytest -q packages/smart_delivery_core/test packages/smart_carrier_api/tests packages/power_monitor/test/test_power_status.py packages/hailo_vision/test --ignore-glob='*/test_copyright.py' --ignore-glob='*/test_flake8.py' --ignore-glob='*/test_pep257.py'
