@@ -150,7 +150,7 @@ class StationGrid:
                 continue
             detail=dict(blocker,reason='occupied_or_unknown_sweep',pose=pose,
                         layer='margin' if blocker['kind']=='occupied' else 'unknown_or_boundary')
-            if first is None:
+            if first is None or (first['layer']=='margin' and detail['layer']!='margin'):
                 first=detail
             hard=self._blocker(pose,padding=0.)
             if hard is not None:

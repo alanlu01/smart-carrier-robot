@@ -61,6 +61,8 @@ def test_translation_obstacle_drains_cancel_then_waits_and_rechecks(motion):
     count=len(n.sent)
     m.grid=grid();m.grid_stamp+=1
     m.isTaskComplete()
+    assert m.phase=='waiting_clearance' and len(n.sent)==count
+    c[0]+=.2;m.grid_stamp+=1;m.isTaskComplete()
     assert m.phase=='entry' and len(n.sent)==count+1
     finish_action(m,n,c,p)
     assert not m.running

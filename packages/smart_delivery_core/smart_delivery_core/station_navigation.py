@@ -508,7 +508,7 @@ class StationNavigation:
             now=time.monotonic()
             if self.clearance_clear_since is None:
                 self.clearance_clear_since=now
-            if self.grid_stamp!=self.clearance_clear_stamp:
+            if self.clearance_clear_stamp is None or self.grid_stamp>self.clearance_clear_stamp:
                 self.clearance_clear_stamp=self.grid_stamp
                 self.clearance_clear_samples+=1
             if self.clearance_clear_samples<2 or now-self.clearance_clear_since<.15:
@@ -829,7 +829,7 @@ class StationNavigation:
                 self.clearance_clear_since=self.clearance_clear_stamp=None
                 self.clearance_clear_samples=0
             if (pose is not None and data_ok and stopped
-                    and self.grid_stamp!=self.clearance_grid_stamp):
+                    and self.grid_stamp>self.clearance_grid_stamp):
                 self.clearance_grid_stamp=self.grid_stamp
                 self.after_stop=self.clearance_resume
                 self._advance(pose)

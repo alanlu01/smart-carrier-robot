@@ -123,6 +123,7 @@ def test_unknown_static_and_dynamic_blocker_classification(motion):
 def test_amcl_future_tf_tolerance_does_not_disable_trusted_capture(manager):
     from smart_delivery_core import localization_manager as module
     n,c=manager;n.latest_odom_at=c.now;n.last_odom_pose=(0.,0.,0.)
+    n.state='LOCALIZED';n.latest_map_score_raw=.8
     n.latest_pose_observed_at=c.now;n.latest_odom_stamp_ns=int(c.now*1e9)
     n.tf_buffer=NS(lookup_transform=lambda *a,**kw:NS(
         header=NS(stamp=NS(sec=101,nanosec=0)),
