@@ -15,7 +15,7 @@ from std_msgs.msg import String
 from tf2_ros import TransformException
 
 from smart_delivery_core.delivery_inputs import shared_inputs
-from smart_delivery_core.station_geometry import StationGrid, angle_error
+from smart_delivery_core.station_geometry import StationGrid, angle_error, geometry_cycle
 
 
 def coordinates(message):
@@ -173,6 +173,8 @@ class StationNavigation:
             mode_switches=getattr(self,'mode_switches',0),
             mode_switch_scope=getattr(self,'mode_switch_scope',None),
             decision_time_ms=getattr(self,'decision_time_ms',None),
+            geometry_cache=dict(queries=getattr(self.grid,'geometry_queries',0),
+                                hits=getattr(self.grid,'geometry_cache_hits',0)),
             alignment_attempts=getattr(self,'alignment_attempts',0),
             alignment_data_pauses=getattr(self,'alignment_data_pauses',0),
             alignment_pause=getattr(self,'alignment_pause',None),
@@ -228,6 +230,7 @@ class StationNavigation:
         finally:
             pending.cancel()
 
+    @geometry_cycle
     def start(self, goal, permitted=lambda:True, *, park=True, behavior_tree='',label=''):
         if self.running: raise RuntimeError('station navigation still owns an action')
         self.goal,self.target,self.permitted = deepcopy(goal),coordinates(goal),permitted
@@ -638,6 +641,7 @@ class StationNavigation:
         else: self._finish(TaskResult.FAILED if self.failure else TaskResult.CANCELED,
                            'failed' if self.failure else 'cancelled',self.failure)
 
+    @geometry_cycle
     def isTaskComplete(self):
         if not self.running: return True
         # Process queued sensor and cancellation callbacks BEFORE evaluating

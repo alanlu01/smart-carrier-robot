@@ -243,10 +243,15 @@ class SlotStateTracker:
             raise ValueError("power hysteresis is too large for configured thresholds")
         if self.confirm_samples < 1:
             raise ValueError("confirm_samples must be at least one")
-        if self.weak_presence_min_a and not self.empty_current_max_a < self.weak_presence_min_a < self.present_current_min_a:
+        if (self.weak_presence_min_a
+                and not self.empty_current_max_a < self.weak_presence_min_a
+                < self.present_current_min_a):
             raise ValueError("weak presence threshold must lie inside the current gap")
-        if (not all(math.isfinite(v) for v in (self.weak_presence_min_a,self.weak_presence_duration_sec,self.weak_presence_max_gap_sec))
-                or self.weak_presence_duration_sec < 3.0 or not 0 < self.weak_presence_max_gap_sec <= 1.0):
+        if (not all(math.isfinite(v) for v in (
+                self.weak_presence_min_a, self.weak_presence_duration_sec,
+                self.weak_presence_max_gap_sec))
+                or self.weak_presence_duration_sec < 3.0
+                or not 0 < self.weak_presence_max_gap_sec <= 1.0):
             raise ValueError("weak evidence needs a bounded sample gap and at least three seconds")
 
     def update(
@@ -281,7 +286,9 @@ class SlotStateTracker:
         if eligible:
             if self._weak_last_at is not None and now==self._weak_last_at:
                 return self.state
-            if self._weak_last_at is None or now-self._weak_last_at>self.weak_presence_max_gap_sec or now<self._weak_last_at:
+            if (self._weak_last_at is None
+                    or now-self._weak_last_at > self.weak_presence_max_gap_sec
+                    or now < self._weak_last_at):
                 self._weak_started_at=now
                 self._weak_samples=1
             elif now>self._weak_last_at:
@@ -330,7 +337,9 @@ class SlotStateTracker:
             self._candidate_samples += 1
         if self._candidate_samples >= self.confirm_samples:
             self.state = measured
-            self.presence_evidence=("sustained_low_current" if weak else "empty_current" if measured=="empty" else "present_current")
+            self.presence_evidence = (
+                "sustained_low_current" if weak else
+                "empty_current" if measured == "empty" else "present_current")
             self._candidate = None
             self._candidate_samples = 0
         return self.state

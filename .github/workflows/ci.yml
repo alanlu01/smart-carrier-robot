@@ -6,15 +6,51 @@ on:
   pull_request:
 
 jobs:
-  pure-python-tests:
-    runs-on: ubuntu-latest
+  lint:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
       - run: pip install -r requirements-dev.txt
-      - run: pip install -e packages/power_monitor -e packages/smart_carrier_api
       - run: ruff check packages/power_monitor/power_monitor/power_status.py packages/power_monitor/test/test_power_status.py packages/smart_carrier_api/smart_carrier_api packages/smart_carrier_api/tests packages/smart_carrier_api/setup.py packages/smart_carrier_api/launch
-      - run: pytest -q packages/power_monitor/test/test_power_status.py packages/smart_carrier_api/tests
+      - run: ruff check packages/smart_delivery_core/smart_delivery_core/wheel_handoff.py packages/smart_delivery_core/test/test_wheel_handoff.py packages/smart_delivery_core/test/test_geometry_cache.py
+
+  pure-python-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Pure policy, persistence, IPC and geometry tests (no ROS imports)
+        run: >-
+          pytest -q packages/power_monitor/test/test_power_status.py
+          packages/smart_carrier_api/tests --ignore=packages/smart_carrier_api/tests/ros
+          packages/smart_delivery_core/test/test_wheel_handoff.py
+          packages/smart_delivery_core/test/test_geometry_cache.py
+
+  ros-jazzy-tests:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base-noble
+    env:
+      ROS_DOMAIN_ID: "231"
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      ROS_STATIC_PEERS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies in CI only
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-pytest python3-serial python3-yaml python3-smbus2 python3-numpy python3-colcon-common-extensions ros-jazzy-nav2-simple-commander ros-jazzy-tf2-ros ros-jazzy-diagnostic-msgs
+      - name: ROS-dependent functional regression (no robot hardware)
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --packages-select smart_delivery_core smart_carrier_api power_monitor hailo_vision --symlink-install
+          source install/setup.bash
+          python3 -m pytest -q packages/smart_delivery_core/test packages/smart_carrier_api/tests packages/power_monitor/test/test_power_status.py packages/hailo_vision/test --ignore-glob='*/test_copyright.py' --ignore-glob='*/test_flake8.py' --ignore-glob='*/test_pep257.py'

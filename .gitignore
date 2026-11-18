@@ -16,6 +16,7 @@ id_ed25519*
 .ssh/
 
 # Python caches and tooling
+.venv*/
 __pycache__/
 *.py[cod]
 .pytest_cache/

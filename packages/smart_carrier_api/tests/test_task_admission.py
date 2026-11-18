@@ -1,7 +1,6 @@
 """No permission heartbeat means no new claims only when explicitly enabled."""
 
 import pytest
-
 from smart_carrier_api.task_admission import TaskAdmissionGate
 
 
@@ -44,13 +43,3 @@ def test_old_allow_cannot_override_new_home_stop():
     gate.observe(permission(1001., False), 11., 1001.)
     gate.observe(permission(1000., True), 11.1, 1001.1)
     assert not gate.allows_claim(11.1)
-
-
-def test_bridge_stops_claim_submission_but_does_not_drop_pending_claim_record():
-    from types import SimpleNamespace
-    from smart_carrier_api.bridge_node import ApiBridgeNode
-    node = object.__new__(ApiBridgeNode)
-    node.task_admission = TaskAdmissionGate(enabled=True)
-    node.store = SimpleNamespace(get_pending_claim=lambda: pytest.fail('must not retry a claim now'))
-    node._submit = lambda *args, **kwargs: pytest.fail('no claim POST while home is latched')
-    assert not node._try_submit_claim(10., 2.)

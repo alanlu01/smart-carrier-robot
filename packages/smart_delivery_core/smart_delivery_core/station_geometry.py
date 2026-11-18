@@ -1,5 +1,21 @@
 """Bounded station candidates, using occupied cells and the complete body sweep."""
 import math
+from contextlib import ExitStack, contextmanager
+from copy import deepcopy
+from functools import wraps
+
+
+def geometry_cycle(function):
+    """Reuse exact geometry only inside one synchronous policy evaluation."""
+    @wraps(function)
+    def evaluate(self, *args, **kwargs):
+        with ExitStack() as stack:
+            grids = (getattr(self, 'grid', None), getattr(self, 'static_grid', None))
+            for grid in {id(grid): grid for grid in grids}.values():
+                if isinstance(grid, StationGrid):
+                    stack.enter_context(grid.evaluation())
+            return function(self, *args, **kwargs)
+    return evaluate
 
 
 def angle_error(a, b):
@@ -34,10 +50,22 @@ class StationGrid:
         q = info.origin.orientation
         self.yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
         self.data = message.data
+        self._blocker_cache = None
+        self.geometry_queries = self.geometry_cache_hits = 0
         if (not math.isfinite(self.resolution) or self.resolution <= 0
                 or self.width*self.height != len(self.data) or not self.data
                 or not all(math.isfinite(v) for v in (self.x, self.y, self.yaw))):
             raise ValueError('invalid station costmap')
+
+    @contextmanager
+    def evaluation(self):
+        """The snapshot is immutable in production; no permissions cross cycles."""
+        previous = self._blocker_cache
+        self._blocker_cache = {} if previous is None else previous
+        try:
+            yield
+        finally:
+            self._blocker_cache = previous
 
     def cell_value(self, x, y):
         c,s=math.cos(self.yaw),math.sin(self.yaw)
@@ -49,6 +77,20 @@ class StationGrid:
         return self.blocker(pose,rotation) is None
 
     def blocker(self, pose, rotation=False):
+        cache = self._blocker_cache
+        if cache is None:
+            return self._blocker(pose, rotation)
+        self.geometry_queries += 1
+        key = (tuple(pose), rotation)
+        if key in cache:
+            self.geometry_cache_hits += 1
+            return deepcopy(cache[key])
+        result = self._blocker(pose, rotation)
+        if len(cache) < 512:
+            cache[key] = deepcopy(result)
+        return result
+
+    def _blocker(self, pose, rotation=False):
         # Add 3 cm to the real 44 x 32 cm body. Test cell squares, not just
         # centers, to avoid losing a thin chair leg along the sampled boundary.
         x, y, yaw = pose

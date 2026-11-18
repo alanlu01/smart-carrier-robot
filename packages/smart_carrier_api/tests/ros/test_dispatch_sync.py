@@ -1,4 +1,4 @@
-"""Exercise startup reconciliation and ACK messages without network or ROS spin."""
+"""Exercise ROS bridge reconciliation without network calls or ROS spin."""
 
 import json
 from types import SimpleNamespace

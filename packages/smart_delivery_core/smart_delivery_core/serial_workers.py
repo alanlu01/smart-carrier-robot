@@ -8,6 +8,7 @@ import time
 import serial
 
 from smart_delivery_core.serial_io import SerialReceiver, SerialTransmitter, ZERO
+from smart_delivery_core.wheel_handoff import WheelHandoff
 
 
 def protect_parent(stop, name):
@@ -31,6 +32,7 @@ def protect_parent(stop, name):
 def receive_worker(path, baud, stop, wheel, health, raw, control=None):
     requested = protect_parent(stop, 'serial_rx_io')
     engine = SerialReceiver(path, baud)
+    handoff = WheelHandoff(wheel)
     last_health = last_raw = 0.
     try:
         while not requested[0] and not stop.is_set():
@@ -43,13 +45,17 @@ def receive_worker(path, baud, stop, wheel, health, raw, control=None):
                 engine.complete_ros_ns = 0
                 latest = None
             if latest is not None:
-                with engine.metrics.measure('wheel_ipc'):
-                    wheel.put(latest)
+                handoff.offer(latest, time.monotonic())
+            with engine.metrics.measure('wheel_ipc'):
+                handoff.flush(time.monotonic(), time.time_ns(), session=engine.session,
+                              valid=bool(engine.complete_ros_ns))
             now = time.monotonic()
             if control is not None:
                 control.put(engine.control_feedback(now))
             if latest is not None or now-last_health >= .2:
-                health.put(engine.health(now))
+                payload = engine.health(now)
+                payload['wheel_ipc'] = handoff.snapshot()
+                health.put(payload)
                 last_health = now
             if engine.frames != last_raw:
                 raw.put(dict(session=engine.session, frames=list(engine.raw)))
@@ -103,6 +109,8 @@ def diagnostic_worker(role, stop, health, relay_metrics, raw=None, summary_perio
     dropped = 0
     last_diag = last_summary = 0.
     previous_frames = 0
+    last_rate_band = None
+    last_console_summary = -float('inf')
     try:
         while rclpy.ok() and not requested[0] and not stop.is_set():
             started = time.monotonic()
@@ -127,7 +135,11 @@ def diagnostic_worker(role, stop, health, relay_metrics, raw=None, summary_perio
                 if started-last_summary >= summary_period and h:
                     frames = h.get('frames', 0)
                     rate = max(0, frames-previous_frames)/max(.001, started-last_summary) if last_summary else 0.
-                    node.get_logger().info(f'📡 STM32 回授：{rate:.1f} Hz')
+                    rate_band = 'missing' if not frames or rate < 1. else 'receiving'
+                    if rate_band != last_rate_band or started-last_console_summary >= 30.:
+                        node.get_logger().info(f'📡 STM32 回授：{rate:.1f} Hz')
+                        last_console_summary = started
+                    last_rate_band = rate_band
                     previous_frames, last_summary = frames, started
             elif h:
                 with metrics.measure('tx_health_publish'):

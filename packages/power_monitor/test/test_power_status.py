@@ -3,8 +3,8 @@ import json
 import pytest
 from power_monitor.power_status import (
     SlotStateTracker,
-    build_vehicle_battery,
     build_slot,
+    build_vehicle_battery,
     classify_current_status,
     classify_power_status,
     classify_vehicle_battery,

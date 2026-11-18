@@ -1,12 +1,33 @@
 #!/usr/bin/env bash
 # Observations only: does not start/stop robot nodes or change parameters.
 set -e
+PROFILE=full
+PRINT_TOPICS=false
+while (( $# )); do
+  case "$1" in
+    --daily) PROFILE=daily ;;
+    --full) PROFILE=full ;;
+    --print-topics) PRINT_TOPICS=true ;;
+    -h|--help)
+      printf 'Usage: bash %s [--full|--daily] [--print-topics]\n' "$0"
+      printf 'Full preserves all diagnostic topics. Daily omits full global grids, particles and bond.\n'
+      exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+source "$(dirname "$0")/recording_topics.sh"
+select_recording_topics "$PROFILE"
+if "$PRINT_TOPICS"; then
+  printf '%s\n' "${TOPICS[@]}"
+  exit 0
+fi
 source "${ROBOT_ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 source "${ROBOT_WS_SETUP:-/home/kj0921/dev_ws/install/setup.bash}"
 set -u
 RECORD_ROOT="${ROBOT_TEST_LOG_ROOT:-/home/kj0921/test_logs}"
 mkdir -p "$RECORD_ROOT"
-RECORD_DIR="$(mktemp -d "$RECORD_ROOT/$(date +%Y%m%d_%H%M%S)_full_system_XXXXXX")"
+RECORD_DIR="$(mktemp -d "$RECORD_ROOT/$(date +%Y%m%d_%H%M%S)_${PROFILE}_system_XXXXXX")"
 CORE_SHARE="$(ros2 pkg prefix smart_delivery_core)/share/smart_delivery_core"
 QOS_FILE="$CORE_SHARE/config/recording_qos.yaml"
 test -r "$QOS_FILE" || { printf 'Missing QoS file: %s\n' "$QOS_FILE" >&2; exit 1; }
@@ -25,47 +46,8 @@ cleanup() {
   for pid in "${MONITOR_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
-# Preserve every topic from the full-system checklist. No raw camera frames.
-TOPICS=(
-  /scan /scan_filtered /stm32_data /chassis/wheel_sample /odom /amcl_pose /initialpose
-  /tf /tf_static /map /particle_cloud
-  /plan /behavior_tree_log
-  /cmd_vel_nav /cmd_vel_smoothed /cmd_vel /chassis_cmd_vel
-  /collision_monitor_state
-  /navigate_to_pose/_action/feedback /navigate_to_pose/_action/status
-  /navigate_through_poses/_action/feedback /navigate_through_poses/_action/status
-  /spin/_action/feedback /spin/_action/status
-  /local_costmap/costmap /local_costmap/costmap_updates
-  /local_costmap/published_footprint
-  /global_costmap/costmap /global_costmap/costmap_updates
-  /global_costmap/published_footprint
-  /localization/state /localization/ready
-  /localization/speed_limit
-  /localization/motion_inhibited
-  /localization/recovery_motion_lease /localization/recovery_motion_guard
-  /smart_carrier/dispatch_sync_request /smart_carrier/dispatch_sync_state
-  /smart_carrier/result_sync_state
-  /smart_carrier/optional_idle_state /smart_carrier/task_admission
-  /vehicle_battery/verified_status
-  /smart_carrier/delivery_navigation_active /delivery/standby_state /delivery/station_state
-  /delivery/station_controller_state
-  /delivery/navigation_policy
-  /delivery/startup_state
-  /chassis/odom_local /chassis/odometry_transport_health
-  /chassis/serial_rx_health /chassis/serial_tx_health /chassis/serial_feedback /navigation/pipeline_health
-  /chassis/serial_io_diagnostics
-  /navigation/diagnostics
-  /power_status /vehicle_battery_status
-  /vision/semantic_info /visual_glass /semantic/speed_multiplier
-  /vision/pipeline_health /semantic/pipeline_health /chassis/feedback_health
-  /lidar/pipeline_health
-  /order /smart_carrier/task_state
-  /bond /amcl/transition_event /map_server/transition_event
-  /controller_server/transition_event /bt_navigator/transition_event /behavior_server/transition_event
-  /smart_carrier/task_result /smart_carrier/task_result_ack
-  /smart_carrier/task_cancel /diagnostics /rosout
-)
 printf '%s\n' "${TOPICS[@]}" > "$RECORD_DIR/requested_topics.txt"
+printf '%s\n' "$PROFILE" > "$RECORD_DIR/recording_profile.txt"
 printf '%s\n' "$RECORD_DIR" > "$RECORD_ROOT/latest_recording_path.txt"
 printf '%s\t%s\n' "$START_TIME" recording_start > "$RECORD_DIR/events.tsv"
 printf '%s\n' "$RECORD_HELP" > "$RECORD_DIR/recorder_help.txt"
@@ -84,7 +66,8 @@ if POWER_PREFIX="$(ros2 pkg prefix power_monitor 2>/dev/null)"; then
   fi
 fi
 {
-  printf 'diagnostic_schema=20261109-runtime-input-reliability\n'
+  printf 'diagnostic_schema=20261118-bounded-wheel-handoff\n'
+  printf 'recording_profile=%s\n' "$PROFILE"
   printf 'start=%s\ncore_share=%s\n' "$START_TIME" "$CORE_SHARE"
   uname -a
   for KEY in ROS_DISTRO ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_LOCALHOST_ONLY \
