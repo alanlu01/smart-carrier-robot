@@ -41,7 +41,8 @@ from smart_delivery_core.standby_retry import StandbyRetryPolicy
 from smart_delivery_core.dispatch_startup import StartupDispatchGate
 from smart_delivery_core.optional_idle import home_pending_decision, load_idle_config
 from smart_delivery_core.navigation_retry import (
-    result_sync_message, retry_data_fresh, schedule_tf_retry, transient_tf_failure, transient_navigation_failure,
+    result_sync_message, retry_data_fresh, schedule_tf_retry, transient_tf_failure,
+    transient_navigation_log, navigation_failure_is_transient,
 )
 
 BORROW_DISTANCE_WEIGHT = 0.7
@@ -732,7 +733,7 @@ def _run_delivery(runtime_holder):
         if (navigation_started_at > 0 and message.level >= Log.WARN
                 and ('bt_navigator' in message.name or message.name.rsplit('.',1)[-1]
                      in {'controller_server','lifecycle_manager_navigation','lifecycle_manager_localization'})
-                and transient_navigation_failure(0,message.msg)):
+                and transient_navigation_log(message.msg)):
             last_navigation_transport_failure=(time.monotonic(),message.msg)
         if (navigation_started_at > 0 and message.level >= Log.WARN
                 and message.name.rsplit('.', 1)[-1] in {
@@ -956,6 +957,8 @@ def _run_delivery(runtime_holder):
     def set_navigation_active(active):
         nonlocal delivery_navigation_active
         delivery_navigation_active = bool(active)
+        if active and optional_runtime is not None:
+            optional_runtime.idle_clock.leave_parking()
         message = Bool()
         message.data = delivery_navigation_active
         navigation_lease_publisher.publish(message)
@@ -1679,7 +1682,7 @@ def _run_delivery(runtime_holder):
         is_standby = False
         if resumed_after_localization:
             navigator.get_logger().warning(
-                f"✅ 定位恢復，繼續前往：{target['name']}"
+                f"✅ {'導航資料已恢復' if target.pop('_navigation_data_retry',False) else '定位恢復'}，繼續前往：{target['name']}"
             )
         progress(target, fsm, "precheck", progress_message="Task precheck passed")
         progress(
@@ -1798,16 +1801,15 @@ def _run_delivery(runtime_holder):
                 "進出站前置檢查失敗（尚未送出導航）" if motion.goals_submitted == 0 else
                 "Nav2 goal failed"
             )
-            transient = (nav_result == TaskResult.FAILED and motion.goals_submitted > 0 and (
-                motion.data_unavailable
-                or transient_tf_failure(nav_error_code, nav_error_msg)
-                or (nav_error_code == 0 and recent_tf_failure)
-                or transient_navigation_failure(nav_error_code,nav_error_msg)
-                or (last_navigation_transport_failure[0] >= navigation_started_at_for_result
-                    and time.monotonic()-last_navigation_transport_failure[0] <= 5.)
-            ))
+            transient = (nav_result == TaskResult.FAILED and motion.goals_submitted > 0
+                and navigation_failure_is_transient(nav_error_code,nav_error_msg,
+                    data_unavailable=motion.data_unavailable,
+                    failure_kind=getattr(motion,'failure_kind',''),recent_tf=recent_tf_failure,
+                    recent_transport=(last_navigation_transport_failure[0]>=navigation_started_at_for_result
+                        and time.monotonic()-last_navigation_transport_failure[0]<=5.)))
             retries = int(target.get("_tf_retry_count", 0))
             if transient and schedule_tf_retry(target, time.time()):
+                target['_navigation_data_retry']=True
                 target.setdefault('_navigation_retry_deadline',time.time()+90.)
                 fsm.transition("waiting_localization")
                 persist(target, fsm.state, pending_result)

@@ -16,6 +16,7 @@ from tf2_ros import TransformException
 
 from smart_delivery_core.delivery_inputs import shared_inputs
 from smart_delivery_core.station_geometry import StationGrid, angle_error, geometry_cycle
+from smart_delivery_core.station_timing import TranslationBudget
 
 
 def coordinates(message):
@@ -194,6 +195,8 @@ class StationNavigation:
             inputs=dict(costmap=self.grid_gate,tf=self.pose_gate,odom=self.odom_gate),
             motion_check=getattr(self,'motion_check',{}),
             clearance_retries=getattr(self,'clearance_retries',0),
+            translation_budget=(self.translation_budget.snapshot(time.monotonic())
+                if getattr(self,'translation_budget',None) else None),
             clearance_clear_samples=getattr(self,'clearance_clear_samples',0),
             clearance_clear_elapsed_sec=(None if getattr(self,'clearance_clear_since',None) is None
                 else round(max(0.,time.monotonic()-self.clearance_clear_since),3)),
@@ -256,6 +259,8 @@ class StationNavigation:
         self.clearance_retries = 0
         self.clearance_pending = None
         self.translation_resume_deadline = None
+        self.translation_budget = None
+        self.departure_redirects = 0
         self.clearance_clear_since = None
         self.clearance_clear_stamp = None
         self.clearance_clear_samples = 0
@@ -296,6 +301,8 @@ class StationNavigation:
         if self.cancelled or not self.permitted():
             self._finish(TaskResult.CANCELED,'cancelled'); return
         self.stage,self.next_phase = point,next_phase
+        if phase not in ('entry','departure'):
+            self.translation_budget=None
         self.native_error = (0,'')
         self.cancel_request,self.cancel_requested_at = None,None
         self.stop_since = None
@@ -315,7 +322,7 @@ class StationNavigation:
         self.active_goal = accepted is not False
         if not self.active_goal: self._finish(TaskResult.FAILED,'failed','Nav2 拒絕目標')
 
-    def _translation(self, start, end, phase, next_phase):
+    def _translation(self, start, end, phase, next_phase, *, budget=None):
         if (not self._data() or not self.grid.segment(start,end)
                 or abs(angle_error(start[2],end[2]))>.12):
             self._finish(TaskResult.FAILED,'failed','平移通道未通過檢查'); return
@@ -323,16 +330,25 @@ class StationNavigation:
         along = math.cos(end[2])*dx+math.sin(end[2])*dy
         across = -math.sin(end[2])*dx+math.cos(end[2])*dy
         axis = 'x' if abs(along)>=abs(across) else 'y'
+        now=time.monotonic()
+        budget=budget or TranslationBudget(now,self.sequence_deadline)
+        budget.transition(now,'moving')
+        if budget.deadline(now)<=now+.2:
+            self.failure_kind='translation_budget_exhausted'
+            self._finish(TaskResult.FAILED,'failed','平移額度已用盡，未送出新目標');return
+        self.translation_budget=budget
         self.translation_start = start
         self.motion_odom_anchor = self._odom_pose()
         tree = str(self.share/'behavior_trees'/f'station_{"exit_" if phase=="departure" else ""}{axis}.xml')
         self._send(end,phase,tree,next_phase)
+        self.deadline=min(self.deadline,budget.deadline(time.monotonic()))
 
     def _wait_clearance(self, reason, resume, scope='local_departure'):
         if self.clearance_deadline is None:
             self.clearance_deadline = min(self.sequence_deadline,time.monotonic()+30.)
-            if scope=='local_translation' and self.translation_resume_deadline is not None:
-                self.clearance_deadline=min(self.clearance_deadline,self.translation_resume_deadline)
+            if scope=='local_translation' and self.translation_budget is not None:
+                self.clearance_deadline=min(self.clearance_deadline,
+                    self.translation_budget.deadline(time.monotonic()))
         self.deadline = self.clearance_deadline
         self.clearance_grid_stamp = self.grid_stamp
         self.clearance_resume = resume
@@ -501,6 +517,16 @@ class StationNavigation:
             self._wait_clearance('等待平移通道恢復','translation_resume','local_translation')
         elif phase=='translation_resume':
             moving,end,resume=self.clearance_pending
+            if moving=='departure' and self.departure_redirects<1:
+                alternate=self.grid.departure(pose,self.target)
+                if (alternate is not None and math.hypot(alternate[0]-end[0],alternate[1]-end[1])>.10
+                        and (not self.grid.segment(pose,end)
+                             or self.grid.extra_clearance(alternate)>self.grid.extra_clearance(end)+.01)):
+                    end=alternate
+                    self.departure_redirects+=1
+                    self.clearance_pending=(moving,end,resume)
+                    self.clearance_clear_since=self.clearance_clear_stamp=None
+                    self.clearance_clear_samples=0
             if not self.grid.segment(pose,end):
                 self.clearance_clear_since=self.clearance_clear_stamp=None
                 self.clearance_clear_samples=0
@@ -515,10 +541,9 @@ class StationNavigation:
                 self.clearance_clear_samples+=1
             if self.clearance_clear_samples<2 or now-self.clearance_clear_since<.15:
                 self._wait_clearance('確認平移通道穩定','translation_resume','local_translation');return
-            original_deadline=self.translation_resume_deadline
+            budget=self.translation_budget
             self.clearance_pending=None
-            self._translation(pose,end,moving,resume)
-            self.deadline=min(self.deadline,original_deadline)
+            self._translation(pose,end,moving,resume,budget=budget)
             self.translation_resume_deadline=None
         elif phase=='finish':
             self._advance_finish()
@@ -622,9 +647,12 @@ class StationNavigation:
 
     def _pause_translation(self):
         if self.clearance_retries>=2:
-            self.failure='平移通道持續受阻';self.cancelTask();return
+            self.failure,self.failure_kind='平移通道持續受阻','translation_blocked'
+            self.cancelTask();return
         self.clearance_retries+=1
         self.translation_resume_deadline=self.deadline
+        if self.translation_budget is not None:
+            self.translation_budget.transition(time.monotonic(),'waiting')
         self.clearance_clear_since=self.clearance_clear_stamp=None
         self.clearance_clear_samples=0
         self.clearance_pending=(self.phase,self.stage,self.next_phase)
@@ -704,7 +732,8 @@ class StationNavigation:
         if not self.cancelled and time.monotonic()>self.deadline:
             self.preflight_timeout = self.goals_submitted==0 and self.phase=='waiting_data'
             self.clearance_timeout = self.phase=='waiting_clearance'
-            self.failure_kind = ('alignment_data_deadline' if self.alignment_pause else 'stage_deadline')
+            self.failure_kind = ('alignment_data_deadline' if self.alignment_pause else
+                                 'clearance_timeout' if self.clearance_timeout else 'stage_deadline')
             self.failure = ('對正資料恢復逾時' if self.alignment_pause else '導航前置確認逾時，尚未送出目標' if self.preflight_timeout
                             else '進出站通道持續受阻' if self.clearance_timeout
                             else '階段逾時，未確認停妥')

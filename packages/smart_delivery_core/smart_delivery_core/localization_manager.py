@@ -2005,9 +2005,12 @@ class LocalizationManager(Node):
         )
 
     def _map_match_has_recovered(self, now):
+        raw = getattr(self, 'latest_map_score_raw', self.latest_map_score)
         return (
             self.latest_map_score is not None
             and self.latest_map_score >= self.map_match_recovery_score
+            and raw is not None and math.isfinite(raw)
+            and raw >= self.map_match_recovery_score
             and len(self.map_score_window) >= self.map_match_window_min_samples
             and now - self.latest_map_score_at <= 2.0 * self.map_match_period
         )

@@ -220,6 +220,15 @@ class StationGrid:
         return ((self.clear(start,rotation=True) and self.clear(end,rotation=True))
                 or self.aligned_route(start,end))
 
+    def extra_clearance(self, pose):
+        """Rank already-safe candidates; never relax the required 3 cm margin."""
+        extra=0.
+        for pad in (.02,.04,.06):
+            if self._blocker(pose,padding=.03+pad) is not None:
+                break
+            extra=pad
+        return extra
+
     def staging(self, target, current, *, final_clear=True, static_grid=None):
         """Try all four body directions; never invent permanent site coordinates."""
         # Remote preparation may defer dynamic FINAL clearance, never the
@@ -237,7 +246,8 @@ class StationGrid:
                         and (not final_clear or self.segment(point,target))):
                     candidates.append(point)
             if distance>=.50 and candidates:break
-        return min(candidates, key=lambda p:math.hypot(p[0]-current[0],p[1]-current[1])) if candidates else None
+        return min(candidates,key=lambda p:(-self.extra_clearance(p),
+            math.hypot(p[0]-current[0],p[1]-current[1]))) if candidates else None
 
     def departure(self, current, target):
         candidates = []
@@ -247,4 +257,5 @@ class StationGrid:
                 point = (current[0]+distance*math.cos(a),current[1]+distance*math.sin(a),current[2])
                 if (self.clear(point,rotation=True) or self.aligned_route(point,target)) and self.segment(current,point):
                     candidates.append(point)
-        return min(candidates, key=lambda p:math.hypot(p[0]-target[0],p[1]-target[1])) if candidates else None
+        return min(candidates,key=lambda p:(-self.extra_clearance(p),
+            math.hypot(p[0]-target[0],p[1]-target[1]))) if candidates else None

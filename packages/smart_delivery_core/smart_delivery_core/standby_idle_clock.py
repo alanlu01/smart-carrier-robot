@@ -32,6 +32,10 @@ class StandbyIdleClock:
         self.last_map_pose = (point['x'],point['y'],point['yaw'])
         self.correction_disqualified = self.correction_used = False
 
+    def leave_parking(self):
+        self.reset()
+        self.point = self.map_reference = self.last_map_pose = None
+
     def update(self, now, *, parked, safe, stationary, pose, odom, transient_tf_gap=False,
                trusted_map_correction=False):
         # Auxiliary time only: no motion can be authorized on missing TF.

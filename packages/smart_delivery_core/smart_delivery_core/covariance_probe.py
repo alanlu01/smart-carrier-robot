@@ -17,6 +17,8 @@ def residual(anchor, odom_anchor, pose, odom):
 
 
 class CovarianceProbe:
+    MAX_WAIT = 3.
+    MAX_ANCHOR_AGE = 3.
     def __init__(self):
         self.active = self.failed = False
         self.anchor = None
@@ -30,7 +32,7 @@ class CovarianceProbe:
         if self.failed:
             return
         if self.active:
-            if (not valid or now-self.started >= 1.5
+            if (not valid or not 0 <= now-self.started < self.MAX_WAIT
                     or not self._consistent(pose, odom)):
                 self.failed, self.active = True, False
                 return
@@ -41,7 +43,7 @@ class CovarianceProbe:
                 self.anchor, self.anchor_at = (pose, odom), now
             return
         if critical:
-            if (valid and self.anchor is not None and 0 <= now-self.anchor_at <= 1.
+            if (valid and self.anchor is not None and 0 <= now-self.anchor_at <= self.MAX_ANCHOR_AGE
                     and self._consistent(pose, odom)):
                 self.active, self.started, self.healthy_samples = True, now, 0
             else:
@@ -56,7 +58,7 @@ class CovarianceProbe:
         return distance <= .15 and angle <= .12
 
     def check_deadline(self, now, evidence_ok):
-        if self.active and (not evidence_ok or not 0 <= now-self.started < 1.5):
+        if self.active and (not evidence_ok or not 0 <= now-self.started < self.MAX_WAIT):
             self.failed, self.active = True, False
 
     @property

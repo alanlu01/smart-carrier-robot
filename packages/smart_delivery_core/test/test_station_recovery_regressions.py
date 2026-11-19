@@ -54,7 +54,8 @@ def test_margin_stop_resumes_only_remaining_leg_after_two_clear_snapshots(motion
     assert m.clearance_clear_samples==1 and len(n.sent)==1
     m.grid_stamp=3;m.isTaskComplete()
     assert m.phase=='entry' and len(n.sent)==2
-    assert n.sent[-1][0]==m.target and m.deadline==original_deadline
+    assert n.sent[-1][0]==m.target and m.deadline>original_deadline
+    assert m.translation_budget.moving<25. and m.deadline<=m.sequence_deadline
 
 
 def test_clearance_flap_or_stale_data_cannot_count_as_continuous_clear(motion):

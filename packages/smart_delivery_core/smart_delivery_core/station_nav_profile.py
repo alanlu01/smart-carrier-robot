@@ -20,6 +20,10 @@ def hull(points):
 
 def station_parameters(source):
     parameters = deepcopy(source)
+    planner=parameters['planner_server']['ros__parameters']
+    planner['GuardedGridBased']=dict(plugin='smart_station_controller::GuardedPlanner')
+    if 'GuardedGridBased' not in planner['planner_plugins']:
+        planner['planner_plugins'].append('GuardedGridBased')
     bt = parameters['bt_navigator']['ros__parameters']
     libraries = bt.setdefault('plugin_lib_names', [])
     if 'smart_navigation_policy_bt_node' not in libraries:

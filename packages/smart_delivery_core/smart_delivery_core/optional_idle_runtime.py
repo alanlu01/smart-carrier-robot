@@ -607,7 +607,9 @@ class OptionalIdleRuntime:
         idle_progress = (self.state=='idle' and self.idle_clock.point is not None
             and self.idle_clock.reason=='counting_verified_stationary_parking'
             and self.ready() and self._localization_phase() in (None,'LOCALIZED')
-            and not self.inhibited and now-self.last_progress_log>=30.)
+            and not self.inhibited and not self.motion and self._stationary()
+            and not getattr(getattr(self.navigator,'station_navigation',None),'running',False)
+            and now-self.last_progress_log>=30.)
         if not transition and not progress and not idle_progress:
             return
         self.log_key, self.last_progress_log = key, now
@@ -1146,7 +1148,7 @@ class OptionalIdleRuntime:
         """Cancel on unsafe data/new service work and drain before any new goal."""
         if has_work:
             self.idle_since = None
-            self.idle_clock.reset()
+            self.idle_clock.leave_parking()
         if (not self.motion and self.state in (
                 'waiting_observation_stop', 'waiting_observation_retry',
                 'waiting_people_localization',

@@ -53,6 +53,26 @@ def transient_navigation_failure(error_code, error_msg):
     ))
 
 
+def transient_navigation_log(message):
+    """An expected BT halt while we cancel is not evidence of a DDS outage."""
+    text=str(message or '').lower()
+    return 'in node halt' not in text and transient_navigation_failure(0,text)
+
+
+def navigation_failure_is_transient(code, message, *, data_unavailable=False,
+                                    failure_kind='', recent_tf=False, recent_transport=False):
+    """Explicit physical/policy failures take precedence over nearby cancel logs."""
+    physical = failure_kind in {'translation_blocked','clearance_timeout','stage_deadline','route_no_progress',
+        'alignment_no_progress','alignment_turn_blocked','alignment_displacement',
+        'translation_budget_exhausted'} or any(x in str(message) for x in (
+            '通道持續受阻','平移通道未通過','平移偏離','平移車頭方向','準備點偏離'))
+    if physical and not data_unavailable:
+        return False
+    return bool(data_unavailable or transient_tf_failure(code,message)
+                or (code==0 and recent_tf) or transient_navigation_failure(code,message)
+                or recent_transport)
+
+
 def result_sync_message(status):
     """Describe the outcome without confusing local receipt with cloud success."""
     label = {'done': '操作已完成', 'failed': '任務失敗',
