@@ -21,6 +21,8 @@ struct RouteGrid
   std::vector<unsigned char> costs;
   bool cell(double wx,double wy,int & col,int & row) const
   {
+    if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(x) || !std::isfinite(y) ||
+      !std::isfinite(resolution) || resolution<=0.) {return false;}
     col=static_cast<int>(std::floor((wx-x)/resolution));
     row=static_cast<int>(std::floor((wy-y)/resolution));
     return col>=0 && row>=0 && col<width && row<height;
@@ -116,7 +118,8 @@ public:
       grid.costs.size()!=static_cast<size_t>(grid.width*grid.height)) {
       throw std::runtime_error("Invalid route costmap snapshot");
     }
-    if (!std::isfinite(now) || now<last_now) {reset();}
+    if (!std::isfinite(now)) {throw std::runtime_error("Invalid route clock");}
+    if (now<last_now) {reset();}
     last_now=now;
     if (!has_goal || distance(goal,target)>.01 || std::abs(wrap(goal.yaw-target.yaw))>.01) {
       reset();goal=target;has_goal=true;

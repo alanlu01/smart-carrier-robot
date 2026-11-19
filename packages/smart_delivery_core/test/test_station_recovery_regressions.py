@@ -40,6 +40,7 @@ def test_margin_stop_resumes_only_remaining_leg_after_two_clear_snapshots(motion
     m.mode='station'
     m._translation(p[0],m.target,'entry','finish')
     original_deadline=m.deadline
+    c[0]+=.28
     m.grid=single_cell_at(.5,.20);m.grid_stamp=1
     assert not m.isTaskComplete() and n.cancels==1
     assert m.motion_check['blocker']['layer']=='margin'
@@ -56,6 +57,27 @@ def test_margin_stop_resumes_only_remaining_leg_after_two_clear_snapshots(motion
     assert m.phase=='entry' and len(n.sent)==2
     assert n.sent[-1][0]==m.target and m.deadline>original_deadline
     assert m.translation_budget.moving<25. and m.deadline<=m.sequence_deadline
+
+
+def test_recorded_25_second_clearance_pause_resumes_with_actual_motion_time(motion):
+    m,n,c,p,_,_=motion;m.mode='station'
+    m._translation(p[0],m.target,'entry','finish')
+    c[0]=100.28;m.grid=single_cell_at(.5,.20);m.grid_stamp=1;m.isTaskComplete()
+    n.complete,n.result=True,TaskResult.CANCELED;tick(m,c)
+    c[0]=124.;m.grid=grid();m.grid_stamp=2;m.isTaskComplete()
+    assert len(n.sent)==1
+    c[0]=125.1;m.grid_stamp=3;m.isTaskComplete()
+    assert m.phase=='entry' and len(n.sent)==2
+    assert m.deadline>c[0]+24. and not m.cancelled
+    assert m.translation_budget.waiting<6.
+
+
+def test_current_bad_raw_match_cannot_release_on_old_smoothed_score(manager):
+    n,c=manager
+    n.state='SUSPECT';n.latest_map_score=.417;n.latest_map_score_raw=.167
+    n.stable_samples=5;n.last_stable_map_score_at=99.
+    n._tick_state_machine()
+    assert not n.ready and n.stable_samples==0 and n.state=='SUSPECT'
 
 
 def test_clearance_flap_or_stale_data_cannot_count_as_continuous_clear(motion):

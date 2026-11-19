@@ -1225,7 +1225,9 @@ class LocalizationManager(Node):
                 self._mark_localized()
 
     def _covariance_evidence_ok(self, now):
+        raw=getattr(self,'latest_map_score_raw',self.latest_map_score)
         return (not self._verification_data_blockers(now)
+                and raw is not None and math.isfinite(raw) and raw>=self.map_match_recovery_score
                 and self.latest_map_score is not None and self.latest_map_score >= .60
                 and 0 <= now-self.latest_map_score_at <= 1.5
                 and self.latest_map_sector_count >= self.map_match_min_sectors
