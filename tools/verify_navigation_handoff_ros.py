@@ -60,6 +60,9 @@ def main():
     odom = node.create_publisher(Odometry, '/odom', 10)
     scan = node.create_publisher(LaserScan, '/scan_filtered', qos_profile_sensor_data)
     paths = []
+    guarded_routes = []
+    node.create_subscription(String,'/delivery/route_state',
+        lambda m:guarded_routes.append(json.loads(m.data)),qos_profile_sensor_data)
     command_peaks={}
     command_trace={}
     for topic in ('/cmd_vel_nav','/cmd_vel_smoothed'):
@@ -284,7 +287,10 @@ def main():
             recovery_report=dict(native_navigation_reset_startup=True,stale_stop_proof_blocked=True,
                 localization_lifecycle_preserved=True,new_station_and_normal_goals_succeeded=True,
                 injected_diagnostic_only=True,action=health[-1]['action'])
+        if '--owned' in sys.argv:
+            assert any(row.get('valid') for row in guarded_routes),guarded_routes
         (root/'result.json').write_text(json.dumps(dict(passed=True,results=results,
+            guarded_routes=guarded_routes,
             after_cancel=True,wrong_policy_no_motion='--owned' in sys.argv,recovery=recovery_report),indent=2))
         print(json.dumps(dict(passed=True,domain=231,software_plant_only=True,root=str(root))),flush=True)
     finally:

@@ -80,6 +80,16 @@ def test_current_bad_raw_match_cannot_release_on_old_smoothed_score(manager):
     assert not n.ready and n.stable_samples==0 and n.state=='SUSPECT'
 
 
+def test_active_covariance_probe_requests_updates_at_verification_rate(manager):
+    n,c=manager;n.state='LOCALIZED';n.last_nomotion_request_at=99.
+    n.covariance_probe=NS(active=True)
+    n._request_nomotion_if_due(c.now)
+    assert len(n.requests)==1
+    n.covariance_probe.active=False
+    c.now=101.;n._request_nomotion_if_due(c.now)
+    assert len(n.requests)==1
+
+
 def test_clearance_flap_or_stale_data_cannot_count_as_continuous_clear(motion):
     m,n,c,p,_,_=motion
     m.mode='station';m._translation(p[0],m.target,'entry','finish')

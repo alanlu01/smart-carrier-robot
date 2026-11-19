@@ -1,7 +1,4 @@
 <library path="station_controller">
-  <class type="smart_station_controller::GuardedPlanner" base_class_type="nav2_core::GlobalPlanner">
-    <description>Snapshot-only NavFn Dijkstra with padded-body validation and safe route retention.</description>
-  </class>
   <class type="smart_station_controller::StationMPPI" base_class_type="nav2_core::Controller">
     <description>Station-only MPPI with a continuous goal-distance speed envelope.</description>
   </class>

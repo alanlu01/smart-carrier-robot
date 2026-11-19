@@ -1568,6 +1568,8 @@ class LocalizationManager(Node):
             self.covariance_probe = CovarianceProbe()
         elif probe and probe.active:
             probe.check_deadline(now, self._covariance_evidence_ok(now))
+            if probe.active:
+                self._request_nomotion_if_due(now)
         if self.lateral_phase is not None:
             # Local raw-sensor safety is checked by the independent 20 Hz loop.
             # AMCL/map evidence must not abort or accept localization mid-sidestep.
@@ -2213,6 +2215,7 @@ class LocalizationManager(Node):
     def _request_nomotion_if_due(self, now):
         interval = (
             self.amcl_nomotion_refresh if self.state == "LOCALIZED"
+            and not getattr(getattr(self,'covariance_probe',None),'active',False)
             else self.verification_nomotion_refresh
         )
         if now - self.last_nomotion_request_at >= interval:

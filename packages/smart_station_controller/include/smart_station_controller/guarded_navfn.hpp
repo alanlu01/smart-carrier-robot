@@ -122,7 +122,7 @@ public:
     if (now<last_now) {reset();}
     last_now=now;
     if (!has_goal || distance(goal,target)>.01 || std::abs(wrap(goal.yaw-target.yaw))>.01) {
-      reset();goal=target;has_goal=true;
+      reset();goal=target;has_goal=true;last_progress=now;
     }
     avoid.erase(std::remove_if(avoid.begin(),avoid.end(),[now](const auto & a) {
       return now>=a.until;}),avoid.end());

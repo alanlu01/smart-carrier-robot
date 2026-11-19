@@ -20,12 +20,18 @@ target_compile_definitions(smart_navigation_policy_bt_node PRIVATE BT_PLUGIN_EXP
 ament_target_dependencies(smart_navigation_policy_bt_node rclcpp std_msgs geometry_msgs behaviortree_cpp)
 target_link_libraries(smart_navigation_policy_bt_node nlohmann_json::nlohmann_json)
 install(TARGETS smart_navigation_policy_bt_node LIBRARY DESTINATION lib)
-add_library(station_controller SHARED src/station_controller.cpp src/alignment_controller.cpp src/guarded_planner.cpp)
+add_library(station_controller SHARED src/station_controller.cpp src/alignment_controller.cpp)
 target_include_directories(station_controller PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(station_controller nav2_core nav2_mppi_controller nav2_rotation_shim_controller
-  nav2_costmap_2d nav2_navfn_planner pluginlib rclcpp rclcpp_lifecycle tf2_geometry_msgs std_msgs)
-target_link_libraries(station_controller nlohmann_json::nlohmann_json)
+  nav2_costmap_2d pluginlib rclcpp rclcpp_lifecycle tf2_geometry_msgs std_msgs)
+add_library(guarded_planner SHARED src/guarded_planner.cpp)
+target_include_directories(guarded_planner PRIVATE include)
+ament_target_dependencies(guarded_planner nav2_core nav2_navfn_planner nav2_costmap_2d
+  pluginlib rclcpp rclcpp_lifecycle tf2_geometry_msgs std_msgs)
+target_link_libraries(guarded_planner nlohmann_json::nlohmann_json)
+pluginlib_export_plugin_description_file(nav2_core guarded_planner_plugin.xml)
+install(TARGETS guarded_planner LIBRARY DESTINATION lib)
 pluginlib_export_plugin_description_file(nav2_core plugins.xml)
 install(TARGETS station_controller ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
