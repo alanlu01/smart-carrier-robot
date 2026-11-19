@@ -48,7 +48,7 @@ jobs:
       - name: Install test dependencies in CI only
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends python3-pytest python3-serial python3-yaml python3-smbus2 python3-numpy python3-colcon-common-extensions ros-jazzy-nav2-simple-commander ros-jazzy-nav2-bt-navigator ros-jazzy-nav2-mppi-controller ros-jazzy-nav2-rotation-shim-controller ros-jazzy-navfn-planner ros-jazzy-tf2-ros ros-jazzy-diagnostic-msgs nlohmann-json3-dev
+          apt-get install -y --no-install-recommends python3-pytest python3-serial python3-yaml python3-smbus2 python3-numpy python3-colcon-common-extensions ros-jazzy-nav2-simple-commander ros-jazzy-nav2-bt-navigator ros-jazzy-nav2-mppi-controller ros-jazzy-nav2-rotation-shim-controller ros-jazzy-nav2-navfn-planner ros-jazzy-tf2-ros ros-jazzy-diagnostic-msgs nlohmann-json3-dev
       - name: ROS-dependent functional regression (no robot hardware)
         shell: bash
         run: |
