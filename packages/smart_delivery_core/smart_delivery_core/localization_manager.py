@@ -1265,7 +1265,7 @@ class LocalizationManager(Node):
             pass
         probe.observe(now, stamp, pose, odom, healthy=quality.healthy,
                       critical=quality.critical, evidence_ok=odom is not None,
-                      map_ok=self._covariance_evidence_ok(now))
+                      map_ok=odom is not None and self._covariance_evidence_ok(now))
         if probe.stopped and hasattr(self, 'speed_limit_publisher'):
             message = Float32()
             message.data = 0.

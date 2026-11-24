@@ -568,6 +568,8 @@ class StationNavigation:
             if moving=='entry':
                 alternate=self._entry_endpoint(pose,prefer_alternative=True)
                 if alternate is None:
+                    self.clearance_clear_since=self.clearance_clear_stamp=None
+                    self.clearance_clear_samples=0
                     self._wait_clearance('確認進站安全落點','translation_resume','local_translation');return
                 end=alternate;self.clearance_pending=(moving,end,resume)
             if moving=='departure' and self.departure_redirects<1:

@@ -389,9 +389,9 @@ def test_shifted_entry_needs_two_fresh_grids_and_keeps_requested_arrival_point(m
     manager.grid_stamp=1
     manager._advance(pose[0])
     assert manager.phase=='waiting_clearance' and not node.sent
-    clock[0]+=.5;manager._advance(pose[0])
+    clock[0]+=.5;manager.isTaskComplete()
     assert not node.sent  # Same map does not reconfirm a candidate.
-    manager.grid_stamp=2;clock[0]+=.5;manager._advance(pose[0])
+    manager.grid_stamp=2;clock[0]+=.5;manager.isTaskComplete()
     assert manager.phase=='entry' and manager.entry_adjustments==1
     assert manager.target==(1.,0.,0.) and node.sent[-1][0]!=manager.target
     # Inside shifted-goal tolerance but outside ORIGINAL tolerance is not done.
