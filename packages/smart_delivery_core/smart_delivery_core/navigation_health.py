@@ -22,7 +22,7 @@ from smart_delivery_core.serial_recovery import fresh_feedback
 TARGETS = ('map_server','amcl','planner_server','controller_server','bt_navigator','behavior_server','collision_monitor')
 
 
-def navigation_snapshot(records, now, *, fresh_safety=False):
+def navigation_snapshot(records, now, *, fresh_safety=False, action_healthy=False):
     states = {name: dict(record, age_sec=max(0.,now-record.get('at',now)))
               for name,record in records.items()}
     ready = len(states)==len(TARGETS) and all(
@@ -30,10 +30,16 @@ def navigation_snapshot(records, now, *, fresh_safety=False):
     inactive = [name for name,p in states.items() if p.get('id') != 3]
     missing = [name for name in TARGETS if name not in states]
     stale = [name for name,p in states.items() if not 0 <= now-p.get('at',-1e6) <= 3.]
-    grace = (fresh_safety and not inactive and not missing and stale == ['map_server']
+    map_grace = (fresh_safety and not inactive and not missing and stale == ['map_server']
              and 3. < states['map_server']['age_sec'] <= 4.5)
+    active_grace = (fresh_safety and action_healthy and not inactive and not missing
+        and 1<=len(stale)<=2
+        and set(stale)<={'controller_server','collision_monitor','planner_server'}
+        and all(3.<states[name]['age_sec']<=4. for name in stale))
+    grace=map_grace or active_grace
     ready = ready or grace
-    reason = ('late_map_server_response' if grace else 'lifecycle_inactive' if inactive else 'awaiting_responses' if missing
+    reason = ('late_active_response' if active_grace else 'late_map_server_response' if map_grace
+              else 'lifecycle_inactive' if inactive else 'awaiting_responses' if missing
               else 'response_stale' if stale else 'ready')
     return dict(state='ready' if ready else 'unavailable', nodes=states, reason=reason,
                 inactive_nodes=inactive, missing_nodes=missing, stale_nodes=stale,
@@ -200,7 +206,8 @@ class NavigationHealth(Node):
                 service_ready=self.manage.service_is_ready(),call=self._manage)
         if now-self.last_publish>=1.:
             self.last_publish=now
-            payload=navigation_snapshot(self.records,now,fresh_safety=self._fresh_safety(now))
+            payload=navigation_snapshot(self.records,now,fresh_safety=self._fresh_safety(now),
+                                        action_healthy=self.action.state=='healthy')
             payload['sample_ros_stamp_ns']=self.get_clock().now().nanoseconds
             payload['diagnostic_only']=True
             payload['action']=self.action.snapshot()

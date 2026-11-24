@@ -44,3 +44,14 @@ def test_map_server_late_reply_has_bounded_independently_verified_grace():
     records['map_server']['id']=3
     records['amcl']['at']=100.
     assert navigation_snapshot(records,103.1,fresh_safety=True)['state']=='unavailable'
+
+
+def test_recorded_controller_collision_reply_delay_requires_independent_safety_and_healthy_action():
+    records={n:dict(id=3,at=103.) for n in TARGETS}
+    for n in ('controller_server','collision_monitor'):records[n]['at']=100.
+    assert navigation_snapshot(records,103.01)['state']=='unavailable'
+    assert navigation_snapshot(records,103.01,fresh_safety=True)['state']=='unavailable'
+    assert navigation_snapshot(records,103.01,fresh_safety=True,action_healthy=True)['state']=='ready'
+    assert navigation_snapshot(records,104.01,fresh_safety=True,action_healthy=True)['state']=='unavailable'
+    records['amcl']['at']=100.
+    assert navigation_snapshot(records,103.1,fresh_safety=True,action_healthy=True)['state']=='unavailable'

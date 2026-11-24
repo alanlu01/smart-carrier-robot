@@ -70,17 +70,48 @@ struct RouteGrid
       if (cancel()) {return false;}
       const auto a=path[i-1],b=path[i];
       const double length=distance(a,b);
-      if (length<1e-7) {continue;}
-      const double yaw=std::atan2(b.y-a.y,b.x-a.x);
+      // Each destination encodes the heading of that translation. A duplicate
+      // endpoint is an explicit stopped rotation, including the final yaw.
+      const double yaw=b.yaw;
       blocked={a.x,a.y,previous};
       if (!turnClear(blocked,yaw)) {return false;}
-      // Segment-aligned rectangle is the EXACT convex body translation sweep.
       blocked={(a.x+b.x)/2.,(a.y+b.y)/2.,yaw};
-      if (!boxClear(blocked,.25+length/2.,.19)) {return false;}
+      if (length>=1e-7 && !translationClear(a,b,yaw,cancel)) {return false;}
       previous=yaw;
     }
     blocked={path.back().x,path.back().y,previous};
     return turnClear(blocked,path.back().yaw);
+  }
+  bool translationClear(RoutePose a,RoutePose b,double heading,
+    const std::function<bool()> & cancel=[] {return false;}) const
+  {
+    if (!boxClear({a.x,a.y,heading}) || !boxClear({b.x,b.y,heading})) {return false;}
+    const double dx=b.x-a.x,dy=b.y-a.y,c=std::cos(heading),s=std::sin(heading);
+    const RoutePose mid{(a.x+b.x)/2.,(a.y+b.y)/2.,heading};
+    const double ex=.25*std::abs(c)+.19*std::abs(s)+std::abs(dx)/2.;
+    const double ey=.25*std::abs(s)+.19*std::abs(c)+std::abs(dy)/2.;
+    int lx,ly,hx,hy;
+    if (!cell(mid.x-ex-1e-9,mid.y-ey-1e-9,lx,ly) ||
+      !cell(mid.x+ex+1e-9,mid.y+ey+1e-9,hx,hy)) {return false;}
+    // SAT of the exact rectangle+translation convex sweep against cell squares.
+    // Include its oblique edge; a diagonal bounding rectangle is too restrictive.
+    const double axes[5][2]={{1.,0.},{0.,1.},{c,s},{-s,c},{-dy,dx}};
+    for (int row=ly;row<=hy;++row) {
+      if (cancel()) {return false;}
+      for (int col=lx;col<=hx;++col) {
+        if (costs[row*width+col]<254) {continue;}
+        const double px=x+(col+.5)*resolution-mid.x,py=y+(row+.5)*resolution-mid.y;
+        bool overlaps=true;
+        for (const auto & axis:axes) {
+          const double nx=axis[0],ny=axis[1];
+          const double radius=.25*std::abs(nx*c+ny*s)+.19*std::abs(-nx*s+ny*c)+
+            std::abs(nx*dx+ny*dy)/2.+resolution/2.*(std::abs(nx)+std::abs(ny));
+          if (std::abs(nx*px+ny*py)>radius+1e-12) {overlaps=false;break;}
+        }
+        if (overlaps) {return false;}
+      }
+    }
+    return true;
   }
 };
 
@@ -94,6 +125,7 @@ public:
   bool has_goal=false,retained=false;
   double best_remaining=0.,last_progress=0.,last_now=0.;
   unsigned generation=0,repairs=0,stalls=0;
+  const char * heading_policy="tangent";
 
   void reset() {cached.clear();avoid.clear();has_goal=false;}
   static double length(const std::vector<RoutePose> & path)
@@ -127,6 +159,9 @@ public:
     avoid.erase(std::remove_if(avoid.begin(),avoid.end(),[now](const auto & a) {
       return now>=a.until;}),avoid.end());
     RoutePose blocked{};
+    const auto began=std::chrono::steady_clock::now();
+    auto interrupted=[&] {return cancel() || std::chrono::steady_clock::now()-began>
+      std::chrono::milliseconds(250);};
     if (!cached.empty()) {
       auto nearest=std::min_element(cached.begin(),cached.end(),[&](auto a,auto b) {
         return distance(start,a)<distance(start,b);});
@@ -134,7 +169,7 @@ public:
         std::vector<RoutePose> tail{start};
         if (nearest+1!=cached.end()) {tail.insert(tail.end(),nearest+1,cached.end());}
         else {tail.push_back(target);}
-        if (grid.pathClear(tail,blocked,cancel)) {
+        if (grid.pathClear(tail,blocked,interrupted) && !interrupted()) {
           const double remaining=length(tail);
           if (remaining<=best_remaining-.15) {best_remaining=remaining;last_progress=now;}
           if (now-last_progress<25.) {cached=tail;retained=true;return cached;}
@@ -152,9 +187,17 @@ public:
       }
       cached.clear();
     }
-    const auto began=std::chrono::steady_clock::now();
-    auto interrupted=[&] {return cancel() || std::chrono::steady_clock::now()-began>
-      std::chrono::milliseconds(250);};
+    // Avoid grid-centre zigzags for centimetre terminal moves. The exact same
+    // swept footprint and stopped terminal turn are still mandatory.
+    if (distance(start,target)<=.10 && !interrupted()) {
+      for (double heading:{start.yaw,target.yaw}) {
+        std::vector<RoutePose> direct{start,{target.x,target.y,heading},target};
+        if (grid.pathClear(direct,blocked,interrupted) && !interrupted()) {
+          cached=direct;best_remaining=length(cached);last_progress=now;++generation;
+          heading_policy="short_holonomic";return cached;
+        }
+      }
+    }
     for (unsigned attempt=0;attempt<8 && !interrupted();++attempt) {
       auto costs=grid.costs;
       for (const auto & item:avoid) {
@@ -182,12 +225,38 @@ public:
       for (int i=count-1;i>=0;--i) {
         RoutePose p{grid.x+(native.getPathX()[i]+.5)*grid.resolution,
           grid.y+(native.getPathY()[i]+.5)*grid.resolution,0.};
-        if (distance(candidate.back(),p)>1e-5) {candidate.push_back(p);}
+        if (distance(start,p)>.075 && distance(target,p)>.075 &&
+          distance(candidate.back(),p)>1e-5) {candidate.push_back(p);}
       }
       candidate.push_back(target);
-      if (grid.pathClear(candidate,blocked,interrupted) && !interrupted()) {
-        cached=candidate;best_remaining=length(cached);last_progress=now;++generation;return cached;
+      for (size_t i=1;i<candidate.size();++i) {
+        candidate[i].yaw=std::atan2(candidate[i].y-candidate[i-1].y,
+          candidate[i].x-candidate[i-1].x);
       }
+      candidate.push_back(target);
+      auto accepted=[&](const std::vector<RoutePose> & route,const char * policy) {
+        if (!grid.pathClear(route,blocked,interrupted) || interrupted()) {return false;}
+        cached=route;best_remaining=length(cached);last_progress=now;++generation;
+        heading_policy=policy;return true;
+      };
+      if (accepted(candidate,"tangent")) {return cached;}
+      const auto tangent_blocked=blocked;
+      // Only the final 1.5 m may hold a heading. Ordinary long-route driving
+      // retains its tangent policy; this does not change MPPI lateral limits.
+      for (bool hold_target:{true,false}) {
+        auto alternate=candidate;double remaining=0.;size_t first=alternate.size()-1;
+        for (size_t i=alternate.size()-1;i>0;--i) {
+          remaining+=distance(alternate[i-1],alternate[i]);
+          if (remaining>1.5) {break;}first=i;
+        }
+        if (first>=alternate.size()-1) {continue;}
+        const double heading=hold_target ? target.yaw : alternate[first-1].yaw;
+        for (size_t i=first;i+1<alternate.size();++i) {alternate[i].yaw=heading;}
+        if (accepted(alternate,hold_target ? "goal_heading_tail" : "arrival_heading_tail")) {
+          return cached;
+        }
+      }
+      blocked=tangent_blocked;
       if (interrupted() || distance(blocked,start)<.30 || distance(blocked,target)<.30) {break;}
       remember(blocked,now);++repairs;
     }

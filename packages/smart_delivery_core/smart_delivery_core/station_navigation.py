@@ -167,6 +167,10 @@ class StationNavigation:
         import json
         self.publisher.publish(String(data=json.dumps(dict(phase=phase,reason=reason,
             target=getattr(self,'target',None),stage=self.stage,
+            entry_target=getattr(self,'entry_target',None),
+            entry_candidate=getattr(self,'entry_candidate',None),
+            entry_adjustments=getattr(self,'entry_adjustments',0),
+            clearance_query=getattr(self,'clearance_query',{}),
             target_name=getattr(self,'target_label',''),
             goals_submitted=getattr(self,'goals_submitted',0),
             preflight_timeout=getattr(self,'preflight_timeout',False),
@@ -257,6 +261,10 @@ class StationNavigation:
         self.motion_odom_anchor = None
         self.motion_check = {}
         self.clearance_retries = 0
+        self.entry_target=self.entry_candidate=None
+        self.entry_adjustments=self.entry_candidate_samples=0
+        self.entry_candidate_stamp=self.entry_candidate_since=None
+        self.clearance_query={}
         self.clearance_pending = None
         self.translation_resume_deadline = None
         self.translation_budget = None
@@ -353,10 +361,17 @@ class StationNavigation:
         self.clearance_grid_stamp = self.grid_stamp
         self.clearance_resume = resume
         self.clearance_scope,self.clearance_detail=scope,reason
-        point=self.target if scope.startswith('destination') else self._pose()
-        self.clearance_blocker=(self._translation_blocker(point,self.clearance_pending[1])
+        point=self._pose()
+        endpoint=(getattr(self,'entry_candidate',None) or getattr(self,'entry_target',None) or self.target)
+        self.clearance_query=dict(start=point,end=endpoint,costmap_stamp_ns=self.grid_stamp)
+        self.clearance_blocker=(self._translation_blocker(point,endpoint)
+            if scope=='destination_final' and point else
+            self._translation_blocker(point,self.clearance_pending[1])
             if scope=='local_translation' and point and self.clearance_pending else
+            self.grid.blocker(self.target) if scope.startswith('destination') else
             self.grid.blocker(point,rotation=True) if point and hasattr(self.grid,'blocker') else {}) or {}
+        if scope=='local_translation' and self.clearance_pending:
+            self.clearance_query['end']=self.clearance_pending[1]
         self.clearance_kind=self._classify_blocker(self.clearance_blocker)
         kind_label={'static':'靜態障礙','unknown':'未知區域','off_map':'地圖邊界',
                     'dynamic_costmap':'即時障礙','static_map_unavailable':'缺少靜態地圖'}.get(self.clearance_kind,'通道受阻')
@@ -447,6 +462,37 @@ class StationNavigation:
         self.mode = 'normal' if ordinary else 'station'
         self.mode_reason = 'verified_normal_clearance' if ordinary else 'restricted_station_turn'
 
+    def _entry_endpoint(self, pose, *, prefer_alternative=False):
+        """Choose once while stopped, with two fresh snapshots before a shift."""
+        endpoint=self.entry_target or self.target
+        clear=self.grid.segment(pose,endpoint)
+        if self.entry_adjustments or (clear and not prefer_alternative):
+            return endpoint if clear else None
+        candidate=self.entry_candidate
+        if (candidate is None or not self.grid.segment(pose,candidate)
+                or (self.static_grid is not None and not self.static_grid.segment(pose,candidate))):
+            candidate=self.grid.docking_candidate(pose,self.target,self.static_grid)
+            self.entry_candidate_since=self.entry_candidate_stamp=None
+            self.entry_candidate_samples=0
+        if candidate is None:
+            self.entry_candidate=None
+            return None
+        if math.hypot(candidate[0]-endpoint[0],candidate[1]-endpoint[1])<.001:
+            self.entry_candidate=None
+            return endpoint if clear else None
+        self.entry_candidate=candidate
+        now=time.monotonic()
+        if self.entry_candidate_since is None:self.entry_candidate_since=now
+        if self.entry_candidate_stamp is None or self.grid_stamp>self.entry_candidate_stamp:
+            self.entry_candidate_stamp=self.grid_stamp
+            self.entry_candidate_samples+=1
+        if self.entry_candidate_samples<2 or now-self.entry_candidate_since<.15:return None
+        self.entry_target=candidate;self.entry_candidate=None;self.entry_adjustments+=1
+        self.clearance_clear_samples=self.entry_candidate_samples
+        self.clearance_clear_stamp=self.entry_candidate_stamp
+        self.clearance_clear_since=self.entry_candidate_since
+        return candidate
+
     def _prepare(self, pose):
         self._choose_mode(pose)
         distance = math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])
@@ -504,19 +550,26 @@ class StationNavigation:
             if length>.75:
                 self._finish(TaskResult.FAILED,'failed','準備點偏離過遠');return
             self.remote_preparation=False
-            if not self.grid.segment(pose,self.target):
-                self._wait_clearance('目的地末段通道受阻','entry','destination_final');return
-            self._translation(pose,self.target,'entry','finish')
+            endpoint=self._entry_endpoint(pose)
+            if endpoint is None:
+                reason='確認進站安全落點' if self.entry_candidate else '目的地末段通道受阻'
+                self._wait_clearance(reason,'entry','destination_final');return
+            self._translation(pose,endpoint,'entry','finish')
         elif phase=='final_translation':
             if (math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.10
                     and abs(angle_error(pose[2],self.target[2]))<=.10):
                 self._advance_finish()
-            else:self._translation(pose,self.target,'entry','finish')
+            else:self._translation(pose,self.entry_target or self.target,'entry','finish')
         elif phase=='final_align':self._align(pose,'final_translation')
         elif phase=='translation_clearance':
             self._wait_clearance('等待平移通道恢復','translation_resume','local_translation')
         elif phase=='translation_resume':
             moving,end,resume=self.clearance_pending
+            if moving=='entry':
+                alternate=self._entry_endpoint(pose,prefer_alternative=True)
+                if alternate is None:
+                    self._wait_clearance('確認進站安全落點','translation_resume','local_translation');return
+                end=alternate;self.clearance_pending=(moving,end,resume)
             if moving=='departure' and self.departure_redirects<1:
                 alternate=self.grid.departure(pose,self.target)
                 if (alternate is not None and math.hypot(alternate[0]-end[0],alternate[1]-end[1])>.10
@@ -549,6 +602,10 @@ class StationNavigation:
             self._advance_finish()
 
     def _advance_finish(self):
+        pose=self._pose()
+        if self.park and (pose is None or math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])>.10
+                         or abs(angle_error(pose[2],self.target[2]))>.10):
+            self._finish(TaskResult.FAILED,'failed','未通過原始停靠點確認');return
         if self.park:self.parked=self.target
         self._finish(TaskResult.SUCCEEDED,'arrived' if self.park else 'reached')
 
@@ -859,6 +916,8 @@ class StationNavigation:
             if pose is None or not data_ok or not stopped:
                 self.clearance_clear_since=self.clearance_clear_stamp=None
                 self.clearance_clear_samples=0
+                self.entry_candidate_since=self.entry_candidate_stamp=None
+                self.entry_candidate_samples=0
             if (pose is not None and data_ok and stopped
                     and self.grid_stamp>self.clearance_grid_stamp):
                 self.clearance_grid_stamp=self.grid_stamp
@@ -869,6 +928,9 @@ class StationNavigation:
         position_ok = self.after_stop=='translation_clearance' or self.stage is None or (pose is not None
             and math.hypot(pose[0]-self.stage[0],pose[1]-self.stage[1])<=(.20 if intermediate else .10)
             and (intermediate or abs(angle_error(pose[2],self.stage[2]))<=.10))
+        if position_ok and self.after_stop=='finish' and self.park:
+            position_ok=(pose is not None and math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.10
+                         and abs(angle_error(pose[2],self.target[2]))<=.10)
         if (not position_ok and self.after_stop=='finish' and self.park and self.final_corrections<1
                 and pose is not None and data_ok and stopped
                 and math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.20):
@@ -877,7 +939,7 @@ class StationNavigation:
                 self.final_corrections+=1
                 if abs(angle_error(pose[2],self.target[2]))>.10:
                     self._align(pose,'final_translation')
-                else:self._translation(pose,self.target,'entry','finish')
+                else:self._translation(pose,self.entry_target or self.target,'entry','finish')
             return not self.running
         self._waiting(pose,data_ok,stopped,position_ok=position_ok)
         if pose is None or not data_ok or not stopped or not position_ok:

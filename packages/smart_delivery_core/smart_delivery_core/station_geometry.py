@@ -229,6 +229,17 @@ class StationGrid:
             extra=pad
         return extra
 
+    def docking_candidate(self, start, target, static_grid=None):
+        """At most 5 cm from the requested pose; retain the complete 3 cm pad."""
+        candidates=[]
+        for dx,dy in ((0.,0.),(-.05,0.),(.05,0.),(0.,-.05),(0.,.05)):
+            point=(target[0]+dx,target[1]+dy,target[2])
+            if (self.segment(start,point)
+                    and (static_grid is None or static_grid.segment(start,point))):
+                candidates.append(point)
+        return min(candidates,key=lambda p:(-self.extra_clearance(p),
+            math.hypot(p[0]-target[0],p[1]-target[1]))) if candidates else None
+
     def staging(self, target, current, *, final_clear=True, static_grid=None):
         """Try all four body directions; never invent permanent site coordinates."""
         # Remote preparation may defer dynamic FINAL clearance, never the

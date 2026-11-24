@@ -62,7 +62,7 @@ public:
     for (size_t i=0;i<route.size();++i) {
       geometry_msgs::msg::PoseStamped p;p.header=result.header;
       p.pose.position.x=route[i].x;p.pose.position.y=route[i].y;
-      const double yaw=i+1<route.size() ? std::atan2(route[i+1].y-route[i].y,route[i+1].x-route[i].x) : b.yaw;
+      const double yaw=route[i].yaw;
       p.pose.orientation.z=std::sin(yaw/2.);p.pose.orientation.w=std::cos(yaw/2.);
       result.poses.push_back(p);
     }
@@ -77,6 +77,7 @@ private:
     msg.data=nlohmann::json{{"planner","guarded_navfn_dijkstra"},{"valid",valid},
       {"retained",engine_.retained},{"generation",engine_.generation},
       {"repair_attempts",engine_.repairs},{"avoid_regions",engine_.avoid.size()},
+      {"heading_policy",engine_.heading_policy},
       {"stalled_routes",engine_.stalls},{"remaining_m",remaining},
       {"no_progress_sec",std::max(0.,now-engine_.last_progress)},
       {"goal_stamp_ns",rclcpp::Time(goal.header.stamp).nanoseconds()}}.dump();

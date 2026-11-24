@@ -56,6 +56,30 @@ int main()
   try {GuardedNavfn p;p.plan(g,start,goal,100.,[] {return true;});}
   catch (const std::runtime_error &) {cancelled=true;}
   assert(cancelled);
+  // A mecanum can translate along a narrow lane without first rotating 90 deg.
+  auto lane=room(false);
+  for (int y=1;y<lane.height-1;++y) {
+    for (double x:{-.325,.325}) {
+      int col,row;assert(lane.cell(x,lane.y+(y+.5)*lane.resolution,col,row));
+      lane.costs[row*lane.width+col]=254;
+    }
+  }
+  RoutePose lateral_start{0.,-1.,0.},lateral_goal{0.,0.,0.};
+  assert(!lane.turnClear(lateral_start,1.5707963267948966));
+  GuardedNavfn lateral;
+  auto sideways=lateral.plan(lane,lateral_start,lateral_goal,100.);
+  assert(lane.pathClear(sideways,blocked));
+  assert(std::string(lateral.heading_policy)=="goal_heading_tail");
+  for (auto p:sideways) {assert(std::abs(p.yaw)<1e-8);}
+  GuardedNavfn tiny;
+  auto terminal=tiny.plan(lane,{0.,-.02,0.},{.005,0.,0.},100.);
+  assert(std::string(tiny.heading_policy)=="short_holonomic");
+  assert(lane.pathClear(terminal,blocked));
+  // A zero-distance turn must still reject the real swept-body collision.
+  assert(!lane.pathClear({lateral_goal,{0.,0.,1.5707963267948966}},blocked));
+  // A lateral option never authorizes unknown cells or clipped body corners.
+  int bx,by;assert(lane.cell(.0,-.5,bx,by));lane.costs[by*lane.width+bx]=255;
+  assert(!lane.translationClear(lateral_start,lateral_goal,0.));
   std::cout<<"guarded_navfn: narrow-route rejection, detour retention, obstacle invalidation, "
     "net-progress and cancellation passed\n";
 }

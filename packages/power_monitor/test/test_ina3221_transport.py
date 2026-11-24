@@ -180,3 +180,24 @@ def test_verified_main_stream_is_absent_by_default_and_reports_invalid_sensor_ho
     node.timer_callback()
     payload=json.loads(verified[-1].data)
     assert payload['sensor_ok'] is False and payload['voltage'] is None
+
+
+def test_short_i2c_outage_reconfirms_slots_in_three_fresh_cycles(monkeypatch):
+    from power_monitor import ina3221_node
+    clock=[100.]
+    monkeypatch.setattr(ina3221_node.time,'monotonic',lambda:clock[0])
+    node,bus=sensor(monkeypatch)
+    node.state_trackers=[SlotStateTracker(confirm_samples=3) for _ in range(3)]
+    assert node._probe_sensor(force=True)
+    for _ in range(3):node.timer_callback();clock[0]+=.5
+    assert json.loads(node.messages[-1].data)['ch1']['status']=='full'
+    bus.short_read=True;node.timer_callback();clock[0]+=.5
+    assert json.loads(node.messages[-1].data)['ch1']['status']=='unknown'
+    bus.short_read=False
+    for index in range(3):
+        node.timer_callback();clock[0]+=.5
+        payload=json.loads(node.messages[-1].data)
+        assert payload['ch1']['status']==('full' if index==2 else 'unknown')
+    assert payload['slot_supply']['healthy']
+    assert payload['i2c_transport']['last_verified_address']==0x40
+    assert payload['i2c_transport']['read_cycle_failures']>=1

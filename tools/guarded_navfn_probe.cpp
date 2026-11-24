@@ -21,7 +21,8 @@ int main(int argc,char ** argv)
     RoutePose blocked{};if (!g.pathClear(route,blocked)) {return 5;}
     auto again=p.plan(g,start,goal,101.);
     std::cout<<"{\"passed\":true,\"length_m\":"<<p.length(route)<<",\"retained\":"
-      <<(p.retained?"true":"false")<<",\"milliseconds\":"<<duration<<",\"points\":[";
+      <<(p.retained?"true":"false")<<",\"heading_policy\":\""<<p.heading_policy
+      <<"\",\"milliseconds\":"<<duration<<",\"points\":[";
     for (size_t i=0;i<route.size();++i) {
       if (i) {std::cout<<",";}std::cout<<"["<<route[i].x<<","<<route[i].y<<"]";
     }

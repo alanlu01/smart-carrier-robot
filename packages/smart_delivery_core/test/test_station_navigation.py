@@ -368,3 +368,44 @@ def test_wait_diagnostics_explain_bad_grid_frame_and_are_rate_limited(motion):
     assert len(node.messages)==count+1 and len(node.logs)==1
     clock[0]+=5.;manager.isTaskComplete()
     assert len(node.logs)==2
+
+
+def test_docking_candidates_keep_full_margin_and_original_five_cm_bound():
+    g=single_cell_at(1.27,.07)
+    start,target=(.6,0.,0.),(1.,0.,0.)
+    assert not g.segment(start,target)
+    candidate=g.docking_candidate(start,target)
+    assert candidate is not None and g.segment(start,candidate)
+    assert math.hypot(candidate[0]-target[0],candidate[1]-target[1])<=.0500001
+    assert candidate[2]==target[2]
+    obstacle(g,1.,0.,-1)
+    assert g.docking_candidate(start,target) is None
+
+
+def test_shifted_entry_needs_two_fresh_grids_and_keeps_requested_arrival_point(motion):
+    manager,node,clock,pose,_,_=motion
+    manager.grid=single_cell_at(1.27,.07)
+    pose[0]=(.6,0.,0.);manager.after_stop='entry';manager.mode='station'
+    manager.grid_stamp=1
+    manager._advance(pose[0])
+    assert manager.phase=='waiting_clearance' and not node.sent
+    clock[0]+=.5;manager._advance(pose[0])
+    assert not node.sent  # Same map does not reconfirm a candidate.
+    manager.grid_stamp=2;clock[0]+=.5;manager._advance(pose[0])
+    assert manager.phase=='entry' and manager.entry_adjustments==1
+    assert manager.target==(1.,0.,0.) and node.sent[-1][0]!=manager.target
+    # Inside shifted-goal tolerance but outside ORIGINAL tolerance is not done.
+    pose[0]=(.89,0.,0.);node.complete=True
+    manager.isTaskComplete()
+    assert manager.getResult()!=TaskResult.SUCCEEDED
+
+
+def test_destination_diagnostic_describes_actual_remaining_sweep(motion):
+    manager,node,clock,pose,_,_=motion
+    manager.grid=single_cell_at(1.1,.0);pose[0]=(.6,0.,0.)
+    manager._wait_clearance('blocked','entry','destination_final')
+    report=node.messages[-1]
+    assert report['clearance_query']['start']==list(pose[0])
+    assert report['clearance_query']['end']==list(manager.target)
+    assert report['clearance_blocker']['reason']=='occupied_or_unknown_sweep'
+    assert report['clearance_blocker']['layer']=='body'

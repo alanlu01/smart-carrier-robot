@@ -1,6 +1,6 @@
 """Covariance spikes retain goals only while stopped and evidence stays fresh."""
 import pytest
-from smart_delivery_core.covariance_probe import CovarianceProbe
+from smart_delivery_core.covariance_probe import CovarianceProbe, StoppedConfidenceRecovery
 
 
 def observe(p, now, stamp, *, healthy=False, critical=False, ok=True, x=0., ox=0.):
@@ -44,3 +44,32 @@ def test_recorded_repeated_outliers_get_two_fresh_healthy_samples_within_three_s
     observe(p,104.5,5,healthy=True,x=.4,ox=.4)
     assert not p.stopped
     assert p.MAX_WAIT==3.
+
+
+def test_bad_map_opens_only_a_zero_motion_probe_and_cannot_verify_a_position():
+    p=CovarianceProbe();observe(p,100.,1,healthy=True)
+    p.observe(100.1,2,(0.,0.,0.),(0.,0.,0.),healthy=False,critical=True,evidence_ok=True,map_ok=False)
+    assert p.active and p.stopped and p.reason=='waiting_current_map'
+    for at,stamp in ((100.5,3),(101.,4)):
+        p.observe(at,stamp,(0.,0.,0.),(0.,0.,0.),healthy=True,critical=False,evidence_ok=True,map_ok=False)
+    assert p.stopped and p.healthy_samples==0
+    p.check_deadline(103.2,True)
+    assert p.failed and p.reason=='window_expired'
+
+
+def test_stopped_confidence_recovery_needs_distinct_map_and_amcl_sources():
+    h=StoppedConfidenceRecovery(((0.,0.,0.),(0.,0.,0.)),100.)
+    args=dict(sources_ok=True,stopped=True,qualified=True)
+    assert not h.observe(101.,1,1,(.02,0.,0.),(.02,0.,0.),**args)
+    assert not h.observe(101.2,1,2,(.02,0.,0.),(.02,0.,0.),**args)
+    assert not h.observe(101.3,2,1,(.02,0.,0.),(.02,0.,0.),**args)
+    assert h.observe(102.,2,2,(.02,0.,0.),(.02,0.,0.),**args)
+
+
+@pytest.mark.parametrize('fault',['source','pose_jump','timeout','moving','poor_map'])
+def test_stopped_confidence_recovery_never_accepts_bad_or_moving_evidence(fault):
+    h=StoppedConfidenceRecovery(((0.,0.,0.),(0.,0.,0.)),100.)
+    for i in (1,2):
+        assert not h.observe(110. if fault=='timeout' else 100.+i,i,i,
+            (.3 if fault=='pose_jump' else 0.,0.,0.),(0.,0.,0.),
+            sources_ok=fault!='source',stopped=fault!='moving',qualified=fault!='poor_map')

@@ -73,7 +73,7 @@ from smart_delivery_core.localization_quality_history import LocalizationQuality
 from smart_delivery_core.delivery_console import localization_label, brief, reason_label
 from smart_delivery_core.global_pose_gate import ray_consistency
 from smart_delivery_core.recovery_scan_evidence import RecoveryScanEvidence
-from smart_delivery_core.covariance_probe import CovarianceProbe
+from smart_delivery_core.covariance_probe import CovarianceProbe, StoppedConfidenceRecovery
 from smart_delivery_core.pipeline_recheck import PipelineRecheck, TrustedPipelineReference
 from smart_delivery_core.settled_motion import can_arm_stationary_anchor, near_convergence, StationaryPoseGuard
 from smart_delivery_core.recovery_spin import RecoverySpin
@@ -800,7 +800,13 @@ class LocalizationManager(Node):
                 'motion_zero': self.state == 'LOCALIZED' and self.covariance_probe.stopped,
                 'elapsed_sec': max(0.,now-self.covariance_probe.started) if self.covariance_probe.active else 0.,
                 'healthy_samples': self.covariance_probe.healthy_samples,
+                'reason': self.covariance_probe.reason,
             },
+            'short_confidence_recovery': (dict(
+                reason=self.short_confidence_recovery.reason,
+                samples=self.short_confidence_recovery.samples,
+                failed=self.short_confidence_recovery.failed)
+                if getattr(self,'short_confidence_recovery',None) else None),
             "global_attempts": self.global_attempts,
             'dispatch_allowed': self.ready and not self.stationary_map_guard.active and not self.mild_map_active,
             'stationary_map_observation': {
@@ -1097,6 +1103,7 @@ class LocalizationManager(Node):
         now = time.monotonic()
         seed_ns=getattr(self,'manual_seed_after_ns',0)
         stamp_ns=message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec
+        self.last_amcl_stamp_ns=stamp_ns
         if seed_ns and stamp_ns<seed_ns:return
         if seed_ns:self.manual_seed_after_ns=0
         self._record_receipt("amcl_pose", message, now)
@@ -1224,11 +1231,12 @@ class LocalizationManager(Node):
             if qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
 
-    def _covariance_evidence_ok(self, now):
+    def _covariance_evidence_ok(self, now, *, require_map=True):
         raw=getattr(self,'latest_map_score_raw',self.latest_map_score)
         return (not self._verification_data_blockers(now)
-                and raw is not None and math.isfinite(raw) and raw>=self.map_match_recovery_score
-                and self.latest_map_score is not None and self.latest_map_score >= .60
+                and raw is not None and math.isfinite(raw)
+                and (not require_map or (raw>=self.map_match_recovery_score
+                    and self.latest_map_score is not None and self.latest_map_score >= .60))
                 and 0 <= now-self.latest_map_score_at <= 1.5
                 and self.latest_map_sector_count >= self.map_match_min_sectors
                 and self.latest_map_near_fraction <= .60
@@ -1245,7 +1253,7 @@ class LocalizationManager(Node):
         odom = None
         try:
             age = (self.get_clock().now().nanoseconds-stamp)/1e9
-            if stamp > 0 and -.1 <= age <= .30 and self._covariance_evidence_ok(now):
+            if stamp > 0 and -.1 <= age <= .30 and self._covariance_evidence_ok(now,require_map=False):
                 tf = self.tf_buffer.lookup_transform(
                     'odom', 'base_footprint', Time(nanoseconds=stamp)).transform
                 q = tf.rotation
@@ -1256,11 +1264,33 @@ class LocalizationManager(Node):
         except (TransformException, AttributeError, TypeError, ValueError):
             pass
         probe.observe(now, stamp, pose, odom, healthy=quality.healthy,
-                      critical=quality.critical, evidence_ok=odom is not None)
+                      critical=quality.critical, evidence_ok=odom is not None,
+                      map_ok=self._covariance_evidence_ok(now))
         if probe.stopped and hasattr(self, 'speed_limit_publisher'):
             message = Float32()
             message.data = 0.
             self.speed_limit_publisher.publish(message)
+
+    def _short_confidence_recovered(self, now):
+        verifier=getattr(self,'short_confidence_recovery',None)
+        if verifier is None:return False
+        stamp=getattr(self,'last_amcl_stamp_ns',0)
+        odom=None
+        try:
+            age=(self.get_clock().now().nanoseconds-stamp)/1e9
+            if stamp>0 and -.1<=age<=.30 and self._covariance_evidence_ok(now,require_map=False):
+                tr=self.tf_buffer.lookup_transform('odom','base_footprint',Time(nanoseconds=stamp)).transform
+                odom=(tr.translation.x,tr.translation.y,quaternion_to_yaw(tr.rotation))
+        except (TransformException,AttributeError,ValueError,TypeError):pass
+        stop=getattr(self,'recovery_stop',None)
+        stopped=(not self.commanded_motion and not self.odom_motion
+                 and stop is not None and stop.ready(now))
+        qualified=(self.latest_quality is not None and self.latest_quality.healthy
+            and self._map_match_has_recovered(now)
+            and self.latest_map_score>=.45
+            and getattr(self,'latest_map_score_raw',0.)>=.45)
+        return verifier.observe(now,stamp,int(self.latest_map_score_at*1e9),self.latest_pose,odom,
+            sources_ok=odom is not None,stopped=stopped,qualified=qualified)
 
     def _external_initial_pose_callback(self, _message):
         if getattr(self, 'managed_spin', None) is not None:
@@ -1567,7 +1597,7 @@ class LocalizationManager(Node):
         if probe and self.state != 'LOCALIZED':
             self.covariance_probe = CovarianceProbe()
         elif probe and probe.active:
-            probe.check_deadline(now, self._covariance_evidence_ok(now))
+            probe.check_deadline(now, self._covariance_evidence_ok(now,require_map=False))
             if probe.active:
                 self._request_nomotion_if_due(now)
         if self.lateral_phase is not None:
@@ -1763,6 +1793,9 @@ class LocalizationManager(Node):
             if (self.latest_quality.critical or (probe and probe.failed) or stationary_mismatch
                     or (map_match_bad and suspicion_required)):
                 if self.suspect_since is None:
+                    self.short_confidence_recovery=(StoppedConfidenceRecovery(probe.anchor,now)
+                        if probe and probe.failed and probe.reason=='window_expired'
+                        and probe.anchor is not None and not stationary_mismatch else None)
                     self.suspect_since = now
                     self.stable_samples = 0
                     self.last_stable_map_score_at = self.latest_map_score_at
@@ -1846,7 +1879,9 @@ class LocalizationManager(Node):
                     self.stable_samples,
                 )
             )
-            if qualified and self.stable_samples >= self.stable_samples_required:
+            if qualified and self._short_confidence_recovered(now):
+                self._mark_localized('短暫定位波動已完成停車交叉驗證')
+            elif qualified and self.stable_samples >= self.stable_samples_required:
                 self._mark_localized()
             elif self.suspect_since is not None:
                 suspect_age = self.observation_clock.elapsed
@@ -2072,6 +2107,7 @@ class LocalizationManager(Node):
         self.pipeline_recheck = None
         self.manual_intervention_kind = 'pose'
         self.suspect_since = None
+        self.short_confidence_recovery=None
         self.stationary_map_guard.reset()
         self.map_match_unknown_since = None
         self.recovery_step = None

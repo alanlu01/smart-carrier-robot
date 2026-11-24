@@ -285,7 +285,7 @@ class INA3221Node(Node):
                 for history in self.current_histories + self.voltage_histories:
                     history.clear()
                 message = (
-                    "已偵測 INA3221："
+                    "INA3221 識別碼符合，等待完整讀值："
                     f"bus={self.i2c_bus}, address=0x{address:02X}"
                 )
                 # rclpy caches severity per call site. Do not dynamically call
@@ -339,8 +339,13 @@ class INA3221Node(Node):
             current_sample = self.read_raw_current(shunt_register)
             voltage_sample = self.read_bus_voltage(bus_register)
             if current_sample is None or voltage_sample is None:
+                self.read_cycle_failures=getattr(self,'read_cycle_failures',0)+1
                 return None
             samples.append((current_sample, voltage_sample))
+        if getattr(self,'last_verified_i2c_address',None)!=self.i2c_address:
+            self.last_verified_i2c_address=self.i2c_address
+            self.get_logger().info(
+                f'✅ INA3221 完整讀值已確認：bus={self.i2c_bus}, address=0x{self.i2c_address:02X}')
         return samples
 
     def _retry_failed_cycle(self):
@@ -349,6 +354,7 @@ class INA3221Node(Node):
             return None
         samples = self._read_cycle()
         if samples is not None:
+            self.retry_recovered_cycles=getattr(self,'retry_recovered_cycles',0)+1
             now = time.monotonic()
             if now - self.last_i2c_recovery_log_at >= self.i2c_error_log_period:
                 self.get_logger().warning(
@@ -400,12 +406,14 @@ class INA3221Node(Node):
                 self.state_trackers[index].update(
                     current_average if sensor_ok else None,
                     voltage_average if sensor_ok else None,
-                    sensor_ok=sensor_ok and supply['healthy'],
+                    sensor_ok=sensor_ok and (supply['healthy'] or supply.get('recovery_mode')=='communication'),
                     now=time.monotonic(),
                 )
                 if enabled
                 else "disabled"
             )
+            if enabled and not supply['healthy']:
+                status='unknown'
             channels[f"ch{index + 1}"] = build_slot(
                 index + 1,
                 current_average if sensor_ok else None,
@@ -487,6 +495,11 @@ class INA3221Node(Node):
         payload["vehicle_battery"] = vehicle_battery
         supply['source'] = getattr(self, 'supply_source', 'charging_bus')
         payload['slot_supply'] = supply
+        payload['i2c_transport']=dict(bus=self.i2c_bus,address=self.i2c_address,
+            last_verified_address=getattr(self,'last_verified_i2c_address',None),
+            read_cycle_failures=getattr(self,'read_cycle_failures',0),
+            retry_recovered_cycles=getattr(self,'retry_recovered_cycles',0),
+            failure_cycles=self.i2c_failure_cycles,last_error=self.last_i2c_error)
         message.data = json.dumps(payload, ensure_ascii=False)
         self.publisher.publish(message)
 

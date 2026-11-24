@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from geometry_msgs.msg import TransformStamped,PoseWithCovarianceStamped
 from sensor_msgs.msg import LaserScan
 from test_localization_recovery import manager
+from smart_delivery_core.covariance_probe import StoppedConfidenceRecovery
 
 
 def test_real_callback_stops_immediately_preserves_goal_and_requires_fresh_recovery(manager):
@@ -40,3 +41,23 @@ def test_real_callback_stops_immediately_preserves_goal_and_requires_fresh_recov
     n.latest_scan_at=n.latest_raw_scan_at=n.latest_odom_at=n.latest_map_score_at=c.now
     n._tick_state_machine()
     assert n.covariance_probe.failed and n.state=='SUSPECT' and not n.ready
+
+
+def test_short_stopped_verifier_uses_source_aligned_odometry_and_original_anchor(manager):
+    n,c=manager
+    n.short_confidence_recovery=StoppedConfidenceRecovery(((2.,5.,0.),(0.,0.,0.)),100.)
+    n.recovery_stop=SimpleNamespace(ready=lambda _:True)
+    n._covariance_evidence_ok=lambda *a,**k:True
+    n._map_match_has_recovered=lambda _:True
+    n.latest_map_score_raw=.8
+    tf=TransformStamped();tf.transform.rotation.w=1.
+    n.tf_buffer=SimpleNamespace(lookup_transform=lambda *args:tf)
+    n.last_amcl_stamp_ns=100_000_000_000
+    assert not n._short_confidence_recovered(100.)
+    assert not n._short_confidence_recovered(100.)
+    c.now=101.;n.last_amcl_stamp_ns=101_000_000_000;n.latest_map_score_at=101.
+    assert n._short_confidence_recovered(101.)
+    n.short_confidence_recovery=StoppedConfidenceRecovery(((2.,5.,0.),(0.,0.,0.)),101.)
+    n.latest_pose=(3.,5.,0.)
+    assert not n._short_confidence_recovered(101.)
+    assert n.short_confidence_recovery.failed
