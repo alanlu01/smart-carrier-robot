@@ -169,7 +169,9 @@ public:
         std::vector<RoutePose> tail{start};
         if (nearest+1!=cached.end()) {tail.insert(tail.end(),nearest+1,cached.end());}
         else {tail.push_back(target);}
-        if (grid.pathClear(tail,blocked,interrupted) && !interrupted()) {
+        const bool cache_clear=grid.pathClear(tail,blocked,interrupted);
+        if (interrupted()) {throw std::runtime_error("Guarded route validation interrupted");}
+        if (cache_clear) {
           const double remaining=length(tail);
           if (remaining<=best_remaining-.15) {best_remaining=remaining;last_progress=now;}
           if (now-last_progress<25.) {cached=tail;retained=true;return cached;}

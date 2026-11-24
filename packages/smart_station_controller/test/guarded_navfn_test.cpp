@@ -41,6 +41,11 @@ int main()
   auto held=planner.plan(opened,start,goal,110.);
   assert(planner.retained && held.size()==route.size());
   assert(opened.pathClear(held,blocked));
+  const auto remembered=planner.avoid.size();
+  bool held_cancelled=false;
+  try {planner.plan(opened,start,goal,110.5,[] {return true;});}
+  catch (const std::runtime_error &) {held_cancelled=true;}
+  assert(held_cancelled && planner.avoid.size()==remembered && !planner.cached.empty());
   // A new REAL obstacle invalidates the cached route immediately.
   auto middle=held[held.size()/2];int cx,cy;assert(opened.cell(middle.x,middle.y,cx,cy));
   opened.costs[cy*opened.width+cx]=254;
