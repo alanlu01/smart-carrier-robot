@@ -819,6 +819,8 @@ class LocalizationManager(Node):
                 if self.recovery_step=='second_guard_wait' else None),
             'recovery_failure_checks': self._recovery_failure_checks(now, blockers),
             'stationary_update_requests': getattr(self,'nomotion_request_count',0),
+            'stationary_update_timeouts': getattr(self,'nomotion_request_timeouts',0),
+            'stationary_update_errors': getattr(self,'nomotion_request_errors',0),
         }
         if self.suspect_since is not None:
             payload["suspect_age_sec"] = max(0.0, now - self.suspect_since)
@@ -996,13 +998,13 @@ class LocalizationManager(Node):
                 "base_footprint",
                 self.latest_scan.header.frame_id,
                 Time(),
-                timeout=RclpyDuration(seconds=0.05),
+                timeout=RclpyDuration(seconds=0.),
             )
             self.tf_buffer.lookup_transform(
                 "odom",
                 "base_footprint",
                 Time(),
-                timeout=RclpyDuration(seconds=0.05),
+                timeout=RclpyDuration(seconds=0.),
             )
         except TransformException as exc:
             self.last_map_match_error = f"感測器 TF 尚未就緒：{exc}"
@@ -2240,9 +2242,21 @@ class LocalizationManager(Node):
     @timed_operation('amcl_stationary_request')
     def _request_nomotion_update(self):
         now = time.monotonic()
+        pending=getattr(self,'nomotion_future',None)
+        if pending is not None and pending.done():
+            try:pending.result()
+            except Exception:
+                self.nomotion_request_errors=getattr(self,'nomotion_request_errors',0)+1
+        if pending is not None and not pending.done():
+            if 0<=now-self.nomotion_future_at<2.:
+                return False
+            pending.cancel()
+            self.nomotion_client.remove_pending_request(pending)
+            self.nomotion_request_timeouts=getattr(self,'nomotion_request_timeouts',0)+1
         self.last_nomotion_request_at = now
         if self.nomotion_client.service_is_ready():
-            self.nomotion_client.call_async(Empty.Request())
+            self.nomotion_future=self.nomotion_client.call_async(Empty.Request())
+            self.nomotion_future_at=now
             self.nomotion_request_count = getattr(self,'nomotion_request_count',0)+1
             return True
         self.get_logger().warning("⏳ AMCL 靜止更新服務尚未就緒")
@@ -2433,6 +2447,10 @@ class LocalizationManager(Node):
                    and raw_score is not None and raw_score >= self.map_match_recovery_score
                    and self._map_match_has_recovered(now)
                    and self.latest_map_sector_count >= self.map_match_min_sectors and new_scan)
+        guard.input_diagnostics=dict(blockers=list(blockers),stopped=bool(stopped),
+            new_amcl=bool(new_amcl),new_scan=bool(new_scan),quality_healthy=bool(healthy),
+            map_age_sec=round(max(0.,now-self.latest_map_score_at),3),
+            navigation_reason=(getattr(self,'navigation_health',{}) or {}).get('reason'))
         before = guard.reason
         action = guard.observe(now, available=available, stopped=stopped, healthy=healthy,
             new_amcl=new_amcl, map_at=self.latest_map_score_at,

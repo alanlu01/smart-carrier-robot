@@ -111,9 +111,7 @@ def classify_power_status(
     return "low"
 
 
-def input_power_w(
-    current_a: float | None, voltage_v: float | None
-) -> float | None:
+def input_power_w(current_a: float | None, voltage_v: float | None) -> float | None:
     """Return non-negative INA3221 input power, or ``None`` if unavailable."""
     if current_a is None or voltage_v is None:
         return None
@@ -174,9 +172,7 @@ def build_vehicle_battery(
     valid = [
         float(value)
         for value in channel_voltages
-        if value is not None
-        and math.isfinite(float(value))
-        and float(value) > 0.0
+        if value is not None and math.isfinite(float(value)) and float(value) > 0.0
     ]
     voltage = None if not valid else float(statistics.median(valid))
     status = classify_vehicle_battery(
@@ -191,7 +187,8 @@ def build_vehicle_battery(
         "voltage": None if voltage is None else round(voltage, 3),
         "status": status,
         "sensor_ok": bool(valid),
-        "allow_new_tasks": status not in {
+        "allow_new_tasks": status
+        not in {
             "reserve",
             "critical",
             "cutoff",
@@ -223,6 +220,8 @@ class SlotStateTracker:
     _weak_last_at: float | None = None
     _weak_samples: int = 0
     presence_evidence: str = "unknown"
+    _had_presence: bool = False
+    _last_presence_at: float | None = None
 
     def __post_init__(self):
         if self.empty_current_max_a < 0:
@@ -237,21 +236,27 @@ class SlotStateTracker:
             raise ValueError("power hysteresis must not be negative")
         if self.power_hysteresis_w >= self.full_power_max_w:
             raise ValueError("power hysteresis must be below full threshold")
-        if 2.0 * self.power_hysteresis_w >= (
-            self.ready_power_max_w - self.full_power_max_w
-        ):
+        if 2.0 * self.power_hysteresis_w >= (self.ready_power_max_w - self.full_power_max_w):
             raise ValueError("power hysteresis is too large for configured thresholds")
         if self.confirm_samples < 1:
             raise ValueError("confirm_samples must be at least one")
-        if (self.weak_presence_min_a
-                and not self.empty_current_max_a < self.weak_presence_min_a
-                < self.present_current_min_a):
+        if (
+            self.weak_presence_min_a
+            and not self.empty_current_max_a < self.weak_presence_min_a < self.present_current_min_a
+        ):
             raise ValueError("weak presence threshold must lie inside the current gap")
-        if (not all(math.isfinite(v) for v in (
-                self.weak_presence_min_a, self.weak_presence_duration_sec,
-                self.weak_presence_max_gap_sec))
-                or self.weak_presence_duration_sec < 3.0
-                or not 0 < self.weak_presence_max_gap_sec <= 1.0):
+        if (
+            not all(
+                math.isfinite(v)
+                for v in (
+                    self.weak_presence_min_a,
+                    self.weak_presence_duration_sec,
+                    self.weak_presence_max_gap_sec,
+                )
+            )
+            or self.weak_presence_duration_sec < 3.0
+            or not 0 < self.weak_presence_max_gap_sec <= 1.0
+        ):
             raise ValueError("weak evidence needs a bounded sample gap and at least three seconds")
 
     def update(
@@ -262,8 +267,13 @@ class SlotStateTracker:
         sensor_ok: bool = True,
         now: float | None = None,
     ) -> str:
-        if (not sensor_ok or current_a is None or voltage_v is None
-                or not math.isfinite(float(current_a)) or not math.isfinite(float(voltage_v))):
+        if (
+            not sensor_ok
+            or current_a is None
+            or voltage_v is None
+            or not math.isfinite(float(current_a))
+            or not math.isfinite(float(voltage_v))
+        ):
             self.state = "unknown"
             self._reset_weak()
             self.presence_evidence = "unknown"
@@ -279,31 +289,80 @@ class SlotStateTracker:
             full_power_max_w=self.full_power_max_w,
             ready_power_max_w=self.ready_power_max_w,
         )
-        weak=False
-        eligible=(measured=="unknown" and self.weak_presence_min_a>0
-            and abs(float(current_a))>=self.weak_presence_min_a and float(voltage_v)>1.
-            and now is not None and math.isfinite(now))
+        weak = False
+        current = abs(float(current_a))
+        clock_ok = now is not None and math.isfinite(now)
+        prior_present = self.state in {"full", "ready", "low"}
+        contiguous = (
+            clock_ok
+            and self._last_presence_at is not None
+            and 0 <= now - self._last_presence_at <= self.weak_presence_max_gap_sec
+        )
+        # A proven occupied slot may fluctuate below the empty threshold.
+        # Keep its classification for at most two seconds, then report UNKNOWN,
+        # never turn overlapping full/empty currents into a false removal.
+        ambiguous = (
+            self.weak_presence_min_a > 0
+            and self._had_presence
+            and min(self.empty_current_max_a, 0.006) < current < self.weak_presence_min_a
+            and float(voltage_v) > 1.0
+            and clock_ok
+        )
+        if ambiguous:
+            self._reset_weak()
+            hold = (
+                prior_present
+                and self._last_presence_at is not None
+                and 0 <= now - self._last_presence_at <= 2.0
+            )
+            self.state = self.state if hold else "unknown"
+            self.presence_evidence = "bounded_low_current_hold" if hold else "ambiguous_low_current"
+            self._candidate, self._candidate_samples = None, 0
+            return self.state
+        eligible = (
+            measured == "unknown"
+            and self.weak_presence_min_a > 0
+            and abs(float(current_a)) >= self.weak_presence_min_a
+            and float(voltage_v) > 1.0
+            and now is not None
+            and math.isfinite(now)
+        )
         if eligible:
-            if self._weak_last_at is not None and now==self._weak_last_at:
+            if self._weak_last_at is not None and now == self._weak_last_at:
                 return self.state
-            if (self._weak_last_at is None
-                    or now-self._weak_last_at > self.weak_presence_max_gap_sec
-                    or now < self._weak_last_at):
-                self._weak_started_at=now
-                self._weak_samples=1
-            elif now>self._weak_last_at:
-                self._weak_samples+=1
-            self._weak_last_at=now
-            weak=(now-self._weak_started_at>=self.weak_presence_duration_sec
-                  and self._weak_samples>=self.confirm_samples)
+            if (
+                self._weak_last_at is None
+                or now - self._weak_last_at > self.weak_presence_max_gap_sec
+                or now < self._weak_last_at
+            ):
+                self._weak_started_at = now
+                self._weak_samples = 1
+            elif now > self._weak_last_at:
+                self._weak_samples += 1
+            self._weak_last_at = now
+            weak = (prior_present and contiguous) or (
+                now - self._weak_started_at >= self.weak_presence_duration_sec
+                and self._weak_samples >= self.confirm_samples
+            )
             if weak:
-                measured=classify_power_status(current_a,voltage_v,
+                measured = classify_power_status(
+                    current_a,
+                    voltage_v,
                     empty_current_max_a=self.empty_current_max_a,
                     present_current_min_a=self.weak_presence_min_a,
-                    full_power_max_w=self.full_power_max_w,ready_power_max_w=self.ready_power_max_w)
+                    full_power_max_w=self.full_power_max_w,
+                    ready_power_max_w=self.ready_power_max_w,
+                )
         else:
             self._reset_weak()
         if measured == "unknown":
+            if self.weak_presence_min_a > 0 and clock_ok:
+                # An empty slot is not trusted empty while fresh positive
+                # presence evidence is accumulating. Never create a rental.
+                self.state = "unknown"
+                self.presence_evidence = (
+                    "weak_presence_pending" if eligible else "ambiguous_current"
+                )
             self._candidate = None
             self._candidate_samples = 0
             return self.state
@@ -326,6 +385,10 @@ class SlotStateTracker:
             ):
                 measured = "low"
         if measured == self.state:
+            if measured in {"full", "ready", "low"}:
+                self._had_presence = True
+                if clock_ok:
+                    self._last_presence_at = now
             self._candidate = None
             self._candidate_samples = 0
             return self.state
@@ -337,25 +400,39 @@ class SlotStateTracker:
             self._candidate_samples += 1
         if self._candidate_samples >= self.confirm_samples:
             self.state = measured
+            self._had_presence = measured in {"full", "ready", "low"}
+            if self._had_presence and clock_ok:
+                self._last_presence_at = now
+            elif measured == "empty":
+                self._last_presence_at = None
             self.presence_evidence = (
-                "sustained_low_current" if weak else
-                "empty_current" if measured == "empty" else "present_current")
+                "sustained_low_current"
+                if weak
+                else "empty_current"
+                if measured == "empty"
+                else "present_current"
+            )
             self._candidate = None
             self._candidate_samples = 0
         return self.state
 
-
     def _reset_weak(self):
-        self._weak_started_at=self._weak_last_at=None
-        self._weak_samples=0
+        self._weak_started_at = self._weak_last_at = None
+        self._weak_samples = 0
 
     def evidence(self):
-        return dict(method=self.presence_evidence,
+        return dict(
+            method=self.presence_evidence,
             weak_samples=self._weak_samples,
-            weak_elapsed_sec=round(max(0.,self._weak_last_at-self._weak_started_at),3)
-                if self._weak_last_at is not None and self._weak_started_at is not None else 0.,
+            weak_elapsed_sec=round(max(0.0, self._weak_last_at - self._weak_started_at), 3)
+            if self._weak_last_at is not None and self._weak_started_at is not None
+            else 0.0,
             weak_min_current_a=self.weak_presence_min_a,
-            weak_required_sec=self.weak_presence_duration_sec)
+            weak_required_sec=self.weak_presence_duration_sec,
+            prior_presence=self._had_presence,
+            low_current_hold_limit_sec=2.0,
+            confirmed_removal_max_a=min(self.empty_current_max_a, 0.006),
+        )
 
 
 def normalize_power_bank_status(status: Any, status_aliases: dict[Any, str] | None = None) -> str:
@@ -430,11 +507,7 @@ def build_slot(
         "status": canonical_status,
         "current": None if valid_current is None else round(float(valid_current), 3),
         "voltage": None if valid_voltage is None else round(float(valid_voltage), 3),
-        "charge": (
-            charge
-            if charge_supplied
-            else estimate_charge(valid_current, canonical_status)
-        ),
+        "charge": (charge if charge_supplied else estimate_charge(valid_current, canonical_status)),
         "sensor_ok": bool(sensor_ok),
         "enabled": bool(enabled),
     }
@@ -467,9 +540,7 @@ def payload_to_slots(
                 charge_supplied="charge" in channel,
                 enabled=enabled,
             )
-            if require_healthy and enabled and (
-                not sensor_ok or slot["status"] == "unknown"
-            ):
+            if require_healthy and enabled and (not sensor_ok or slot["status"] == "unknown"):
                 raise ValueError(f"ch{number} 感測資料無效")
             slots.append(slot)
         return slots

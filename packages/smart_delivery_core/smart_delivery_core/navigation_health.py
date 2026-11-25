@@ -75,6 +75,8 @@ class NavigationHealth(Node):
         self.last_action_probe=-float('inf')
         self.health_clients = {name:self.create_client(GetState,'/'+name+'/get_state') for name in TARGETS}
         self.pending, self.records = {}, {}
+        self.probe_due={name:time.monotonic()+i*.1 for i,name in enumerate(TARGETS)}
+        self.probe_counts={name:0 for name in TARGETS}
         self.timeouts = {name:0 for name in TARGETS}
         self.errors = {name:0 for name in TARGETS}
         self.response_max = {name:0. for name in TARGETS}
@@ -187,11 +189,7 @@ class NavigationHealth(Node):
                 future.cancel()
                 self.health_clients[name].remove_pending_request(future)
                 self.pending.pop(name)
-        if now-self.last_probe>=1.:
-            self.last_probe=now
-            for name,client in self.health_clients.items():
-                if name not in self.pending and client.service_is_ready():
-                    self.pending[name]=(client.call_async(GetState.Request()),now)
+        self._probe_states(now)
         # The file changes only on native action faults; one stat per second,
         # rather than another high-rate rosout/TF parser or polling ROS CLI.
         if now-self.last_action_probe>=1.:
@@ -217,12 +215,25 @@ class NavigationHealth(Node):
             self.last_detail=now
             payload=dict(sample_ros_stamp_ns=self.get_clock().now().nanoseconds)
             payload['service_diagnostics']=dict(timeouts=dict(self.timeouts),errors=dict(self.errors),
-                response_max_sec=dict(self.response_max),pending_age_sec={n:now-start for n,(_,start) in self.pending.items()})
+                response_max_sec=dict(self.response_max),pending_age_sec={n:now-start for n,(_,start) in self.pending.items()},
+                probe_counts=dict(self.probe_counts),probe_mode='staggered_one_per_tick')
             payload['bonds']=[dict(node=name,instance=instance,age_sec=now-record['at'],**record)
                               for (name,instance),record in self.bonds.items()]
             payload['tf_receipts']=self.receipts.snapshot(now)
             payload['wall_durations']=self.duration_metrics.snapshot(now)
             self.detail_publisher.publish(String(data=json.dumps(payload)))
+
+    def _probe_states(self, now):
+        """Spread seven lifecycle queries; no burst, duplicate or longer age gate."""
+        due=sorted((at,name) for name,at in self.probe_due.items()
+                   if now>=at and name not in self.pending)
+        for _,name in due:
+            self.probe_due[name]=now+1.
+            client=self.health_clients[name]
+            if not client.service_is_ready():continue
+            self.pending[name]=(client.call_async(GetState.Request()),now)
+            self.probe_counts[name]+=1
+            break
 
 
 def main(args=None):

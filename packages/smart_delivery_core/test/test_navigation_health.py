@@ -55,3 +55,19 @@ def test_recorded_controller_collision_reply_delay_requires_independent_safety_a
     assert navigation_snapshot(records,104.01,fresh_safety=True,action_healthy=True)['state']=='unavailable'
     records['amcl']['at']=100.
     assert navigation_snapshot(records,103.1,fresh_safety=True,action_healthy=True)['state']=='unavailable'
+
+
+def test_lifecycle_queries_are_staggered_with_one_inflight_per_node():
+    sent=[];monitor=object.__new__(NavigationHealth)
+    monitor.probe_due={n:100.+i*.1 for i,n in enumerate(TARGETS)}
+    monitor.probe_counts={n:0 for n in TARGETS};monitor.pending={}
+    monitor.health_clients={n:NS(service_is_ready=lambda:True,
+        call_async=lambda _r,n=n:sent.append(n) or object()) for n in TARGETS}
+    for i in range(8):
+        previous=len(sent);monitor._probe_states(100.+i*.10001)
+        assert len(sent)-previous<=1
+    assert sent==list(TARGETS)
+    for at in (101.,102.,103.):monitor._probe_states(at)
+    assert len(sent)==7  # none may duplicate an unfinished request
+    monitor.pending.pop('amcl');monitor._probe_states(104.)
+    assert sent[-1]=='amcl' and monitor.probe_counts['amcl']==2

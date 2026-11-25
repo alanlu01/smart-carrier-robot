@@ -18,11 +18,12 @@ def test_low_current_full_can_be_detected_from_cold_start():
 def test_short_empty_noise_never_creates_bank_and_does_not_slow_removal():
     s=tracker()
     for i in range(3):s.update(.004,11.2,now=i*.5)
-    for i in range(6):assert s.update(.016,11.2,now=1.5+i*.5)=='empty'
-    assert s.update(.004,11.2,now=4.5)=='empty'
-    for i in range(3):s.update(.060,11.2,now=5.+i*.5)
+    for i in range(6):assert s.update(.016,11.2,now=1.5+i*.5)=='unknown'
+    for i in range(3):s.update(.004,11.2,now=4.5+i*.5)
+    assert s.state=='empty'
+    for i in range(3):s.update(.060,11.2,now=6.+i*.5)
     assert s.state=='full'
-    for i in range(3):s.update(.004,11.2,now=6.5+i*.5)
+    for i in range(3):s.update(.004,11.2,now=7.5+i*.5)
     assert s.state=='empty'
 
 
@@ -56,6 +57,37 @@ def test_below_weak_floor_and_invalid_numbers_do_not_invent_presence():
     for i in range(30):assert s.update(.009,11.2,now=i*.5)=='unknown'
     assert s.update(float('nan'),11.2,now=15.)=='unknown'
     assert s.evidence()['weak_samples']==0
+
+
+def test_recorded_full_current_overlap_expires_to_unknown_not_empty_or_permanent_full():
+    s=tracker()
+    for i in range(15):s.update(.013,11.4,now=i*.5)
+    assert s.state=='full'
+    assert s.update(.008,11.4,now=7.5)=='full'
+    assert s.update(.007,11.4,now=8.)=='full'
+    assert s.update(.008,11.4,now=9.5)=='unknown'
+    for i in range(30):assert s.update(.008,11.4,now=10.+i*.5)=='unknown'
+    assert s.evidence()['method']=='ambiguous_low_current'
+    for i in range(3):s.update(.003,11.4,now=25.+i*.5)
+    assert s.state=='empty' and not s.evidence()['prior_presence']
+
+
+def test_fault_never_keeps_old_full_and_weak_recovery_needs_new_evidence():
+    s=tracker()
+    for i in range(3):s.update(.06,11.2,now=i*.5)
+    assert s.update(.012,11.2,now=1.5)=='full'  # continuous occupied evidence
+    assert s.update(None,None,sensor_ok=False,now=2.)=='unknown'
+    for i in range(6):assert s.update(.012,11.2,now=2.5+i*.5)=='unknown'
+    assert s.update(.008,11.2,now=5.5)=='unknown'
+    for i in range(3):s.update(.003,11.2,now=6.+i*.5)
+    assert s.state=='empty'
+
+
+def test_recorded_five_ma_removal_keeps_the_original_three_sample_confirmation():
+    s=tracker()
+    for i in range(3):s.update(.06,11.2,now=i*.5)
+    for i in range(2):assert s.update(.005,11.2,now=1.5+i*.5)=='full'
+    assert s.update(.005,11.2,now=2.5)=='empty'
 
 
 def test_real_ina_timer_publishes_weak_evidence_and_empty_after_removal(monkeypatch):

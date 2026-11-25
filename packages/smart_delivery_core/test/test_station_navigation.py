@@ -409,3 +409,63 @@ def test_destination_diagnostic_describes_actual_remaining_sweep(motion):
     assert report['clearance_query']['end']==list(manager.target)
     assert report['clearance_blocker']['reason']=='occupied_or_unknown_sweep'
     assert report['clearance_blocker']['layer']=='body'
+
+
+def test_recorded_small_odom_deviation_stops_rechecks_two_grids_and_resumes_once(motion):
+    m,n,c,p,_,_=motion
+    o=[(0.,0.,0.)];m._odom_pose=lambda:o[0]
+    m.target=(0.,.5,0.);m.mode='station'
+    m._translation(p[0],m.target,'entry','finish');budget=m.translation_budget
+    o[0]=(.1007,.4169,0.);p[0]=(0.,.4169,0.)
+    m.isTaskComplete()
+    assert n.cancels==1 and not m.cancelled and m.replan_pending and len(n.sent)==1
+    assert m.deviation_retries==1 and m.translation_pause_kind=='deviation'
+    n.complete=True;n.result=TaskResult.CANCELED
+    m.isTaskComplete();c[0]+=.6;m.isTaskComplete()
+    assert m.phase=='waiting_clearance'
+    for stamp in (1,2):
+        m.grid_stamp=stamp;c[0]+=.5;m.isTaskComplete()
+        if stamp==1:assert len(n.sent)==1
+    assert m.phase=='entry' and len(n.sent)==2 and m.translation_budget is budget
+    assert m.deviation_guard['odom']==(0.,0.,0.)
+    # Rebased local odometry cannot hide continuing deviation from the first leg.
+    o[0]=(.121,.43,0.);p[0]=(0.,.43,0.)
+    m.isTaskComplete()
+    assert m.cancelled and m.failure_kind=='translation_deviation'
+
+
+@pytest.mark.parametrize('odom,map_pose',[
+    ((.13,.3,0.),(0.,.3,0.)),
+    ((.1007,.3,0.),(-.10,.3,0.)),
+    ((.1007,.3,.2),(0.,.3,0.)),
+])
+def test_large_or_inconsistent_deviation_cannot_use_small_error_recovery(motion,odom,map_pose):
+    m,n,_,p,_,_=motion
+    o=[(0.,0.,0.)];m._odom_pose=lambda:o[0];m.target=(0.,.5,0.)
+    m._translation(p[0],m.target,'entry','finish')
+    o[0]=odom;p[0]=map_pose;m.isTaskComplete()
+    assert m.cancelled and m.deviation_retries==0
+
+
+def test_heading_only_pause_keeps_original_goal_and_alignment_shares_budget(motion):
+    m,n,c,p,_,_=motion
+    m.target=(1.,0.,0.);m.mode='station';p[0]=(.6,0.,0.)
+    m._translation(p[0],m.target,'entry','finish');budget=m.translation_budget
+    p[0]=(.7,0.,.12334);m.isTaskComplete()
+    assert m.translation_pause_kind=='heading' and not m.cancelled
+    n.complete=True;n.result=TaskResult.CANCELED
+    m.isTaskComplete();c[0]+=.6;m.isTaskComplete()
+    m.grid_stamp=1;c[0]+=.5;m.isTaskComplete()
+    assert m.phase=='aligning' and m.translation_budget is budget
+    assert m.entry_adjustments==0 and m.target==(1.,0.,0.)
+
+
+def test_departure_heading_recheck_keeps_departure_heading_not_next_destination(motion):
+    m,n,c,p,_,_=motion
+    m.target=(1.,1.,math.pi/2);m.mode='station'
+    m._translation(p[0],(.5,0.,0.),'departure','approach')
+    p[0]=(.1,0.,.12334);m.isTaskComplete()
+    n.complete=True;n.result=TaskResult.CANCELED
+    m.isTaskComplete();c[0]+=.6;m.isTaskComplete()
+    m.grid_stamp=1;c[0]+=.5;m.isTaskComplete()
+    assert m.phase=='aligning' and n.sent[-1][0][2]==0.

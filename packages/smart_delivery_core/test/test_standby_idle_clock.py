@@ -62,16 +62,35 @@ def test_persistent_gap_and_movement_still_reset_idle_time():
     clock=StandbyIdleClock();clock.mark_parked(POINT)
     tick(clock,0.);tick(clock,.5)
     tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
-    tick(clock,2.1,safe=False,pose=None,transient_tf_gap=True)
+    tick(clock,6.1,safe=False,pose=None,transient_tf_gap=True)
     assert clock.elapsed==0.
-    tick(clock,2.5);tick(clock,3.)
-    tick(clock,3.5,safe=False,pose=None,odom=(.03,0,0),transient_tf_gap=True)
+    tick(clock,6.5);tick(clock,7.)
+    tick(clock,7.5,safe=False,pose=None,odom=(.03,0,0),transient_tf_gap=True)
     assert clock.elapsed==0.
 
 
-def test_returning_fresh_after_one_second_cannot_preserve_unobserved_time():
+def test_returning_fresh_after_pause_limit_cannot_preserve_unobserved_time():
     clock=StandbyIdleClock();clock.mark_parked(POINT)
     tick(clock,0.);tick(clock,.5)
     tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
-    tick(clock,2.5)
+    tick(clock,6.5)
+    assert clock.elapsed==0.
+
+
+def test_recorded_two_second_tf_gap_preserves_47_seconds_without_counting_gap():
+    clock=StandbyIdleClock();clock.mark_parked(POINT)
+    for step in range(97):tick(clock,step*.5)
+    before=clock.elapsed
+    for at in (48.5,49.,49.5,50.):
+        assert not tick(clock,at,safe=False,pose=None,transient_tf_gap=True)
+        assert clock.elapsed==before
+    assert tick(clock,50.5) and clock.elapsed==before
+    assert tick(clock,51.) and clock.elapsed==before+.5
+
+
+def test_other_safety_fault_during_tf_pause_clears_clock():
+    clock=StandbyIdleClock();clock.mark_parked(POINT)
+    tick(clock,0.);tick(clock,.5)
+    tick(clock,1.,safe=False,pose=None,transient_tf_gap=True)
+    tick(clock,1.5,safe=False,pose=None,transient_tf_gap=False)
     assert clock.elapsed==0.

@@ -4,6 +4,7 @@ import math
 
 class StandbyIdleClock:
     """Count only verified, healthy physical parking; tolerate bounded AMCL jitter."""
+    TF_PAUSE_LIMIT = 5.
     def __init__(self):
         self.point = None
         self.map_reference = None
@@ -46,7 +47,9 @@ class StandbyIdleClock:
                 or abs(math.atan2(math.sin(odom[2]-self.odom_anchor[2]),
                                   math.cos(odom[2]-self.odom_anchor[2])))>.035))
             self.data_pause_since = now if self.data_pause_since is None else self.data_pause_since
-            if moved or now-self.data_pause_since>1.:
+            if now-self.data_pause_since>1.:
+                self.correction_disqualified=True
+            if moved or not 0 <= now-self.data_pause_since <= self.TF_PAUSE_LIMIT:
                 self.correction_disqualified=True
                 self.reset()
                 self.reason='physical_odom_displacement' if moved else 'tf_gap_expired'
@@ -54,9 +57,12 @@ class StandbyIdleClock:
                 self.last_tick=None
                 self.reason='short_tf_gap_paused'
             return False
-        if self.data_pause_since is not None and now-self.data_pause_since>1.:
-            self.correction_disqualified=True
-            self.reset()
+        if self.data_pause_since is not None:
+            gap=now-self.data_pause_since
+            if gap>1.:self.correction_disqualified=True
+            if not 0 <= gap <= self.TF_PAUSE_LIMIT:
+                self.correction_disqualified=True
+                self.reset()
         self.data_pause_since = None
         if not parked or not safe or not stationary or self.point is None or pose is None or odom is None:
             self.correction_disqualified=True
@@ -151,6 +157,8 @@ class StandbyIdleClock:
                     deviation_expired=self.deviation_expired, deviation_resets=self.deviation_resets,
                     correction_used=self.correction_used,
                     correction_disqualified=self.correction_disqualified,
+                    data_pause_sec=None if self.data_pause_since is None else round(max(0.,now-self.data_pause_since),3),
+                    data_pause_limit_sec=self.TF_PAUSE_LIMIT,
                     confirmation_sec=None if self.correction_since is None else round(max(0.,now-self.correction_since),3),
                     map_reference=self.map_reference, observed_pose=self.last_map_pose,
                     odom_anchor=self.odom_anchor)

@@ -146,4 +146,7 @@ def test_translation_physical_guard_survives_a_map_only_shift(motion):
     od[0]=(.1,.01,0.)
     assert not m.isTaskComplete() and not m.cancelled
     od[0]=(.1,.11,0.)
+    assert not m.isTaskComplete() and m.replan_pending and not m.cancelled
+    assert m.deviation_guard['odom']==(0.,0.,0.)
+    od[0]=(.1,.13,0.)
     assert not m.isTaskComplete() and m.cancelled

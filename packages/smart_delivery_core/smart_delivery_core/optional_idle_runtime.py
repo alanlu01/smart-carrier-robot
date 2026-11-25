@@ -636,7 +636,7 @@ class OptionalIdleRuntime:
             text=labels.get(idle_reason,text)
             if idle_reason=='counting_verified_stationary_parking' and transition:
                 remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
-                text=f'💤 人流計時中：剩餘 {remaining:.0f} 秒'
+                text=f'⏳ 人流待機倒數：剩餘 {remaining:.0f} 秒'
         if self.reason=='people_data_pause':
             enroute=(self.state=='going_observation' or self.localization_resume_state=='going_observation')
             text=('🛑 前往分析停止中：等待新鮮資料' if self.cancel_requested and self.motion and enroute
@@ -655,7 +655,8 @@ class OptionalIdleRuntime:
                 text=f'💤 人流冷卻：剩餘 {cooldown:.0f} 秒' if cooldown>0 else '💤 等待停靠後啟動人流計時'
             if cooldown>0:
                 if idle_reason=='counting_verified_stationary_parking' and not first_insufficient:
-                    text=f'💤 人流冷卻：剩餘 {cooldown:.0f} 秒'
+                    remaining=max(0.,self.config['people']['idle_before_observation_sec']-self.idle_clock.elapsed)
+                    text=f'🕒 人流冷卻：剩餘 {cooldown:.0f} 秒｜待機倒數 {remaining:.0f} 秒'
                 elif not first_insufficient:
                     text+=f'｜冷卻 {cooldown:.0f} 秒'
         if self.state=='idle' and text==getattr(self,'_last_people_text',None) and now-getattr(self,'_last_people_text_at',0.)<30.:

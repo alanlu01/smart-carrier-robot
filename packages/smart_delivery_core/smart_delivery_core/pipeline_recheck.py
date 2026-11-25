@@ -76,6 +76,7 @@ class PipelineRecheck:
                     verification_elapsed_sec=round(self.verification_elapsed, 3),
                     required_samples=self.required, reason=self.reason,
                     reference_evidence=getattr(self, 'reference_evidence', None),
+                    inputs=getattr(self,'input_diagnostics',None),
                     position_delta_m=self.position_delta, angle_delta_rad=self.angle_delta)
 
 
