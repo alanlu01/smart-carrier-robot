@@ -57,6 +57,18 @@ def test_diagnostics_preserve_hard_stop_on_stale_semantics(monkeypatch):
     assert node.semantic_speed_limit() == 0.0
 
 
+def test_station_margin_pause_flushes_zero_and_release_preserves_other_limits(monkeypatch):
+    node=fusion(monkeypatch,age=.1)
+    node.station_pause_callback(SimpleNamespace(data=True))
+    command=Twist();command.linear.x=.15
+    node.cmd_vel_callback(command)
+    assert len(node.commands)==2 and all(m.linear.x==0. for m in node.commands)
+    node.station_pause_callback(SimpleNamespace(data=False))
+    node.speed_multiplier=.5
+    node.cmd_vel_callback(command)
+    assert node.commands[-1].linear.x==.075
+
+
 def test_localization_soft_limit_combines_by_minimum_and_expiry_stops(monkeypatch):
     node=fusion(monkeypatch,age=.1)
     node.localization_speed_limit.observe(.5,103.)

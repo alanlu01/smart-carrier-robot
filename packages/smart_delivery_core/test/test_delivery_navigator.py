@@ -96,3 +96,26 @@ def test_other_namespaces_do_not_look_like_duplicate_root_target(monkeypatch):
     node.get_node_names_and_namespaces=lambda:[('bt_navigator','/'),('bt_navigator','/other')]
     node._waitForNodeToActivate('bt_navigator')
     assert '"state": "ready"' in node.messages[-1].data
+
+
+def test_goal_policy_republishes_immutable_payload_until_exact_ack_or_deadline(monkeypatch,tmp_path):
+    import json
+    from geometry_msgs.msg import PoseStamped
+    from std_msgs.msg import String
+    node,clock=harness(monkeypatch,[])
+    node.policy_share=tmp_path
+    node.policy_pub=SimpleNamespace(publish=node.messages.append)
+    node.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=123000000000))
+    pose=PoseStamped();pose.header.frame_id='map';pose.pose.orientation.w=1.
+    node.configure_navigation_goal(pose)
+    payload=node.messages[-1].data;stamp=pose.header.stamp.sec*10**9+pose.header.stamp.nanosec
+    pose.pose.position.x=42.  # Subsequent caller mutation must not rewrite the policy.
+    node._renew_policy();assert node.messages[-1].data==payload
+    node._policy_ack(String(data=json.dumps(dict(goal_stamp_ns=stamp-1,status='matched'))))
+    assert node.policy_pending is not None
+    node._policy_ack(String(data=json.dumps(dict(goal_stamp_ns=stamp,status='matched'))))
+    count=len(node.messages);node._renew_policy();assert len(node.messages)==count
+    node.configure_navigation_goal(pose)
+    assert pose.header.stamp.nanosec==1  # Same ROS clock still gets a new goal identity.
+    clock.now+=3.1;count=len(node.messages);node._renew_policy()
+    assert node.policy_pending is None and len(node.messages)==count

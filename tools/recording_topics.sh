@@ -25,6 +25,7 @@ FULL_TOPICS=(
   /smart_carrier/delivery_navigation_active /delivery/standby_state /delivery/station_state
   /delivery/station_controller_state
   /delivery/navigation_policy
+  /delivery/navigation_policy_state /delivery/station_motion_inhibited
   /delivery/route_state
   /delivery/startup_state
   /chassis/odom_local /chassis/odometry_transport_health

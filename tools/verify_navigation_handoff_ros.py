@@ -58,6 +58,8 @@ def main():
     tr = TransformStamped(); tr.header.frame_id='map'; tr.child_frame_id='odom'
     tr.transform.rotation.w=1.; tr.header.stamp=node.get_clock().now().to_msg()
     odom = node.create_publisher(Odometry, '/odom', 10)
+    chassis = node.create_publisher(Twist, '/chassis_cmd_vel', qos_profile_sensor_data)
+    tiny_test={'freeze':False}
     scan = node.create_publisher(LaserScan, '/scan_filtered', qos_profile_sensor_data)
     paths = []
     guarded_routes = []
@@ -84,12 +86,23 @@ def main():
     node.create_timer(.15,publish_proof)
     policy_pub = node.create_publisher(String, '/delivery/navigation_policy',
         QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
-    def select_policy(pose,tree):
-        from smart_delivery_core.navigation_policy import navigation_policy
-        selected=navigation_policy(pose,tree,share)
-        if selected is None:return tree
-        path,payload=selected;policy_pub.publish(String(data=payload));return path
-    node.configure_navigation_goal=select_policy
+    # Exercise the production immutable resender and ACK consumer while keeping
+    # automatic lifecycle recovery under this test's explicit stop-proof control.
+    from types import MethodType, SimpleNamespace
+    from smart_delivery_core.delivery_navigator import DeliveryNavigator
+    node.policy_share=share;node.policy_pending=None;node.policy_last_stamp=0;node.policy_generation=0
+    policy_loss={'drop_first':True,'dropped':0}
+    def publish_policy(message):
+        if policy_loss['drop_first']:
+            policy_loss['drop_first']=False;policy_loss['dropped']+=1;return
+        policy_pub.publish(message)
+    node.policy_pub=SimpleNamespace(publish=publish_policy)
+    node.configure_navigation_goal=MethodType(DeliveryNavigator.configure_navigation_goal,node)
+    node._renew_policy=MethodType(DeliveryNavigator._renew_policy,node)
+    node._policy_ack=MethodType(DeliveryNavigator._policy_ack,node)
+    node.create_timer(.25,node._renew_policy)
+    node.create_subscription(String,'/delivery/navigation_policy_state',node._policy_ack,
+        QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
     buffer=Buffer();listener=TransformListener(buffer,node)
     station=StationNavigation(node,buffer,share)
     node.create_subscription(NavPath, '/plan', lambda m:paths.append((time.monotonic(),len(m.poses))), 1)
@@ -102,6 +115,11 @@ def main():
     def sensors():
         now=time.monotonic(); dt=min(.1,now-state['last']); state['last']=now
         v=state['command'] if now-state['received']<.3 else Twist(); a=state['yaw']
+        actual=deepcopy(v)
+        if tiny_test['freeze']:
+            actual.linear.x,actual.linear.y,actual.angular.z=.02,.01,.01
+            v=Twist()  # Software wheels do not progress despite tiny final commands.
+        chassis.publish(actual)
         state['x']+=(math.cos(a)*v.linear.x-math.sin(a)*v.linear.y)*dt
         state['y']+=(math.sin(a)*v.linear.x+math.cos(a)*v.linear.y)*dt
         target=(1.5 if phase['stress'] else 1.)*v.angular.z if abs(v.angular.z)>.11 else 0.
@@ -168,11 +186,7 @@ def main():
             p.pose.orientation.z=math.sin(yaw/2); p.pose.orientation.w=math.cos(yaw/2)
             request.pose=p
             if '--owned' in sys.argv:
-                from smart_delivery_core.navigation_policy import navigation_policy
-                selected = navigation_policy(p,request.behavior_tree,share)
-                assert selected is not None
-                request.behavior_tree,policy=selected
-                policy_pub.publish(String(data=policy))
+                request.behavior_tree=node.configure_navigation_goal(p,request.behavior_tree)
             answer=resolve(client.send_goal_async(request)); assert answer.accepted
             return answer
 
@@ -254,8 +268,19 @@ def main():
             bad.pose.header.frame_id='map';bad.pose.header.stamp=node.get_clock().now().to_msg()
             bad.pose.pose.position.x=state['x']+.5;bad.pose.pose.position.y=state['y'];bad.pose.pose.orientation.w=1.
             handle=resolve(client.send_goal_async(bad))
-            assert resolve(handle.get_result_async(),6.).status==6
+            refusal=resolve(handle.get_result_async(),6.)
+            assert refusal.status==6 and refusal.result.error_code==10001,refusal
             assert len(paths)==count and math.hypot(state['x']-anchor[0],state['y']-anchor[1])<.01
+        if '--tiny-stall' in sys.argv:
+            old_events=max((x.get('tiny_stall_events',0) for x in guarded_routes),default=0)
+            handle=send(state['x']+1.5,state['y'],0.,'smart_delivery_navigate.xml')
+            assert pump(lambda:math.hypot(state['command'].linear.x,state['command'].linear.y)>.05,5.)
+            tiny_test['freeze']=True
+            assert pump(lambda:any(x.get('tiny_stall_events',0)>old_events for x in guarded_routes),9.),guarded_routes[-5:]
+            tiny_test['freeze']=False
+            resolve(handle.cancel_goal_async());resolve(handle.get_result_async())
+            assert pump(lambda:math.hypot(state['command'].linear.x,state['command'].linear.y)<.01,3.)
+            print(json.dumps(dict(tiny_stall_native_detected=True,final_command_and_fresh_wheels=True)),flush=True)
         if '--recover' in sys.argv:
             assert pump(lambda:health and health[-1]['state']=='ready',5.)
             proof['lease']=True
@@ -291,7 +316,8 @@ def main():
             assert any(row.get('valid') for row in guarded_routes),guarded_routes
         (root/'result.json').write_text(json.dumps(dict(passed=True,results=results,
             guarded_routes=guarded_routes,
-            after_cancel=True,wrong_policy_no_motion='--owned' in sys.argv,recovery=recovery_report),indent=2))
+            after_cancel=True,wrong_policy_no_motion='--owned' in sys.argv,
+            first_policy_dropped=policy_loss['dropped'],recovery=recovery_report),indent=2))
         print(json.dumps(dict(passed=True,domain=231,software_plant_only=True,root=str(root))),flush=True)
     finally:
         if handle is not None:

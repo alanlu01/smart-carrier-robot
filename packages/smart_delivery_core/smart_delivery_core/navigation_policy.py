@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 PROFILES = {
-    'station_x.xml': ('StationX', 'general_goal_checker'),
-    'station_y.xml': ('StationY', 'general_goal_checker'),
+    'station_x.xml': ('StationX', 'station_goal_checker'),
+    'station_y.xml': ('StationY', 'station_goal_checker'),
     'station_exit_x.xml': ('StationExitX', 'general_goal_checker'),
     'station_exit_y.xml': ('StationExitY', 'general_goal_checker'),
     'station_align.xml': ('StationAlign', 'station_alignment_checker'),

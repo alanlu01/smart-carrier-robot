@@ -31,18 +31,21 @@ public:
       [this](std_msgs::msg::String::ConstSharedPtr message) {
         try {policy_ = nlohmann::json::parse(message->data);} catch (...) {policy_ = nullptr;}
       }, options);
+    diagnostics_=node_->create_publisher<std_msgs::msg::String>(
+      "/delivery/navigation_policy_state",rclcpp::QoS(1).reliable().transient_local());
   }
 
   static BT::PortsList providedPorts()
   {
     return {BT::InputPort<geometry_msgs::msg::PoseStamped>("goal"),
       BT::OutputPort<std::string>("controller"), BT::OutputPort<std::string>("goal_checker"),
-      BT::OutputPort<bool>("station"), BT::OutputPort<unsigned>("error_code_id")};
+      BT::OutputPort<bool>("station"), BT::OutputPort<uint16_t>("error_code_id")};
   }
 
   BT::NodeStatus onStart() override
   {
     started_ = std::chrono::steady_clock::now();
+    last_report_=started_-std::chrono::seconds(1);
     return onRunning();
   }
 
@@ -51,8 +54,8 @@ public:
     executor_.spin_some();
     geometry_msgs::msg::PoseStamped goal;
     static const std::unordered_map<std::string, std::string> profiles{
-      {"FollowPath", "general_goal_checker"}, {"StationX", "general_goal_checker"},
-      {"StationY", "general_goal_checker"}, {"StationExitX", "general_goal_checker"},
+      {"FollowPath", "general_goal_checker"}, {"StationX", "station_goal_checker"},
+      {"StationY", "station_goal_checker"}, {"StationExitX", "general_goal_checker"},
       {"StationExitY", "general_goal_checker"}, {"StationAlign", "station_alignment_checker"}};
     try {
       if (getInput("goal", goal) && policy_.is_object()) {
@@ -81,7 +84,8 @@ public:
           setOutput("controller", controller);
           setOutput("goal_checker", checker);
           setOutput("station", station);
-          setOutput("error_code_id", 0u);
+          setOutput("error_code_id", uint16_t(0));
+          report(goal,"matched");
           config().blackboard->set("compute_path_error_code", uint16_t(0));
           config().blackboard->set("follow_path_error_code", uint16_t(0));
           return BT::NodeStatus::SUCCESS;
@@ -89,9 +93,13 @@ public:
       }
     } catch (const nlohmann::json::exception &) {}
     if (std::chrono::steady_clock::now()-started_>std::chrono::seconds(2)) {
-      setOutput("error_code_id", 10001u);
+      setOutput("error_code_id", uint16_t(10001));
+      report(goal,"mismatch");
       RCLCPP_ERROR(node_->get_logger(), "Delivery policy did not match the stamped goal; no motion");
       return BT::NodeStatus::FAILURE;
+    }
+    if (std::chrono::steady_clock::now()-last_report_>std::chrono::milliseconds(500)) {
+      report(goal,"waiting");
     }
     return BT::NodeStatus::RUNNING;
   }
@@ -99,11 +107,24 @@ public:
   void onHalted() override {}
 
 private:
+  void report(const geometry_msgs::msg::PoseStamped & goal,const char * status)
+  {
+    last_report_=std::chrono::steady_clock::now();
+    const auto & p=goal.pose.position;const auto & q=goal.pose.orientation;
+    std_msgs::msg::String message;
+    message.data=nlohmann::json{{"status",status},{"goal_stamp_ns",rclcpp::Time(goal.header.stamp).nanoseconds()},
+      {"frame",goal.header.frame_id},{"position",{p.x,p.y,p.z}},
+      {"orientation",{q.x,q.y,q.z,q.w}},{"received_policy",policy_},
+      {"wait_sec",std::chrono::duration<double>(last_report_-started_).count()}}.dump();
+    diagnostics_->publish(message);
+  }
   rclcpp::Node::SharedPtr node_;
   rclcpp::CallbackGroup::SharedPtr group_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr subscription_;
   nlohmann::json policy_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr diagnostics_;
+  std::chrono::steady_clock::time_point last_report_;
   std::chrono::steady_clock::time_point started_;
 };
 }

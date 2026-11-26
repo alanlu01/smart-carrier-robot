@@ -1,6 +1,7 @@
 #include <cassert>
 #include <iostream>
 #include "smart_station_controller/guarded_navfn.hpp"
+#include "smart_station_controller/motion_stall.hpp"
 using namespace smart_station_controller;
 
 RouteGrid room(bool slit)
@@ -31,6 +32,22 @@ RouteGrid room(bool slit)
 
 int main()
 {
+  MotionStall tiny_motion;
+  for (int i=0;i<51;++i) {
+    double t=100.+i*.1;tiny_motion.command(.02,.01,.01,t);tiny_motion.odom(0.,0.,0.,t);
+    assert(tiny_motion.stalled(t)==(i>=50));
+  }
+  assert(!tiny_motion.stalled(106.));  // stale wheels/commands cannot create evidence
+  for (int i=0;i<80;++i) {
+    double t=200.+i*.1;tiny_motion.command(.02,0.,.05,t);tiny_motion.odom(0.,0.,i*.005,t);
+    assert(!tiny_motion.stalled(t));  // a purposeful slow turn is progress
+  }
+  GuardedNavfn memory;
+  memory.remember({1.,1.,0.},100.);memory.remember({1.,1.,0.},110.);
+  assert(memory.avoid.front().until>=200.);
+  memory.cached={{0.,0.,0.},{.4,0.,0.},{.7,0.,0.},{1.,0.,0.},{1.4,0.,0.}};
+  memory.motionStalled({0.,0.,0.},120.);
+  assert(memory.cached.empty() && memory.avoid.size()>2);
   auto g=room(true);GuardedNavfn planner;RoutePose blocked{};
   RoutePose start{0.,-2.,1.5707963267948966},goal{0.,2.,1.5707963267948966};
   auto route=planner.plan(g,start,goal,100.);

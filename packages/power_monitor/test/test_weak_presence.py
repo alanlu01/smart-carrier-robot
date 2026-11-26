@@ -90,6 +90,24 @@ def test_recorded_five_ma_removal_keeps_the_original_three_sample_confirmation()
     assert s.update(.005,11.2,now=2.5)=='empty'
 
 
+def test_confirmed_full_survives_one_second_dip_without_restarting_six_second_proof():
+    s=tracker()
+    for i in range(3):s.update(.1,11.2,now=i*.5)
+    for t,value in [(1.5,.012),(2.,.009),(2.5,.009),(3.,.012),(3.5,.013)]:
+        assert s.update(value,11.2,now=t)=='full'
+
+
+def test_known_empty_noise_is_bounded_and_never_invents_full():
+    s=tracker()
+    for i in range(3):s.update(.004,11.2,now=i*.5)
+    assert s.update(.009,11.2,now=1.5)=='empty'
+    assert s.update(.009,11.2,now=2.)=='empty'
+    assert s.update(.009,11.2,now=2.5)=='empty'
+    assert s.update(.009,11.2,now=3.)=='empty'
+    assert s.update(.009,11.2,now=3.5)=='unknown'
+    for i in range(20):assert s.update(.009,11.2,now=4.+i*.5)=='unknown'
+
+
 def test_real_ina_timer_publishes_weak_evidence_and_empty_after_removal(monkeypatch):
     import json
     from power_monitor import ina3221_node

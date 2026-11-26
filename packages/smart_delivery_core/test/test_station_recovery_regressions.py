@@ -42,7 +42,9 @@ def test_margin_stop_resumes_only_remaining_leg_after_two_clear_snapshots(motion
     original_deadline=m.deadline
     c[0]+=.28
     m.grid=single_cell_at(.5,.20);m.grid_stamp=1
-    assert not m.isTaskComplete() and n.cancels==1
+    assert not m.isTaskComplete() and n.cancels==0 and m.motion_paused
+    c[0]+=2.6;m.isTaskComplete()
+    assert n.cancels==1
     assert m.motion_check['blocker']['layer']=='margin'
     assert m.active_goal and len(n.sent)==1  # Cancellation still owns the action.
     n.complete,n.result=True,TaskResult.CANCELED
@@ -63,13 +65,16 @@ def test_recorded_25_second_clearance_pause_resumes_with_actual_motion_time(moti
     m,n,c,p,_,_=motion;m.mode='station'
     m._translation(p[0],m.target,'entry','finish')
     c[0]=100.28;m.grid=single_cell_at(.5,.20);m.grid_stamp=1;m.isTaskComplete()
+    c[0]+=2.6;m.isTaskComplete()
     n.complete,n.result=True,TaskResult.CANCELED;tick(m,c)
     c[0]=124.;m.grid=grid();m.grid_stamp=2;m.isTaskComplete()
     assert len(n.sent)==1
     c[0]=125.1;m.grid_stamp=3;m.isTaskComplete()
     assert m.phase=='entry' and len(n.sent)==2
-    assert m.deadline>c[0]+24. and not m.cancelled
-    assert m.translation_budget.waiting<6.
+    # The bounded no-cancel margin hold consumes the original leg budget;
+    # later cancelled-action clearance waiting does not consume motion time.
+    assert m.deadline>c[0]+21. and not m.cancelled
+    assert m.translation_budget.waiting<10. and 21.<m.translation_budget.moving<25.
 
 
 def test_current_bad_raw_match_cannot_release_on_old_smoothed_score(manager):
@@ -94,6 +99,7 @@ def test_clearance_flap_or_stale_data_cannot_count_as_continuous_clear(motion):
     m,n,c,p,_,_=motion
     m.mode='station';m._translation(p[0],m.target,'entry','finish')
     m.grid=single_cell_at(.5,.20);m.grid_stamp=1;m.isTaskComplete()
+    c[0]+=2.6;m.isTaskComplete()
     n.complete,n.result=True,TaskResult.CANCELED;tick(m,c)
     m.grid=grid();m.grid_stamp=2;c[0]+=.2;m.isTaskComplete()
     assert m.clearance_clear_samples==1

@@ -103,7 +103,8 @@ def test_actual_delivery_wait_resets_confirmations_and_fails_a_confirmed_supply_
     exec(code,namespace)
     namespace['wait_for_slot_action'](dict(type='borrow',slot_number=1,task_id='test'),
                                     SimpleNamespace(state='waiting_action'),baseline)
-    assert inhibits==([True,False,True,False] if uncertain_baseline else [True,False]) and len(results)==1
+    # An uncertain OTHER slot no longer delays a valid target baseline.
+    assert inhibits==[True,False] and len(results)==1
     if persistent:
         assert results[0][0]=='failed' and '供電不足' in results[0][1]
     else:

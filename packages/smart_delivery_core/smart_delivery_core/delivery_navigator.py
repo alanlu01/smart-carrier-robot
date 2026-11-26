@@ -4,7 +4,7 @@ import time
 import rclpy
 from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profile_sensor_data
 from std_msgs.msg import String
 from smart_delivery_core.delivery_console import startup_status
 from ament_index_python.packages import get_package_share_directory
@@ -40,6 +40,13 @@ class DeliveryNavigator(BasicNavigator):
         self.action_requested_key=None
         self.action_recovery_client=self.create_client(Trigger,'/navigation/recover_actions')
         shared_inputs(self).subscribe(String,'/navigation/pipeline_health',self._action_health,1)
+        shared_inputs(self).subscribe(String,'/delivery/navigation_policy_state',self._policy_ack,
+            QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        shared_inputs(self).subscribe(String,'/delivery/route_state',self._route_status,qos_profile_sensor_data)
+        self.policy_pending=None
+        self.policy_last_stamp=0
+        self.policy_generation=0
+        self.create_timer(.25,self._renew_policy)
         self.create_timer(.5,self._poll_action_recovery)
 
     def _action_health(self, message):
@@ -78,11 +85,44 @@ class DeliveryNavigator(BasicNavigator):
             self.get_logger().warning('⏸️ 導航回應異常，停妥後嘗試恢復；保留任務')
 
     def configure_navigation_goal(self, pose, behavior_tree=''):
+        # Give each attempt a unique stamp; caller sends this very same pose.
+        stamp=max(self.get_clock().now().nanoseconds,getattr(self,'policy_last_stamp',0)+1)
+        pose.header.stamp.sec,pose.header.stamp.nanosec=divmod(stamp,1_000_000_000)
         selected = navigation_policy(pose, behavior_tree, self.policy_share)
         if selected is not None:
             behavior_tree, policy = selected
+            self.policy_generation=getattr(self,'policy_generation',0)+1
+            payload=json.loads(policy);payload['generation']=self.policy_generation
+            policy=json.dumps(payload)
+            self.policy_last_stamp=stamp
+            self.policy_pending=(stamp,policy,time.monotonic())
             self.policy_pub.publish(String(data=policy))
+        else:self.policy_pending=None
         return behavior_tree
+
+    def _renew_policy(self):
+        pending=getattr(self,'policy_pending',None)
+        if pending is None:return
+        if not 0<=time.monotonic()-pending[2]<=3.:
+            self.policy_pending=None;return
+        self.policy_pub.publish(String(data=pending[1]))
+
+    def _policy_ack(self, message):
+        try:
+            value=message_json(message);pending=getattr(self,'policy_pending',None)
+            if pending is not None and value.get('goal_stamp_ns')==pending[0] and value.get('status')=='matched':
+                self.policy_pending=None
+        except (ValueError,TypeError,AttributeError):pass
+
+    def _route_status(self, message):
+        try:
+            value=message_json(message)
+            events=int(value.get('tiny_stall_events',0))
+            previous=getattr(self,'last_tiny_stall_events',0)
+            self.last_tiny_stall_events=events
+            if events>previous:
+                self.get_logger().warning('↪️ 小速度無有效進展：改走其他通道')
+        except (ValueError,TypeError,AttributeError):pass
 
     def _waitForNodeToActivate(self, node_name):
         started = time.monotonic()

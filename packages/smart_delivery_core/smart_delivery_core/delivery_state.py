@@ -82,20 +82,13 @@ def navigation_was_interrupted_by_localization(
     """Recognize a localization-initiated Nav2 cancel despite callback ordering."""
     if not navigation_cancelled:
         return False
-    return (
-        localization_ready is False
-        or int(interruption_generation) > int(navigation_generation)
-    )
+    return localization_ready is False or int(interruption_generation) > int(navigation_generation)
 
 
 def interrupted_localization_order(orders):
     """Return the exact order interrupted by localization before route reordering."""
     return next(
-        (
-            order
-            for order in orders
-            if order.get("_resume_state") == "waiting_localization"
-        ),
+        (order for order in orders if order.get("_resume_state") == "waiting_localization"),
         None,
     )
 
@@ -132,6 +125,7 @@ class SlotActionVerifier:
         baseline_slots: list[dict[str, Any]],
         *,
         confirm_samples: int = 6,
+        allow_other_unknown: bool = False,
     ):
         if task_type not in {"borrow", "return"}:
             raise ValueError("槽位確認只支援 borrow 或 return")
@@ -143,6 +137,9 @@ class SlotActionVerifier:
         self.expected_slot = expected_slot
         self.confirm_samples = confirm_samples
         self.matching_samples = 0
+        self.allow_other_unknown = allow_other_unknown
+        self.unverified_slots = ()
+        self.enabled_slots={int(slot['slot']) for slot in baseline_slots if slot.get('enabled',True)}
         self.baseline = {int(slot["slot"]): slot_presence(slot) for slot in baseline_slots}
         expected_baseline = self.baseline.get(expected_slot)
         required_baseline = task_type == "borrow"
@@ -154,6 +151,11 @@ class SlotActionVerifier:
 
     def update(self, slots: list[dict[str, Any]]) -> SlotVerification:
         current = {int(slot["slot"]): slot_presence(slot) for slot in slots}
+        self.unverified_slots = tuple(
+            n
+            for n, v in self.baseline.items()
+            if n != self.expected_slot and n in self.enabled_slots and (v is None or current.get(n) is None)
+        )
         if current.get(self.expected_slot) is None:
             self.matching_samples = 0
             return SlotVerification(
@@ -167,6 +169,8 @@ class SlotActionVerifier:
                 continue
             current_presence = current.get(slot_number)
             if current_presence is None:
+                if self.allow_other_unknown:
+                    continue
                 self.matching_samples = 0
                 return SlotVerification(
                     "sensor_unavailable",
@@ -239,11 +243,14 @@ class DeliveryJournal:
         content = json.dumps(data, ensure_ascii=False, indent=2)
         try:
             stamp = self.path.stat()
-            identity = (stamp.st_ino,stamp.st_mtime_ns,stamp.st_size)
+            identity = (stamp.st_ino, stamp.st_mtime_ns, stamp.st_size)
         except FileNotFoundError:
             identity = None
-        if (identity is not None and identity == getattr(self,'_saved_identity',None)
-                and content == getattr(self,'_saved_content',None)):
+        if (
+            identity is not None
+            and identity == getattr(self, "_saved_identity", None)
+            and content == getattr(self, "_saved_content", None)
+        ):
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
@@ -253,7 +260,7 @@ class DeliveryJournal:
         )
         os.replace(temporary, self.path)
         stamp = self.path.stat()
-        self._saved_identity = (stamp.st_ino,stamp.st_mtime_ns,stamp.st_size)
+        self._saved_identity = (stamp.st_ino, stamp.st_mtime_ns, stamp.st_size)
         self._saved_content = content
 
     def clear(self) -> None:

@@ -13,7 +13,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
-from std_msgs.msg import Float32, Header, String
+from std_msgs.msg import Float32, Header, String, Bool
 from nav2_msgs.msg import CollisionMonitorState
 from smart_delivery_core.atomic_wheel_feedback import AtomicWheelReceiver
 from smart_delivery_core.odom_transport import LOCAL_ODOM_QOS
@@ -133,6 +133,9 @@ class SensorFusionNode(Node):
         # 2. 訂閱與發布速度 (確保 cmd_vel_to_serial 訂閱的是 /chassis_cmd_vel！)
         self.sub_nav2_cmd = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.pub_safe_cmd = self.create_publisher(Twist, '/chassis_cmd_vel', 10)
+        self.station_inhibited=False
+        self.create_subscription(Bool,'/delivery/station_motion_inhibited',self.station_pause_callback,
+            QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.recovery_guard_pub = self.create_publisher(
             String, '/localization/recovery_motion_guard', 1
         )
@@ -304,6 +307,8 @@ class SensorFusionNode(Node):
         self.semantic_health_state = next_state
 
     def cmd_vel_callback(self, msg):
+        if getattr(self,'station_inhibited',False):
+            self.pub_safe_cmd.publish(Twist());return
         values = (msg.linear.x, msg.linear.y, msg.angular.z)
         if any(not math.isfinite(v) or abs(v) > 1e-6 for v in values):
             self.recovery_last_nonzero_cmd_at = time.monotonic()
@@ -334,6 +339,10 @@ class SensorFusionNode(Node):
             real_cmd.linear.x = real_cmd.angular.z = 0.0
             real_cmd.linear.y = max(-0.25, min(0.25, msg.linear.y)) * effective_multiplier
         self.pub_safe_cmd.publish(real_cmd)
+
+    def station_pause_callback(self, message):
+        self.station_inhibited=bool(message.data)
+        if self.station_inhibited:self.pub_safe_cmd.publish(Twist())
 
     def localization_limit_callback(self, message):
         self.localization_speed_limit.observe(message.data, time.monotonic())

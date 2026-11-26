@@ -118,7 +118,7 @@ struct RouteGrid
 class GuardedNavfn
 {
 public:
-  struct Avoid {RoutePose point;double until;};
+  struct Avoid {RoutePose point;double until;unsigned hits=1;};
   std::vector<RoutePose> cached;
   std::vector<Avoid> avoid;
   RoutePose goal{};
@@ -137,10 +137,31 @@ public:
   void remember(RoutePose p,double now)
   {
     for (auto & item:avoid) {
-      if (distance(item.point,p)<.10) {item.until=now+45.;return;}
+      if (distance(item.point,p)<.10) {
+        ++item.hits;item.until=now+std::min(180.,45.*item.hits);return;
+      }
     }
     if (avoid.size()>=32) {avoid.erase(avoid.begin());}
     avoid.push_back({p,now+45.});
+  }
+  void rememberCorridor(const std::vector<RoutePose> & path,RoutePose p,double now)
+  {
+    remember(p,now);double selected=-1.;
+    for (size_t i=0;i<path.size();++i) {
+      if (distance(path[i],p)>.55) {continue;}
+      if (selected>=0 && distance(path[i],path[static_cast<size_t>(selected)])<.20) {continue;}
+      remember(path[i],now);selected=static_cast<double>(i);
+    }
+  }
+  void motionStalled(RoutePose start,double now)
+  {
+    if (cached.empty()) {return;}
+    RoutePose ahead=cached.back();double walked=0.;
+    for (size_t i=1;i<cached.size();++i) {
+      walked+=distance(cached[i-1],cached[i]);if (walked>=.6) {ahead=cached[i];break;}
+    }
+    if (distance(ahead,start)>.30) {rememberCorridor(cached,ahead,now);}
+    cached.clear();++stalls;
   }
   std::vector<RoutePose> plan(const RouteGrid & grid,RoutePose start,RoutePose target,
     double now,const std::function<bool()> & cancel=[] {return false;})
@@ -154,7 +175,7 @@ public:
     if (now<last_now) {reset();}
     last_now=now;
     if (!has_goal || distance(goal,target)>.01 || std::abs(wrap(goal.yaw-target.yaw))>.01) {
-      reset();goal=target;has_goal=true;last_progress=now;
+      cached.clear();goal=target;has_goal=true;last_progress=now;
     }
     avoid.erase(std::remove_if(avoid.begin(),avoid.end(),[now](const auto & a) {
       return now>=a.until;}),avoid.end());
@@ -182,9 +203,9 @@ public:
             ahead+=distance(tail[i-1],tail[i]);
             if (ahead>=.6) {blocked=tail[i];break;}
           }
-          remember(blocked,now);++stalls;
+          rememberCorridor(tail,blocked,now);++stalls;
         } else if (distance(blocked,start)>.30 && distance(blocked,target)>.30) {
-          remember(blocked,now);
+          rememberCorridor(tail,blocked,now);
         }
       }
       cached.clear();
@@ -204,11 +225,11 @@ public:
       auto costs=grid.costs;
       for (const auto & item:avoid) {
         int cx,cy;if (!grid.cell(item.point.x,item.point.y,cx,cy)) {continue;}
-        const int radius=static_cast<int>(std::ceil(.15/grid.resolution));
+        const int radius=static_cast<int>(std::ceil(.20/grid.resolution));
         for (int row=std::max(0,cy-radius);row<=std::min(grid.height-1,cy+radius);++row) {
           for (int col=std::max(0,cx-radius);col<=std::min(grid.width-1,cx+radius);++col) {
             const RoutePose p{grid.x+(col+.5)*grid.resolution,grid.y+(row+.5)*grid.resolution,0.};
-            if (distance(p,item.point)<=.15 && distance(p,start)>.30 && distance(p,target)>.30) {
+            if (distance(p,item.point)<=.20 && distance(p,start)>.30 && distance(p,target)>.30) {
               costs[row*grid.width+col]=254;
             }
           }

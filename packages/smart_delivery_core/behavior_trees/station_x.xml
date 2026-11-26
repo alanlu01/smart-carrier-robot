@@ -3,7 +3,7 @@
   <BehaviorTree ID="MainTree">
     <Sequence name="StationTranslation">
       <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}"/>
-      <FollowPath path="{path}" controller_id="StationX" goal_checker_id="general_goal_checker" error_code_id="{follow_path_error_code}"/>
+      <FollowPath path="{path}" controller_id="StationX" goal_checker_id="station_goal_checker" error_code_id="{follow_path_error_code}"/>
     </Sequence>
   </BehaviorTree>
 </root>

@@ -52,12 +52,14 @@ class PowerActionHealth:
         return slots
 
     @staticmethod
-    def action_ready(slots):
+    def action_ready(slots, expected_slot=None):
         # Navigation can use known inventory while other presence is uncertain.
         # Physical wrong-slot verification needs a trustworthy baseline first.
-        return all(not slot.get('enabled',True) or
+        checked=slots if expected_slot is None else [s for s in slots if int(s['slot'])==expected_slot]
+        if expected_slot is not None and (not checked or not checked[0].get('enabled',True)):return False
+        return bool(checked) and all(not slot.get('enabled',True) or
                    (slot.get('sensor_ok',True) and slot.get('status') not in {'unknown','disabled'})
-                   for slot in slots)
+                   for slot in checked)
 
     def failure(self, now):
         if self.valid or self.received_at is None or not 0 <= now-self.received_at <= 2.:

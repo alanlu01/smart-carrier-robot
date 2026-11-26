@@ -29,6 +29,8 @@ def station_parameters(source):
     libraries = bt.setdefault('plugin_lib_names', [])
     if 'smart_navigation_policy_bt_node' not in libraries:
         libraries.append('smart_navigation_policy_bt_node')
+    bt['error_code_names']=list(dict.fromkeys(bt.get('error_code_names',[
+        'compute_path_error_code','follow_path_error_code'])+['delivery_policy_error_code']))
     controller = parameters['controller_server']['ros__parameters']
     station = deepcopy(controller['FollowPath'])
     station.update(wz_max=.15,
@@ -74,6 +76,11 @@ def station_parameters(source):
         trans_stopped_velocity=.02,rot_stopped_velocity=.03)
     if 'station_alignment_checker' not in controller['goal_checker_plugins']:
         controller['goal_checker_plugins'].append('station_alignment_checker')
+    # Shift <=5 cm plus final tolerance 4 cm remains inside original 10 cm.
+    controller['station_goal_checker']=dict(plugin='nav2_controller::SimpleGoalChecker',
+        xy_goal_tolerance=.04,yaw_goal_tolerance=.10,stateful=False)
+    if 'station_goal_checker' not in controller['goal_checker_plugins']:
+        controller['goal_checker_plugins'].append('station_goal_checker')
 
     # Selecting one polygon is native CollisionMonitor work. Only its selected
     # outline is checked against scans; this is not 73 separate scan consumers.

@@ -11,7 +11,7 @@ from nav2_simple_commander.robot_navigator import TaskResult
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from rclpy.task import Future
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from tf2_ros import TransformException
 
 from smart_delivery_core.delivery_inputs import shared_inputs
@@ -47,6 +47,9 @@ class StationNavigation:
         navigator.create_subscription(OccupancyGrid,'/map',self._map,
             QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.publisher = navigator.create_publisher(String,'/delivery/station_state',10)
+        self.pause_publisher = navigator.create_publisher(Bool,'/delivery/station_motion_inhibited',
+            QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.pause_publisher.publish(Bool(data=False))
         navigator.create_subscription(OccupancyGrid,'/global_costmap/costmap',self._grid,
             QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
         shared_inputs(navigator).subscribe(Odometry,'/odom',self._odom,10)
@@ -200,6 +203,9 @@ class StationNavigation:
             motion_check=getattr(self,'motion_check',{}),
             translation_pause_kind=getattr(self,'translation_pause_kind',''),
             deviation_retries=getattr(self,'deviation_retries',0),
+            policy_retries=getattr(self,'policy_retries',0),
+            station_motion_inhibited=getattr(self,'motion_paused',False),
+            margin_wait=getattr(self,'margin_wait',None),
             deviation_guard=getattr(self,'deviation_guard',None),
             clearance_retries=getattr(self,'clearance_retries',0),
             translation_budget=(self.translation_budget.snapshot(time.monotonic())
@@ -266,6 +272,10 @@ class StationNavigation:
         self.translation_pause_kind = ''
         self.deviation_retries = 0
         self.deviation_guard = None
+        self.policy_retries=0
+        self.policy_retry=None
+        self.margin_wait=None
+        self._pause_motion(False)
         self.clearance_retries = 0
         self.entry_target=self.entry_candidate=None
         self.entry_adjustments=self.entry_candidate_samples=0
@@ -315,6 +325,7 @@ class StationNavigation:
         if self.cancelled or not self.permitted():
             self._finish(TaskResult.CANCELED,'cancelled'); return
         self.stage,self.next_phase = point,next_phase
+        self.last_send_tree=tree
         if phase not in ('entry','departure'):
             self.translation_budget=None
         self.native_error = (0,'')
@@ -573,7 +584,12 @@ class StationNavigation:
             if (math.hypot(pose[0]-self.target[0],pose[1]-self.target[1])<=.10
                     and abs(angle_error(pose[2],self.target[2]))<=.10):
                 self._advance_finish()
-            else:self._translation(pose,self.entry_target or self.target,'entry','finish')
+            else:self._translation(pose,self.target,'entry','finish')
+        elif phase=='policy_retry':
+            point,moving,tree,resume,deadline=self.policy_retry
+            self.policy_retry=None
+            self._send(point,moving,tree,resume)
+            self.deadline=min(self.deadline,deadline)
         elif phase=='final_align':self._align(pose,'final_translation')
         elif phase=='translation_clearance':
             self._wait_clearance('等待平移通道恢復','translation_resume','local_translation')
@@ -684,8 +700,36 @@ class StationNavigation:
             ('failed to make progress','no valid trajectories','patience exceeded'))
 
     def _finish(self, result, phase, reason=''):
+        self._pause_motion(False)
         self.running,self.active_goal,self.result = False,False,result
         self._report(phase,reason)
+
+    def _pause_motion(self, active):
+        if active==getattr(self,'motion_paused',None):return
+        self.motion_paused=active
+        self.pause_publisher.publish(Bool(data=active))
+
+    def _margin_transient(self, pose, blocker):
+        """Stop without cancelling for <=2.5s; resume on two clear grids only."""
+        now=time.monotonic()
+        if blocker and blocker.get('layer')!='margin':
+            self._pause_motion(True);return False
+        if self.margin_wait is None:
+            if not blocker:return True
+            self.margin_wait=dict(start=now,clear_stamp=None,clear_samples=0)
+            self._pause_motion(True)
+            self.nav.get_logger().info('⏸️ 進站餘裕待確認：短暫停車重驗')
+        wait=self.margin_wait
+        if now-wait['start']>2.5:return False
+        if blocker:
+            wait['clear_stamp']=None;wait['clear_samples']=0
+        elif self._stopped():
+            if wait['clear_stamp'] is None or self.grid_stamp>wait['clear_stamp']:
+                wait['clear_stamp']=self.grid_stamp;wait['clear_samples']+=1
+            if wait['clear_samples']>=2:
+                self.margin_wait=None;self._pause_motion(False)
+                self.nav.get_logger().info('▶️ 進站通道穩定：接續原目標')
+        return True
 
     def _odom_pose(self):
         if self.odom is None:return None
@@ -877,10 +921,12 @@ class StationNavigation:
                     if not self._pause_deviation(pose,physical,along,across,length):
                         self.failure,self.failure_kind='平移偏離已檢查通道','translation_deviation'
                         self.cancelTask()
-                elif not self.grid.segment(pose,self.stage):
-                    blocker=self._translation_blocker(pose,self.stage)
-                    self.motion_check.update(blocker=blocker)
-                    self._pause_translation('heading' if blocker.get('reason')=='heading_mismatch' else 'obstacle')
+                else:
+                    blocker=None if self.grid.segment(pose,self.stage) else self._translation_blocker(pose,self.stage)
+                    if blocker or self.margin_wait is not None:
+                        self.motion_check.update(blocker=blocker)
+                        if not self._margin_transient(pose,blocker):
+                            self._pause_translation('heading' if blocker and blocker.get('reason')=='heading_mismatch' else 'obstacle')
         if self.active_goal and not completed and self.phase=='aligning' and not self.cancelled:
             physical=self._physical_pose(self.align_anchor)
             if physical is not None and math.hypot(physical[0]-self.align_anchor[0],
@@ -919,6 +965,8 @@ class StationNavigation:
             if not completed:
                 return False
             self.active_goal = False
+            self.margin_wait=None
+            self._pause_motion(False)
             result = self.nav.getResult()
             if self.alignment_pause is not None and not self.cancelled:
                 self._report('alignment_wait','舊目標已停止，等待新資料')
@@ -930,6 +978,13 @@ class StationNavigation:
                     self.native_error = int(message.error_code),str(message.error_msg)
                 except (AttributeError,TypeError,ValueError):
                     pass
+                if (self.native_error[0]==10001 and not self.cancelled
+                        and self.policy_retries<1):
+                    self.policy_retries+=1
+                    self.policy_retry=(self.stage,self.phase,self.last_send_tree,self.next_phase,self.deadline)
+                    self.after_stop,self.stop_since='policy_retry',None
+                    self._report('settling','策略未配對，停妥後重送一次')
+                    return False
                 if (hasattr(self.nav,'navigation_actions_ready')
                         and not self.nav.navigation_actions_ready()):
                     self.failure,self.data_unavailable='導航回應異常，等待導航恢復',True
@@ -946,6 +1001,8 @@ class StationNavigation:
                 self.mode,self.mode_reason,self.mode_switches='station','normal_route_blocked',1
                 self.replan_pending=True
             if self.replan_pending and not self.cancelled:
+                self.margin_wait=None
+                self._pause_motion(False)
                 self.replan_pending=False
                 self.stage=None
                 self.after_stop,self.stop_since=('translation_clearance' if self.clearance_pending else
@@ -986,7 +1043,7 @@ class StationNavigation:
                 self._advance(pose)
             return not self.running
         intermediate = self.after_stop in ('entry','approach','prepare','translation_clearance')
-        position_ok = self.after_stop=='translation_clearance' or self.stage is None or (pose is not None
+        position_ok = self.after_stop in ('translation_clearance','policy_retry') or self.stage is None or (pose is not None
             and math.hypot(pose[0]-self.stage[0],pose[1]-self.stage[1])<=(.20 if intermediate else .10)
             and (intermediate or abs(angle_error(pose[2],self.stage[2]))<=.10))
         if position_ok and self.after_stop=='finish' and self.park:
@@ -1000,7 +1057,7 @@ class StationNavigation:
                 self.final_corrections+=1
                 if abs(angle_error(pose[2],self.target[2]))>.10:
                     self._align(pose,'final_translation')
-                else:self._translation(pose,self.entry_target or self.target,'entry','finish')
+                else:self._translation(pose,self.target,'entry','finish')
             return not self.running
         self._waiting(pose,data_ok,stopped,position_ok=position_ok)
         if pose is None or not data_ok or not stopped or not position_ok:

@@ -3,6 +3,9 @@ import json
 import uuid
 from pathlib import Path
 
+ACTION_RECOVERY_TOTAL_SEC = 85.
+DELIVERY_RECOVERY_TOTAL_SEC = ACTION_RECOVERY_TOTAL_SEC+20.
+
 
 class ActionRecovery:
     """No reset is allowed without an explicit request and fresh stop proof."""
@@ -17,6 +20,8 @@ class ActionRecovery:
         self.future = None
         self.observed_size = None
         self.fault_wall_time = None
+        self.total_deadline=None
+        self.last_policy_fault=None
 
     def observe(self):
         if self.path is None:
@@ -29,6 +34,9 @@ class ActionRecovery:
             self.observed_size=signature
             if sequence<=self.sequence:return
             self.sequence=sequence
+            if payload.get('kind')=='policy_mismatch':
+                self.last_policy_fault=payload
+                return  # An exact-policy refusal needs rebinding, not lifecycle RESET.
             self.fault_wall_time=float(payload.get('wall_time',0.))
             if self.state not in ('waiting_stop','resetting','waiting_start','starting','verifying','manual_required'):
                 self.state='fault'; self.requested=False
@@ -45,6 +53,7 @@ class ActionRecovery:
             return False
         self.requested=True
         self.deadline=now+10.
+        self.total_deadline=now+ACTION_RECOVERY_TOTAL_SEC
         self.state,self.reason='waiting_stop','waiting_fresh_physical_stop'
         self.stop_since=None
         self.last_stop_check=None
@@ -53,7 +62,9 @@ class ActionRecovery:
     def tick(self, now, *, stopped, lifecycle_ready, service_ready, call):
         self.observe()
         if (self.state in ('waiting_stop','resetting','waiting_start','starting','verifying')
-                and now>=self.deadline):
+                and ((self.total_deadline is not None and now>=self.total_deadline)
+                     or (now>=self.deadline and not (
+                         self.state in ('resetting','starting') and self.future.done())))):
             self.state,self.reason='manual_required','navigation_recovery_phase_timeout'
             return
         if self.state=='waiting_stop':
@@ -64,7 +75,7 @@ class ActionRecovery:
             elif self.stop_since is None:self.stop_since=now
             if self.stop_since is not None and now-self.stop_since>=1. and service_ready:
                 self.attempts+=1
-                self._call(call,3,now,'resetting','navigation_reset',10.)
+                self._call(call,3,now,'resetting','navigation_reset',25.)
             elif now>=self.deadline:
                 self.state,self.reason='manual_required','stop_or_service_not_verified'
         elif self.state in ('resetting','starting'):
@@ -76,7 +87,7 @@ class ActionRecovery:
                 elif self.state=='resetting':
                     self.state,self.reason,self.deadline='waiting_start','navigation_stopped_verify',now+5.
                 else:
-                    self.state,self.reason,self.deadline='verifying','navigation_verify_active',now+5.
+                    self.state,self.reason,self.deadline='verifying','navigation_verify_active',now+10.
                     self.verification_since=now
             elif now>=self.deadline:
                 # A timed-out lifecycle RPC may still execute. Never send a new
@@ -86,7 +97,7 @@ class ActionRecovery:
             # Stop proof must also remain valid AFTER RESET. Reconfiguration
             # never starts while another Spin or an external goal is moving.
             if stopped and service_ready:
-                self._call(call,0,now,'starting','navigation_startup',15.)
+                self._call(call,0,now,'starting','navigation_startup',35.)
             elif now>=self.deadline:
                 self.state,self.reason='manual_required','stop_not_verified_after_reset'
         elif self.state=='verifying':
@@ -100,11 +111,12 @@ class ActionRecovery:
     def _call(self, call, command, now, state, reason, timeout):
         try:
             self.future=call(command)
-            self.state,self.reason,self.deadline=state,reason,now+timeout
+            self.state,self.reason,self.deadline=state,reason,min(now+timeout,self.total_deadline)
         except Exception:
             self.state,self.reason='manual_required','navigation_lifecycle_request_exception'
 
     def snapshot(self):
         return dict(state=self.state,reason=self.reason,session=self.session,
             fault_sequence=self.sequence,recovered_generation=self.recovered_generation,
-            recovery_attempts=self.attempts,recovery_limit=2)
+            recovery_attempts=self.attempts,recovery_limit=2,
+            total_deadline=self.total_deadline,last_policy_fault=self.last_policy_fault)

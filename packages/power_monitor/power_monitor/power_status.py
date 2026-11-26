@@ -222,6 +222,9 @@ class SlotStateTracker:
     presence_evidence: str = "unknown"
     _had_presence: bool = False
     _last_presence_at: float | None = None
+    _last_empty_at: float | None = None
+    _last_valid_at: float | None = None
+    _weak_pause_since: float | None = None
 
     def __post_init__(self):
         if self.empty_current_max_a < 0:
@@ -276,6 +279,7 @@ class SlotStateTracker:
         ):
             self.state = "unknown"
             self._reset_weak()
+            self._last_valid_at = self._last_empty_at = None
             self.presence_evidence = "unknown"
             self._candidate = None
             self._candidate_samples = 0
@@ -293,10 +297,18 @@ class SlotStateTracker:
         current = abs(float(current_a))
         clock_ok = now is not None and math.isfinite(now)
         prior_present = self.state in {"full", "ready", "low"}
+        fresh_stream = (
+            clock_ok
+            and self._last_valid_at is not None
+            and 0 <= now - self._last_valid_at <= self.weak_presence_max_gap_sec
+        )
+        if clock_ok:
+            self._last_valid_at = now
         contiguous = (
             clock_ok
             and self._last_presence_at is not None
-            and 0 <= now - self._last_presence_at <= self.weak_presence_max_gap_sec
+            and fresh_stream
+            and 0 <= now - self._last_presence_at <= 2.0
         )
         # A proven occupied slot may fluctuate below the empty threshold.
         # Keep its classification for at most two seconds, then report UNKNOWN,
@@ -309,7 +321,13 @@ class SlotStateTracker:
             and clock_ok
         )
         if ambiguous:
-            self._reset_weak()
+            if self._weak_started_at is not None and fresh_stream:
+                if self._weak_pause_since is None:
+                    self._weak_pause_since = now
+                if now - self._weak_pause_since > 1.0:
+                    self._reset_weak()
+            else:
+                self._reset_weak()
             hold = (
                 prior_present
                 and self._last_presence_at is not None
@@ -331,6 +349,14 @@ class SlotStateTracker:
             if self._weak_last_at is not None and now == self._weak_last_at:
                 return self.state
             if (
+                self._weak_pause_since is not None
+                and fresh_stream
+                and now - self._weak_pause_since <= 1.0
+                and self._weak_last_at is not None
+            ):
+                self._weak_started_at += now - self._weak_last_at
+                self._weak_samples += 1
+            elif (
                 self._weak_last_at is None
                 or now - self._weak_last_at > self.weak_presence_max_gap_sec
                 or now < self._weak_last_at
@@ -340,6 +366,7 @@ class SlotStateTracker:
             elif now > self._weak_last_at:
                 self._weak_samples += 1
             self._weak_last_at = now
+            self._weak_pause_since = None
             weak = (prior_present and contiguous) or (
                 now - self._weak_started_at >= self.weak_presence_duration_sec
                 and self._weak_samples >= self.confirm_samples
@@ -359,9 +386,20 @@ class SlotStateTracker:
             if self.weak_presence_min_a > 0 and clock_ok:
                 # An empty slot is not trusted empty while fresh positive
                 # presence evidence is accumulating. Never create a rental.
-                self.state = "unknown"
+                hold_empty = (
+                    not eligible
+                    and self.state == "empty"
+                    and fresh_stream
+                    and self._last_empty_at is not None
+                    and 0 <= now - self._last_empty_at <= 2.0
+                )
+                self.state = "empty" if hold_empty else "unknown"
                 self.presence_evidence = (
-                    "weak_presence_pending" if eligible else "ambiguous_current"
+                    "bounded_empty_noise_hold"
+                    if hold_empty
+                    else "weak_presence_pending"
+                    if eligible
+                    else "ambiguous_current"
                 )
             self._candidate = None
             self._candidate_samples = 0
@@ -385,6 +423,8 @@ class SlotStateTracker:
             ):
                 measured = "low"
         if measured == self.state:
+            if measured == "empty" and clock_ok:
+                self._last_empty_at = now
             if measured in {"full", "ready", "low"}:
                 self._had_presence = True
                 if clock_ok:
@@ -405,6 +445,8 @@ class SlotStateTracker:
                 self._last_presence_at = now
             elif measured == "empty":
                 self._last_presence_at = None
+                if clock_ok:
+                    self._last_empty_at = now
             self.presence_evidence = (
                 "sustained_low_current"
                 if weak
@@ -417,6 +459,7 @@ class SlotStateTracker:
         return self.state
 
     def _reset_weak(self):
+        self._weak_pause_since = None
         self._weak_started_at = self._weak_last_at = None
         self._weak_samples = 0
 

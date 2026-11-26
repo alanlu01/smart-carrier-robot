@@ -111,6 +111,22 @@ def test_multiple_wrong_slots_are_reported_together():
     assert "2、3號槽" in result.message
 
 
+def test_unknown_other_slot_does_not_block_expected_transition_but_is_declared_unverified():
+    baseline=[slot(1,'full'),slot(2,'unknown'),slot(3,'empty')]
+    verifier=SlotActionVerifier('borrow',1,baseline,confirm_samples=3,allow_other_unknown=True)
+    taken=[slot(1,'empty'),slot(2,'unknown'),slot(3,'empty')]
+    assert not verifier.update(taken).confirmed
+    assert not verifier.update(taken).confirmed
+    assert verifier.update(taken).confirmed and verifier.unverified_slots==(2,)
+
+
+def test_degraded_monitoring_keeps_known_wrong_slot_and_expected_sensor_guards():
+    baseline=[slot(1,'full'),slot(2,'full'),slot(3,'unknown')]
+    verifier=SlotActionVerifier('borrow',1,baseline,confirm_samples=1,allow_other_unknown=True)
+    assert verifier.update([slot(1,'empty'),slot(2,'empty'),slot(3,'unknown')]).state=='wrong_slot'
+    assert verifier.update([slot(1,'unknown'),slot(2,'full'),slot(3,'unknown')]).state=='sensor_unavailable'
+
+
 def test_delivery_journal_round_trip(tmp_path):
     journal = DeliveryJournal(tmp_path / "delivery.json")
     assert journal.load() == {}

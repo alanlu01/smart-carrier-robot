@@ -84,11 +84,31 @@ def test_reset_rpc_timeout_cannot_startup_later_or_recover_from_new_log(tmp_path
     p,path=fault(tmp_path);calls=[];late=Future(done=False)
     assert p.request(0.)
     hold(p,0.,calls,call=lambda c:(calls.append(c) or late))
-    tick(p,12.,calls);assert p.state=='manual_required' and calls==[3]
+    tick(p,27.,calls);assert p.state=='manual_required' and calls==[3]
     late.complete=True
     path.write_text(json.dumps(dict(sequence=2,wall_time=200.,reason='another timeout')))
-    tick(p,13.,calls)
-    assert p.state=='manual_required' and calls==[3] and not p.request(14.)
+    tick(p,28.,calls)
+    assert p.state=='manual_required' and calls==[3] and not p.request(29.)
+
+
+def test_recorded_eleven_second_reset_is_acknowledged_and_followed_by_startup(tmp_path):
+    p,_=fault(tmp_path);calls=[];slow=Future(done=False)
+    assert p.request(100.)
+    hold(p,100.,calls,call=lambda command:(calls.append(command) or slow))
+    tick(p,112.,calls);assert p.state=='resetting'
+    slow.complete=True;tick(p,113.,calls);assert p.state=='waiting_start'
+    tick(p,113.1,calls);assert calls==[3,0] and p.state=='starting'
+    tick(p,114.,calls);tick(p,115.,calls)
+    assert p.state=='healthy' and p.recovered_generation==1
+
+
+def test_policy_mismatch_does_not_trigger_global_navigation_reset(tmp_path):
+    path=tmp_path/'fault.json'
+    path.write_text(json.dumps(dict(sequence=1,wall_time=100.,kind='policy_mismatch',reason='policy mismatch')))
+    p=ActionRecovery(path);p.observe();calls=[]
+    assert p.state=='healthy' and p.last_policy_fault is not None
+    assert not p.request(101.)
+    tick(p,102.,calls);assert not calls
 
 
 def test_no_stop_proof_no_recovery_and_no_restart_storm_after_limit(tmp_path):

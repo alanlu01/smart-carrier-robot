@@ -20,6 +20,7 @@ from smart_delivery_core.stationary_map_guard import dispatch_permitted
 from rclpy.executors import ExternalShutdownException
 from power_monitor.power_status import normalize_power_bank_status, payload_to_slots
 from smart_delivery_core.power_action_health import PowerActionHealth
+from smart_delivery_core.navigation_action_health import DELIVERY_RECOVERY_TOTAL_SEC
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rcl_interfaces.msg import Log
@@ -1219,7 +1220,9 @@ def _run_delivery(runtime_holder):
         if not power_health.valid:
             queue_result(target, fsm, 'failed', power_health.note or '槽位資料尚未就緒')
             return
-        if not power_health.action_ready(baseline_slots):
+        if not power_health.action_ready(baseline_slots,slot_number):
+            progress(target,fsm,'arrived',action_ready=False,expected_slot=slot_number,
+                     progress_message='已抵達，準備槽位中，請暫勿取還')
             navigator.get_logger().warning('⏳ 等待槽位基準，請暫勿取還')
             set_motion_inhibited(True)
             baseline_deadline=time.monotonic()+10.
@@ -1230,7 +1233,7 @@ def _run_delivery(runtime_holder):
                         queue_result(target,fsm,'cancelled','等待槽位基準時收到取消');return
                     if (not resumed and power_health.valid and
                             time.monotonic()-latest_power_status_at<=2. and
-                            power_health.action_ready(latest_power_banks)):
+                            power_health.action_ready(latest_power_banks,slot_number)):
                         baseline_slots=latest_power_banks
                         break
                 else:
@@ -1243,6 +1246,7 @@ def _run_delivery(runtime_holder):
                 slot_number,
                 baseline_slots,
                 confirm_samples=confirmation_samples,
+                allow_other_unknown=True,
             )
         except ValueError as exc:
             queue_result(target, fsm, "failed", str(exc))
@@ -1263,6 +1267,9 @@ def _run_delivery(runtime_holder):
             fsm,
             "waiting_action",
             progress_message=progress_message,
+            action_ready=True,
+            unverified_slots=[int(s['slot']) for s in baseline_slots
+                if int(s['slot'])!=slot_number and s.get('status')=='unknown'],
             expected_slot=slot_number,
             action_deadline=action_deadline,
         )
@@ -1324,8 +1331,8 @@ def _run_delivery(runtime_holder):
                         or time.monotonic()-latest_power_status_at > 2.):
                     verifier.matching_samples = 0
                     if not unhealthy_reported:
-                        progress(target, fsm, 'waiting_action', expected_slot=slot_number,
-                                 action_deadline=action_deadline,
+                        progress(target, fsm, 'waiting_action', expected_slot=slot_number, action_ready=False,
+                                 action_deadline=action_deadline,warning=True,
                                  progress_message=power_health.note or '槽位更新中，暫停租還確認')
                         unhealthy_reported = True
                         last_verification = None
@@ -1342,6 +1349,7 @@ def _run_delivery(runtime_holder):
                     verification.changed_slot,
                     verification.changed_slots,
                     verification.message,
+                    verifier.unverified_slots,
                 )
                 if signature != last_verification:
                     state = (
@@ -1366,6 +1374,8 @@ def _run_delivery(runtime_holder):
                         state,
                         event_id=event_id,
                         progress_message=verification.message,
+                        action_ready=verification.state!='sensor_unavailable',
+                        unverified_slots=list(verifier.unverified_slots),
                         expected_slot=slot_number,
                         changed_slot=verification.changed_slot,
                         changed_slots=list(verification.changed_slots),
@@ -1488,7 +1498,7 @@ def _run_delivery(runtime_holder):
             pending_orders.remove(expired)
             active_task = expired
             queue_result(expired,DeliveryStateMachine('waiting_localization'),'failed',
-                         'Navigation/data recovery deadline exceeded (90 s)')
+                         f'Navigation/data recovery deadline exceeded ({DELIVERY_RECOVERY_TOTAL_SEC:.0f} s)')
             continue
         if not navigator.navigation_actions_ready():
             set_navigation_active(False)
@@ -1810,7 +1820,7 @@ def _run_delivery(runtime_holder):
             retries = int(target.get("_tf_retry_count", 0))
             if transient and schedule_tf_retry(target, time.time()):
                 target['_navigation_data_retry']=True
-                target.setdefault('_navigation_retry_deadline',time.time()+90.)
+                target.setdefault('_navigation_retry_deadline',time.time()+DELIVERY_RECOVERY_TOTAL_SEC)
                 fsm.transition("waiting_localization")
                 persist(target, fsm.state, pending_result)
                 publish_task_state(
@@ -1830,6 +1840,7 @@ def _run_delivery(runtime_holder):
                 fsm,
                 "arrived",
                 progress_message=f"Arrived at {target['name']}",
+                action_ready=False,
                 expected_slot=target.get("slot_number"),
             )
             if target["type"] not in {"borrow", "return"}:

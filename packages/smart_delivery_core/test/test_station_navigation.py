@@ -182,7 +182,8 @@ def test_station_trees_use_explicit_profiles_no_spin_backup_or_goal_tolerance_ch
         root=ElementTree.parse(ROOT/f'behavior_trees/station_{name}.xml')
         assert not any(root.findall('.//'+tag) for tag in ('Spin','BackUp','ControllerSelector','RecoveryNode'))
         follow=root.find('.//FollowPath')
-        assert follow.get('goal_checker_id')==('station_alignment_checker' if name=='align' else 'general_goal_checker')
+        assert follow.get('goal_checker_id')==('station_alignment_checker' if name=='align' else
+            'general_goal_checker' if 'exit' in name else 'station_goal_checker')
         expected='StationAlign' if name=='align' else 'Station'+('Exit' if 'exit' in name else '')+name[-1].upper()
         assert follow.get('controller_id')==expected
 
@@ -193,7 +194,9 @@ def motion(monkeypatch):
     monkeypatch.setattr(module.time,'monotonic',lambda:clock[0])
     monkeypatch.setattr(module.rclpy,'spin_once',lambda *_a,**_k:None)
     node=NS(sent=[],complete=False,result=TaskResult.SUCCEEDED,cancels=0,messages=[],logs=[])
-    node.create_publisher=lambda *_a,**_k:NS(publish=lambda msg:node.messages.append(json.loads(msg.data)))
+    node.pause_messages=[]
+    node.create_publisher=lambda *_a,**_k:NS(publish=lambda msg:
+        node.pause_messages.append(msg.data) if isinstance(msg.data,bool) else node.messages.append(json.loads(msg.data)))
     node.create_subscription=lambda *_a,**_k:None
     node.get_logger=lambda:NS(info=node.logs.append)
     node.get_clock=lambda:NS(now=lambda:NS(to_msg=lambda:PoseStamped().header.stamp,nanoseconds=int(clock[0]*1e9)))
@@ -469,3 +472,51 @@ def test_departure_heading_recheck_keeps_departure_heading_not_next_destination(
     m.isTaskComplete();c[0]+=.6;m.isTaskComplete()
     m.grid_stamp=1;c[0]+=.5;m.isTaskComplete()
     assert m.phase=='aligning' and n.sent[-1][0][2]==0.
+
+
+def test_margin_flicker_stops_command_chain_without_cancelling_goal(motion):
+    m,n,c,p,_,_=motion
+    m.target=(.2,0.,0.);m._translation(p[0],m.target,'entry','finish')
+    m.grid=single_cell_at(.10,.20)
+    m.isTaskComplete()
+    assert m.motion_paused and n.cancels==0 and m.margin_wait is not None
+    m.grid=grid();m.grid_stamp=1;c[0]+=.5;m.isTaskComplete()
+    assert m.motion_paused and len(n.sent)==1
+    m.grid_stamp=2;c[0]+=.5;m.isTaskComplete()
+    assert not m.motion_paused and len(n.sent)==1 and n.cancels==0
+
+
+def test_body_obstacle_never_gets_the_margin_confirmation_grace(motion):
+    m,n,_,p,_,_=motion
+    m.target=(.2,0.,0.);m._translation(p[0],m.target,'entry','finish')
+    m.grid=single_cell_at(.10,.175)
+    m.isTaskComplete()
+    assert m.motion_paused and m.replan_pending and n.cancels==1
+
+
+def test_policy_refusal_rebinds_once_only_after_stop_without_extending_budget(motion):
+    m,n,c,p,stopped,_=motion
+    tick(m,c);deadline=m.deadline;first=m.stage
+    n.result_future=NS(result=lambda:NS(result=NS(error_code=10001,error_msg='policy mismatch')))
+    n.result=TaskResult.FAILED;n.complete=True
+    assert not m.isTaskComplete() and m.policy_retries==1
+    stopped[0]=False;c[0]+=.5;m.isTaskComplete();assert len(n.sent)==1
+    stopped[0]=True;tick(m,c)
+    assert len(n.sent)==2 and m.stage==first and m.deadline<=deadline
+    n.result=TaskResult.FAILED;n.complete=True
+    assert m.isTaskComplete() and m.getResult()==TaskResult.FAILED and len(n.sent)==2
+
+
+def test_shifted_station_tolerance_cannot_satisfy_native_goal_outside_original_tolerance():
+    profile=station_parameters(parameters())['controller_server']['ros__parameters']
+    original=profile['general_goal_checker']['xy_goal_tolerance']
+    assert .05+profile['station_goal_checker']['xy_goal_tolerance']<original
+
+
+def test_recorded_shifted_goal_proof_corrects_original_target_not_satisfied_shift(motion):
+    m,n,c,p,_,_=motion
+    m.mode='station';m.target=(1.,0.,0.);m.entry_target=(.95,0.,0.)
+    m._translation(p[0],m.entry_target,'entry','finish')
+    p[0]=(.857,0.,0.);n.complete=True;n.result=TaskResult.SUCCEEDED
+    m.isTaskComplete();c[0]+=.6;m.isTaskComplete()
+    assert len(n.sent)==2 and n.sent[-1][0]==m.target and m.final_corrections==1

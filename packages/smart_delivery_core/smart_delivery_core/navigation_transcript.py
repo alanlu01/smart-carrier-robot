@@ -118,7 +118,8 @@ class NavigationTranscript:
                 continue
             self.action_sequence += 1
             payload=dict(sequence=self.action_sequence,wall_time=time.time(),
-                         reason=line[-1000:],source=suffix)
+                         reason=line[-1000:],source=suffix,
+                         kind='policy_mismatch' if 'Delivery policy did not match' in line else 'action_transport')
             self.action_health_file.parent.mkdir(parents=True,exist_ok=True)
             temporary=self.action_health_file.with_suffix('.tmp')
             temporary.write_text(json.dumps(payload))
